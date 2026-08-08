@@ -26,7 +26,9 @@ enum L10n {
         static let delete = String(localized: "action.delete")
         static let done = String(localized: "action.done")
         static let duplicate = String(localized: "action.duplicate")
+        static let move = String(localized: "action.move", defaultValue: "Move")
         static let ok = String(localized: "action.ok")
+        static let select = String(localized: "action.select", defaultValue: "Select")
         static let rename = String(localized: "action.rename")
         static let share = String(localized: "action.share")
     }
@@ -92,6 +94,26 @@ enum L10n {
 
     enum Jots {
 
+        enum Folder {
+            enum Create {
+                static let title = String(localized: "jots.folder.create.title", defaultValue: "New Folder")
+                static let placeholder = String(localized: "jots.folder.create.placeholder", defaultValue: "Folder name")
+            }
+            enum Rename {
+                static let title = String(localized: "jots.folder.rename.title", defaultValue: "Rename Folder")
+                static let placeholder = String(localized: "jots.folder.rename.placeholder", defaultValue: "New name")
+            }
+            enum Delete {
+                static let message = String(localized: "jots.folder.delete.message", defaultValue: "Are you sure you want to delete this folder?")
+                static func title(_ name: String) -> String {
+                    String(format: String(localized: "jots.folder.delete.title", defaultValue: "Delete '%@'?"), name)
+                }
+            }
+            enum Error {
+                static let generic = String(localized: "jots.folder.error.generic", defaultValue: "An error occurred.")
+            }
+        }
+
         enum Empty {
             static let title = String(localized: "jots.empty.title")
         }
@@ -99,6 +121,8 @@ enum L10n {
         enum Create {
             static let namePlaceholder = String(localized: "jots.create.namePlaceholder")
             static let title = String(localized: "jots.create.title")
+            static let blankNote = String(localized: "jots.create.blankNote", defaultValue: "Blank Note")
+            static let fromPDF = String(localized: "jots.create.fromPDF", defaultValue: "Import PDF")
 
             enum Error {
                 static let generic = String(localized: "jots.create.error.generic")
@@ -185,6 +209,32 @@ enum L10n {
 
         enum Version {
             static let title = String(localized: "settings.version.title")
+        }
+    }
+
+    enum EditJot {
+
+        enum PDF {
+
+            enum Error {
+                static let importFailed = String(localized: "editJot.pdf.error.importFailed", defaultValue: "Failed to import PDF")
+            }
+
+            enum Action {
+                static let importPDF = String(localized: "editJot.pdf.action.importPDF", defaultValue: "Import PDF")
+                static let addPage = String(localized: "editJot.pdf.action.addPage", defaultValue: "Add Page")
+                static let deletePage = String(localized: "editJot.pdf.action.deletePage", defaultValue: "Delete Page")
+            }
+
+            enum DeletePage {
+                static let title = String(localized: "editJot.pdf.deletePage.title", defaultValue: "Delete Page")
+                static let message = String(localized: "editJot.pdf.deletePage.message", defaultValue: "Delete the last added page?")
+                static let nothingToDelete = String(localized: "editJot.pdf.deletePage.nothingToDelete", defaultValue: "No extra pages to delete")
+            }
+        }
+
+        enum Pages {
+            static let title = String(localized: "editJot.pages.title", defaultValue: "Pages")
         }
     }
 

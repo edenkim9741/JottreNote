@@ -20,33 +20,40 @@ import UIKit
 
 protocol SettingsRepositoryProtocol: Sendable {
 
-    func shouldShowEnableICloudButton() -> Bool
-
     func appVersion() -> String
 
     func userInterfaceStyle() -> AsyncStream<UIUserInterfaceStyle>
 
     func updateUserInterfaceStyle(_ style: UIUserInterfaceStyle)
+
+    func getWebDAVURL() -> String?
+    func setWebDAVURL(_ value: String)
+
+    func getWebDAVUsername() -> String?
+    func setWebDAVUsername(_ value: String)
+
+    func getWebDAVPassword() -> String?
+    func setWebDAVPassword(_ value: String)
+
+    func testWebDAVConnection(url: String, username: String, password: String) async -> Bool
+
+    func backupAllJots() -> AsyncStream<Double>
 }
 
 struct SettingsRepository: SettingsRepositoryProtocol {
 
-    private let ubiquitousFileService: FileServiceProtocol
     private let bundleService: BundleServiceProtocol
     private let defaultsService: DefaultsServiceProtocol
+    private let webDAVBackupService: WebDAVBackupService
 
     init(
-        ubiquitousFileService: FileServiceProtocol,
         bundleService: BundleServiceProtocol,
-        defaultsService: DefaultsServiceProtocol
+        defaultsService: DefaultsServiceProtocol,
+        webDAVBackupService: WebDAVBackupService
     ) {
-        self.ubiquitousFileService = ubiquitousFileService
         self.bundleService = bundleService
         self.defaultsService = defaultsService
-    }
-
-    func shouldShowEnableICloudButton() -> Bool {
-        !ubiquitousFileService.isEnabled()
+        self.webDAVBackupService = webDAVBackupService
     }
 
     func appVersion() -> String {
@@ -65,5 +72,36 @@ struct SettingsRepository: SettingsRepositoryProtocol {
 
     func updateUserInterfaceStyle(_ style: UIUserInterfaceStyle) {
         defaultsService.set(.userInterfaceStyle, value: style.rawValue)
+    }
+
+    func getWebDAVURL() -> String? { defaultsService.getValue(.webDAVURL) }
+    func setWebDAVURL(_ value: String) { defaultsService.set(.webDAVURL, value: value) }
+
+    func getWebDAVUsername() -> String? { defaultsService.getValue(.webDAVUsername) }
+    func setWebDAVUsername(_ value: String) { defaultsService.set(.webDAVUsername, value: value) }
+
+    func getWebDAVPassword() -> String? { defaultsService.getValue(.webDAVPassword) }
+    func setWebDAVPassword(_ value: String) { defaultsService.set(.webDAVPassword, value: value) }
+
+    func testWebDAVConnection(url: String, username: String, password: String) async -> Bool {
+        guard !url.isEmpty, let baseURL = URL(string: url) else { return false }
+        var request = URLRequest(url: baseURL, timeoutInterval: 10)
+        request.httpMethod = "PROPFIND"
+        request.setValue("0", forHTTPHeaderField: "Depth")
+        let credentials = "\(username):\(password)"
+        if let encoded = credentials.data(using: .utf8)?.base64EncodedString() {
+            request.setValue("Basic \(encoded)", forHTTPHeaderField: "Authorization")
+        }
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else { return false }
+            return (200...299).contains(http.statusCode)
+        } catch {
+            return false
+        }
+    }
+
+    func backupAllJots() -> AsyncStream<Double> {
+        webDAVBackupService.backupAll()
     }
 }

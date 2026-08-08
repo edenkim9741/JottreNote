@@ -22,6 +22,13 @@ protocol SettingsCoordinatorProtocol: Coordinator {
 
     func openExternalLink(url: URL)
     func dismiss()
+
+    func showWebDAVSettings(
+        initial: WebDAVSettingsViewController.Configuration,
+        onSave: @escaping @MainActor (WebDAVSettingsViewController.Configuration) -> Void,
+        onTest: @escaping @MainActor (WebDAVSettingsViewController.Configuration) async -> Bool,
+        onBackupAll: @escaping @MainActor () -> AsyncStream<Double>
+    )
 }
 
 final class SettingsCoordinator: Coordinator, SettingsCoordinatorProtocol {
@@ -30,6 +37,7 @@ final class SettingsCoordinator: Coordinator, SettingsCoordinatorProtocol {
 
     private let navigation: Navigation
     private let settingsViewControllerFactory: SettingsViewControllerFactoryProtocol
+    private weak var settingsNavigationController: UINavigationController?
 
     init(
         navigation: Navigation,
@@ -44,6 +52,7 @@ final class SettingsCoordinator: Coordinator, SettingsCoordinatorProtocol {
             rootViewController: settingsViewControllerFactory.make(coordinator: self)
         )
         navigationController.navigationBar.prefersLargeTitles = true
+        settingsNavigationController = navigationController
         navigation.present(navigationController, animated: true)
     }
 
@@ -60,5 +69,18 @@ final class SettingsCoordinator: Coordinator, SettingsCoordinatorProtocol {
                 }
             }
         )
+    }
+
+    func showWebDAVSettings(
+        initial: WebDAVSettingsViewController.Configuration,
+        onSave: @escaping @MainActor (WebDAVSettingsViewController.Configuration) -> Void,
+        onTest: @escaping @MainActor (WebDAVSettingsViewController.Configuration) async -> Bool,
+        onBackupAll: @escaping @MainActor () -> AsyncStream<Double>
+    ) {
+        let viewController = WebDAVSettingsViewController(initial: initial)
+        viewController.onSave = onSave
+        viewController.onTest = onTest
+        viewController.onBackupAll = onBackupAll
+        settingsNavigationController?.pushViewController(viewController, animated: true)
     }
 }

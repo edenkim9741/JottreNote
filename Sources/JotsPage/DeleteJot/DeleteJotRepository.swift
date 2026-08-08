@@ -20,18 +20,26 @@ import UIKit
 
 protocol DeleteJotRepositoryProtocol: Sendable {
 
-    func deleteJot(jotFileInfo: JotFile.Info) throws
+    func deleteJot(jotFileInfo: JotFile.Info) async throws
 }
 
 struct DeleteJotRepository: DeleteJotRepositoryProtocol {
 
     private let jotFileService: JotFileServiceProtocol
+    private let fileService: FileServiceProtocol
+    private let trashService: TrashService
 
-    init(jotFileService: JotFileServiceProtocol) {
+    init(
+        jotFileService: JotFileServiceProtocol,
+        fileService: FileServiceProtocol,
+        trashService: TrashService
+    ) {
         self.jotFileService = jotFileService
+        self.fileService = fileService
+        self.trashService = trashService
     }
 
-    func deleteJot(jotFileInfo: JotFile.Info) throws {
-        try jotFileService.remove(jotFileInfo: jotFileInfo)
+    func deleteJot(jotFileInfo: JotFile.Info) async throws {
+        try await trashService.moveToTrash(jotFileInfo: jotFileInfo, fileService: fileService)
     }
 }

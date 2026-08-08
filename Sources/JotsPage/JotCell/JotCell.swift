@@ -34,8 +34,10 @@ final class JotCell: UICollectionViewCell, PageCell {
     private lazy var previewImageView: UIImageView = {
         let imageView = UIImageView()
         imageView.translatesAutoresizingMaskIntoConstraints = false
-        imageView.contentMode = .scaleAspectFit
+        imageView.contentMode = .scaleAspectFill
         imageView.clipsToBounds = true
+        imageView.layer.cornerRadius = DesignTokens.CornerRadius.cell - DesignTokens.Spacing.xs
+        imageView.layer.cornerCurve = .continuous
         return imageView
     }()
 
@@ -97,6 +99,7 @@ final class JotCell: UICollectionViewCell, PageCell {
     private func setUpViews() {
         contentView.backgroundColor = .secondarySystemGroupedBackground
         contentView.layer.cornerRadius = DesignTokens.CornerRadius.cell
+        contentView.layer.cornerCurve = .continuous
         contentView.clipsToBounds = true
         contentView.layoutMargins = UIEdgeInsets(
             top: DesignTokens.Spacing.xs,
@@ -108,6 +111,7 @@ final class JotCell: UICollectionViewCell, PageCell {
         contentView.addLayoutGuide(previewLayoutGuide)
         contentView.addSubview(separatorLine)
         contentView.addSubview(nameLabel)
+        contentView.addSubview(selectionBadge)
 
         NSLayoutConstraint.activate(
             [
@@ -124,9 +128,28 @@ final class JotCell: UICollectionViewCell, PageCell {
                 nameLabel.leadingAnchor.constraint(equalTo: contentView.layoutMarginsGuide.leadingAnchor),
                 nameLabel.trailingAnchor.constraint(equalTo: contentView.layoutMarginsGuide.trailingAnchor),
                 nameLabel.bottomAnchor.constraint(equalTo: contentView.layoutMarginsGuide.bottomAnchor),
+
+                selectionBadge.topAnchor.constraint(equalTo: contentView.layoutMarginsGuide.topAnchor),
+                selectionBadge.trailingAnchor.constraint(equalTo: contentView.layoutMarginsGuide.trailingAnchor),
+                selectionBadge.widthAnchor.constraint(equalToConstant: 26),
+                selectionBadge.heightAnchor.constraint(equalToConstant: 26),
             ]
         )
     }
+
+    private lazy var selectionBadge: UIImageView = {
+        let imageView = UIImageView()
+        imageView.translatesAutoresizingMaskIntoConstraints = false
+        imageView.image = UIImage(systemName: "checkmark.circle.fill")?
+            .withConfiguration(UIImage.SymbolConfiguration(pointSize: 22, weight: .bold))
+        imageView.tintColor = .label
+        imageView.backgroundColor = .systemBackground
+        imageView.layer.cornerRadius = 13
+        imageView.clipsToBounds = true
+        imageView.contentMode = .scaleAspectFit
+        imageView.alpha = 0
+        return imageView
+    }()
 
     private var viewModel: JotCellViewModel?
     private var previewImageTask: Task<Void, Never>?
@@ -140,6 +163,10 @@ final class JotCell: UICollectionViewCell, PageCell {
         cloudIconImageView.removeFromSuperview()
         downloadActivityIndicator.stopAnimating()
         downloadActivityIndicator.removeFromSuperview()
+        contentView.layer.borderWidth = 0
+        contentView.layer.borderColor = UIColor.clear.cgColor
+        selectionBadge.alpha = 0
+        selectionBadge.transform = .identity
     }
 
     func configure(
@@ -206,6 +233,21 @@ final class JotCell: UICollectionViewCell, PageCell {
                 ),
             ])
             downloadActivityIndicator.startAnimating()
+        }
+    }
+
+    override var isSelected: Bool {
+        didSet {
+            guard oldValue != isSelected else { return }
+            if isSelected {
+                selectionBadge.transform = CGAffineTransform(scaleX: 0.5, y: 0.5)
+            }
+            UIView.animate(withDuration: 0.2, delay: 0, usingSpringWithDamping: 0.7, initialSpringVelocity: 0.5) {
+                self.contentView.layer.borderWidth = self.isSelected ? 2 : 0
+                self.contentView.layer.borderColor = self.isSelected ? UIColor.label.cgColor : UIColor.clear.cgColor
+                self.selectionBadge.alpha = self.isSelected ? 1 : 0
+                self.selectionBadge.transform = self.isSelected ? .identity : CGAffineTransform(scaleX: 0.5, y: 0.5)
+            }
         }
     }
 }

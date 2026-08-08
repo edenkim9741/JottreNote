@@ -42,12 +42,9 @@ struct JotFilePreviewImageService: JotFilePreviewImageServiceProtocol {
         userInterfaceStyle: UIUserInterfaceStyle,
         displayScale: CGFloat
     ) async throws -> Data {
-        guard jotFileInfo.ubiquitousInfo?.downloadStatus != .notDownloaded else {
-            throw Failure.fileNotDownloaded
-        }
-
         let jotFile = try jotFileService.readJotFile(jotFileInfo: jotFileInfo)
         let drawing = try PKDrawing(data: jotFile.jot.drawing)
+        let pdfData = jotFile.jot.pdfData
 
         let aspectRatio = Constants.size.width / Constants.size.height
         let rect = CGRect(
@@ -58,17 +55,49 @@ struct JotFilePreviewImageService: JotFilePreviewImageServiceProtocol {
         )
         let scale = displayScale * Constants.size.width / jotFile.jot.width
 
+        let backgroundPageImage: UIImage? = if let pdfData {
+            try? await MainActor.run {
+                let service = PDFLoadService()
+                let result = try service.load(
+                    data: pdfData,
+                    normalizedPageSize: CGSize(
+                        width: jotFile.jot.width,
+                        height: jotFile.jot.width * (4.0 / 3.0)
+                    )
+                )
+                let previewPageSize = CGSize(
+                    width: Constants.size.width,
+                    height: Constants.size.width * result.pageSize.height / result.pageSize.width
+                )
+                return service.renderPage(
+                    from: result,
+                    at: 0,
+                    targetSize: previewPageSize,
+                    scale: displayScale
+                )
+            }
+        } else { nil }
+
         let traitCollection = UITraitCollection(userInterfaceStyle: userInterfaceStyle)
 
         let image = await MainActor.run {
-            var image: UIImage?
-            traitCollection.performAsCurrent {
-                image = drawing.image(from: rect, scale: scale)
+            let renderer = UIGraphicsImageRenderer(size: Constants.size)
+            return renderer.image { context in
+                traitCollection.performAsCurrent {
+                    UIColor.systemBackground.setFill()
+                    context.fill(CGRect(origin: .zero, size: Constants.size))
+
+                    if let backgroundPageImage {
+                        backgroundPageImage.draw(in: CGRect(origin: .zero, size: backgroundPageImage.size))
+                    }
+
+                    let drawingImage = drawing.image(from: rect, scale: scale)
+                    drawingImage.draw(in: CGRect(origin: .zero, size: Constants.size))
+                }
             }
-            return image
         }
 
-        guard let imageData = image?.pngData() else {
+        guard let imageData = image.pngData() else {
             throw Failure.couldNotRenderImage
         }
 

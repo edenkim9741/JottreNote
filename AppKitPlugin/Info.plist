@@ -7,7 +7,7 @@
 	<key>CFBundleExecutable</key>
 	<string>AppKitPlugin</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.antonlorani.jottre.AppKitPlugin</string>
+	<string>com.edenkim.jottre.AppKitPlugin</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
@@ -15,8 +15,8 @@
 	<key>CFBundlePackageType</key>
 	<string>BNDL</string>
 	<key>CFBundleShortVersionString</key>
-	<real>1</real>
+	<string>1.3.0</string>
 	<key>CFBundleVersion</key>
-	<integer>1</integer>
+	<string>2</string>
 </dict>
 </plist>

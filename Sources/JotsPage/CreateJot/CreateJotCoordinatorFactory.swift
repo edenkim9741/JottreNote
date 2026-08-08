@@ -21,17 +21,66 @@ import UIKit
 @MainActor
 protocol CreateJotCoordinatorFactoryProtocol: Sendable {
 
-    func make(navigation: Navigation) -> Coordinator
+    func make(
+        navigation: Navigation,
+        directory: CreateJotCoordinatorFactory.Directory?,
+        pdfData: Data?,
+        pdfName: String?
+    ) -> Coordinator
+
+    func makeBatch(
+        navigation: Navigation,
+        directory: CreateJotCoordinatorFactory.Directory?,
+        pdfs: [(data: Data, name: String)]
+    ) -> Coordinator
+}
+
+extension CreateJotCoordinatorFactoryProtocol {
+
+    func make(
+        navigation: Navigation,
+        directory: CreateJotCoordinatorFactory.Directory?,
+        pdfData: Data?
+    ) -> Coordinator {
+        make(navigation: navigation, directory: directory, pdfData: pdfData, pdfName: nil)
+    }
 }
 
 struct CreateJotCoordinatorFactory: CreateJotCoordinatorFactoryProtocol {
 
-    let repository: CreateJotRepositoryProtocol
+    struct Directory: Hashable, Sendable {
+        let url: URL
+    }
 
-    func make(navigation: Navigation) -> Coordinator {
+    let repository: CreateJotRepositoryProtocol
+    let externalFileImportService: ExternalFileImportServiceProtocol
+
+    func make(
+        navigation: Navigation,
+        directory: Directory?,
+        pdfData: Data? = nil,
+        pdfName: String? = nil
+    ) -> Coordinator {
         CreateJotCoordinator(
             navigation: navigation,
-            repository: repository
+            repository: repository,
+            directory: directory,
+            externalFileImportService: externalFileImportService,
+            initialPDFData: pdfData,
+            initialPDFName: pdfName
+        )
+    }
+
+    func makeBatch(
+        navigation: Navigation,
+        directory: Directory?,
+        pdfs: [(data: Data, name: String)]
+    ) -> Coordinator {
+        CreateJotBatchCoordinator(
+            navigation: navigation,
+            repository: repository,
+            directory: directory,
+            pdfs: pdfs
         )
     }
 }

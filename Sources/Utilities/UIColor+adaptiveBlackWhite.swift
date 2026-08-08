@@ -23,4 +23,10 @@ extension UIColor {
     static let adaptiveBlackWhite = UIColor { traits in
         traits.userInterfaceStyle == .dark ? .black : .white
     }
+
+    static let paperColor = UIColor { traits in
+        traits.userInterfaceStyle == .dark
+            ? .black
+            : UIColor(red: 0.99, green: 0.97, blue: 0.90, alpha: 1)
+    }
 }

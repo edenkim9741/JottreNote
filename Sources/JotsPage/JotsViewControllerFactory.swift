@@ -21,7 +21,7 @@ import UIKit
 @MainActor
 protocol JotsViewControllerFactoryProtocol: Sendable {
 
-    func make(coordinator: JotsCoordinatorProtocol) -> UIViewController
+    func make(coordinator: JotsCoordinatorProtocol, location: JotsLocation) -> UIViewController
 }
 
 struct JotsViewControllerFactory: JotsViewControllerFactoryProtocol {
@@ -31,14 +31,17 @@ struct JotsViewControllerFactory: JotsViewControllerFactoryProtocol {
     let textBarButtonItemFactory: TextBarButtonItemFactory
     let symbolBarButtonItemFactory: SymbolBarButtonItemFactory
     let logger: LoggerProtocol
+    let defaultsService: DefaultsServiceProtocol
 
-    func make(coordinator: JotsCoordinatorProtocol) -> UIViewController {
+    func make(coordinator: JotsCoordinatorProtocol, location: JotsLocation) -> UIViewController {
         let viewController = PageViewController(
             viewModel: JotsViewModel(
                 coordinator: coordinator,
                 repository: repository,
                 menuConfigurationFactory: menuConfigurationFactory,
-                logger: logger
+                logger: logger,
+                defaultsService: defaultsService,
+                location: location
             ),
             textBarButtonItemFactory: textBarButtonItemFactory,
             symbolBarButtonItemFactory: symbolBarButtonItemFactory
@@ -48,6 +51,14 @@ struct JotsViewControllerFactory: JotsViewControllerFactoryProtocol {
         #else
         viewController.navigationItem.largeTitleDisplayMode = .always
         #endif
+        if case .directory = location {
+            let homeItem = symbolBarButtonItemFactory.make(
+                symbolName: "house",
+                primaryAction: .action(UIAction { _ in Task { @MainActor in coordinator.openRoot() } })
+            )
+            viewController.navigationItem.leftItemsSupplementBackButton = true
+            viewController.navigationItem.setLeftBarButton(homeItem, animated: false)
+        }
         return viewController
     }
 }

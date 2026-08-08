@@ -30,14 +30,13 @@ protocol ShareJotRepositoryProtocol: Sendable {
 struct ShareJotRepository: ShareJotRepositoryProtocol {
 
     private enum Constants {
-
-        enum Rendering {
-            static let scale = CGFloat(2)
-        }
-
-        enum JpegEncoding {
-            static let compressionQuality = CGFloat(0.9)
-        }
+        static let ruledLineSpacing = CGFloat(32)
+        static let pageSpacing = CGFloat(32)
+        static let drawingScale = CGFloat(2)
+        static let maximumRasterPixels = CGFloat(32_000_000)
+        static let jpegCompressionQuality = CGFloat(0.9)
+        static let vectorInkSampleDistance = CGFloat(1.5)
+        static let minimumVectorInkRadius = CGFloat(0.1)
     }
 
     enum Failure: Error {
@@ -61,96 +60,422 @@ struct ShareJotRepository: ShareJotRepositoryProtocol {
     ) async throws -> URL {
         let jotFile = try jotFileService.readJotFile(jotFileInfo: jotFileInfo)
         let drawing = try PKDrawing(data: jotFile.jot.drawing)
-
-        let width = jotFile.jot.width
-        let contentHeight = max(drawing.bounds.maxY, width * sqrt(2))
-        let rect = CGRect(x: 0, y: 0, width: width, height: contentHeight)
-
         let temporaryDirectory = fileService.temporaryDirectory()
-        let fileName = jotFileInfo.name
 
-        switch format {
-        case .pdf:
-            return try await exportPDF(
-                drawing: drawing,
-                rect: rect,
-                url: temporaryDirectory.appendingPathComponent("\(fileName).pdf")
-            )
-        case .jpg:
-            return try await exportJPG(
-                drawing: drawing,
-                rect: rect,
-                url: temporaryDirectory.appendingPathComponent("\(fileName).jpg")
-            )
-        case .png:
-            return try await exportPNG(
-                drawing: drawing,
-                rect: rect,
-                url: temporaryDirectory.appendingPathComponent("\(fileName).png")
-            )
-        }
-    }
-
-    private func exportPDF(
-        drawing: PKDrawing,
-        rect: CGRect,
-        url: URL
-    ) async throws -> URL {
-        let data = await MainActor.run {
-            let renderer = UIGraphicsPDFRenderer(bounds: rect)
-            return renderer.pdfData { context in
-                context.beginPage()
-                let image = renderDrawing(drawing: drawing, rect: rect)
-                image.draw(in: rect)
-            }
-        }
-        try data.write(to: url)
-        return url
-    }
-
-    private func exportJPG(
-        drawing: PKDrawing,
-        rect: CGRect,
-        url: URL
-    ) async throws -> URL {
-        let data: Data = try await MainActor.run {
-            let renderer = UIGraphicsImageRenderer(bounds: rect)
-            let image = renderer.image { context in
-                UIColor.white.setFill()
-                context.fill(rect)
-                renderDrawing(drawing: drawing, rect: rect).draw(in: rect)
-            }
-            guard let jpegData = image.jpegData(compressionQuality: Constants.JpegEncoding.compressionQuality) else {
-                throw Failure.couldNotRenderImage
-            }
-            return jpegData
-        }
-        try data.write(to: url)
-        return url
-    }
-
-    private func exportPNG(
-        drawing: PKDrawing,
-        rect: CGRect,
-        url: URL
-    ) async throws -> URL {
-        let data: Data = try await MainActor.run {
-            let image = renderDrawing(drawing: drawing, rect: rect)
-            guard let pngData = image.pngData() else {
-                throw Failure.couldNotRenderImage
-            }
-            return pngData
-        }
-        try data.write(to: url)
-        return url
+        return try await exportOnMainActor(
+            drawing: drawing,
+            jot: jotFile.jot,
+            format: format,
+            url: temporaryDirectory
+                .appendingPathComponent(jotFileInfo.name)
+                .appendingPathExtension(format.fileExtension)
+        )
     }
 
     @MainActor
-    private func renderDrawing(drawing: PKDrawing, rect: CGRect) -> UIImage {
+    private func exportOnMainActor(
+        drawing: PKDrawing,
+        jot: Jot,
+        format: ShareFormat,
+        url: URL
+    ) throws -> URL {
+        let background = makeBackground(jot: jot)
+        switch format {
+        case .pdf:
+            return try exportPDF(drawing: drawing, background: background, url: url)
+        case .jpg:
+            return try exportRaster(
+                drawing: drawing,
+                background: background,
+                format: .jpg,
+                url: url
+            )
+        case .png:
+            return try exportRaster(
+                drawing: drawing,
+                background: background,
+                format: .png,
+                url: url
+            )
+        }
+    }
+
+    // MARK: - PDF
+
+    @MainActor
+    private func exportPDF(
+        drawing: PKDrawing,
+        background: Background,
+        url: URL
+    ) throws -> URL {
+        let pageBounds = CGRect(origin: .zero, size: background.pageSize)
+        let renderer = UIGraphicsPDFRenderer(bounds: pageBounds)
+
+        // Stream pages straight to disk. `pdfData` retained the whole output plus
+        // every autoreleased page bitmap and could terminate the app on long notes.
+        try renderer.writePDF(to: url) { rendererContext in
+            for pageIndex in 0..<background.totalPages {
+                autoreleasepool {
+                    rendererContext.beginPage()
+                    renderPageBackground(
+                        background,
+                        logicalPageIndex: pageIndex,
+                        in: pageBounds,
+                        context: rendererContext.cgContext
+                    )
+
+                    let pageY = CGFloat(pageIndex) * background.pageStride
+                    let canvasRect = CGRect(
+                        x: 0,
+                        y: pageY,
+                        width: background.pageSize.width,
+                        height: background.pageSize.height
+                    )
+                    renderVectorInk(
+                        drawing: drawing,
+                        canvasRect: canvasRect,
+                        pageBounds: pageBounds,
+                        context: rendererContext.cgContext
+                    )
+                }
+            }
+        }
+        return url
+    }
+
+    // MARK: - JPG / PNG
+
+    @MainActor
+    private func exportRaster(
+        drawing: PKDrawing,
+        background: Background,
+        format: ShareFormat,
+        url: URL
+    ) throws -> URL {
+        let rect = CGRect(
+            x: 0,
+            y: 0,
+            width: background.pageSize.width,
+            height: background.contentHeight
+        )
+        let rendererFormat = UIGraphicsImageRendererFormat.default()
+        rendererFormat.opaque = true
+        rendererFormat.scale = rasterScale(for: rect)
+
+        let image = UIGraphicsImageRenderer(bounds: rect, format: rendererFormat).image { rendererContext in
+            rendererContext.cgContext.setFillColor(gray: 0.92, alpha: 1)
+            rendererContext.cgContext.fill(rect)
+
+            for pageIndex in 0..<background.totalPages {
+                autoreleasepool {
+                    let pageOriginY = CGFloat(pageIndex) * background.pageStride
+                    let pageRect = CGRect(
+                        x: 0,
+                        y: pageOriginY,
+                        width: background.pageSize.width,
+                        height: background.pageSize.height
+                    )
+                    renderPageBackground(
+                        background,
+                        logicalPageIndex: pageIndex,
+                        in: pageRect,
+                        context: rendererContext.cgContext
+                    )
+                    let drawingImage = renderDrawingImage(
+                        drawing: drawing,
+                        rect: pageRect,
+                        scale: rendererFormat.scale
+                    )
+                    drawingImage.draw(in: pageRect)
+                }
+            }
+        }
+
+        let data: Data?
+        switch format {
+        case .jpg:
+            data = image.jpegData(compressionQuality: Constants.jpegCompressionQuality)
+        case .png:
+            data = image.pngData()
+        case .pdf:
+            data = nil
+        }
+        guard let data else { throw Failure.couldNotRenderImage }
+        try data.write(to: url, options: .atomic)
+        return url
+    }
+
+    // MARK: - Page layout and rendering
+
+    private struct Background {
+        let document: PDFRenderDocument?
+        let pageSize: CGSize
+        let insertedPageSlots: [Int]
+        let totalPages: Int
+
+        var pageStride: CGFloat { pageSize.height + Constants.pageSpacing }
+
+        var contentHeight: CGFloat {
+            CGFloat(totalPages) * pageSize.height
+                + CGFloat(max(0, totalPages - 1)) * Constants.pageSpacing
+        }
+
+        func pdfPageIndex(at logicalIndex: Int) -> Int? {
+            guard let document, !insertedPageSlots.contains(logicalIndex) else { return nil }
+            let precedingInsertions = insertedPageSlots.filter { $0 < logicalIndex }.count
+            let pageIndex = logicalIndex - precedingInsertions
+            guard pageIndex >= 0, pageIndex < document.pageCount else { return nil }
+            return pageIndex
+        }
+    }
+
+    @MainActor
+    private func makeBackground(jot: Jot) -> Background {
+        let defaultSize = CGSize(width: jot.width, height: jot.width * (4.0 / 3.0))
+        guard
+            let pdfData = jot.pdfData,
+            let result = try? PDFLoadService().load(data: pdfData, normalizedPageSize: defaultSize)
+        else {
+            return Background(
+                document: nil,
+                pageSize: defaultSize,
+                insertedPageSlots: [],
+                totalPages: max(1, 1 + jot.extraPages)
+            )
+        }
+
+        let legacySlots = Array(result.pageCount..<(result.pageCount + jot.extraPages))
+        let sourceSlots = jot.pdfInsertedPageSlots.isEmpty ? legacySlots : jot.pdfInsertedPageSlots
+        let maximumSlot = result.pageCount + sourceSlots.count
+        let slots = Array(Set(sourceSlots.filter { $0 >= 0 && $0 < maximumSlot })).sorted()
+        return Background(
+            document: result.document,
+            pageSize: result.pageSize,
+            insertedPageSlots: slots,
+            totalPages: max(1, result.pageCount + slots.count)
+        )
+    }
+
+    @MainActor
+    private func renderPageBackground(
+        _ background: Background,
+        logicalPageIndex: Int,
+        in rect: CGRect,
+        context: CGContext
+    ) {
+        if
+            let document = background.document,
+            let pageIndex = background.pdfPageIndex(at: logicalPageIndex)
+        {
+            document.drawPage(at: pageIndex, in: rect, context: context)
+        } else {
+            drawRuledPage(in: rect, context: context)
+        }
+    }
+
+    @MainActor
+    private func drawRuledPage(in rect: CGRect, context: CGContext) {
+        context.setFillColor(red: 0.99, green: 0.97, blue: 0.90, alpha: 1)
+        context.fill(rect)
+        context.setStrokeColor(gray: 0.62, alpha: 0.55)
+        context.setLineWidth(0.5)
+        var lineY = rect.minY + Constants.ruledLineSpacing
+        while lineY < rect.maxY {
+            context.move(to: CGPoint(x: rect.minX, y: lineY))
+            context.addLine(to: CGPoint(x: rect.maxX, y: lineY))
+            context.strokePath()
+            lineY += Constants.ruledLineSpacing
+        }
+    }
+
+    @MainActor
+    private func renderDrawingImage(drawing: PKDrawing, rect: CGRect, scale: CGFloat) -> UIImage {
         var image = UIImage()
         UITraitCollection(userInterfaceStyle: .light).performAsCurrent {
-            image = drawing.image(from: rect, scale: Constants.Rendering.scale)
+            image = drawing.image(from: rect, scale: max(0.1, scale))
         }
         return image
+    }
+
+    /// Writes PencilKit ink as filled PDF paths. `PKDrawing.image` must not be
+    /// used here because it embeds a fixed-resolution bitmap in the PDF.
+    @MainActor
+    private func renderVectorInk(
+        drawing: PKDrawing,
+        canvasRect: CGRect,
+        pageBounds: CGRect,
+        context: CGContext
+    ) {
+        context.saveGState()
+        defer { context.restoreGState() }
+
+        context.clip(to: pageBounds)
+        context.translateBy(x: -canvasRect.minX, y: -canvasRect.minY)
+
+        let lightTraits = UITraitCollection(userInterfaceStyle: .light)
+        for stroke in drawing.strokes where stroke.renderBounds.intersects(canvasRect) {
+            guard let vectorPath = makeVectorPath(for: stroke) else { continue }
+            let color = stroke.ink.color.resolvedColor(with: lightTraits)
+
+            context.saveGState()
+            context.concatenate(stroke.transform)
+            if let mask = stroke.mask {
+                context.addPath(mask.cgPath)
+                context.clip()
+            }
+            context.setFillColor(color.cgColor)
+            context.setAlpha(vectorPath.opacity)
+            if stroke.ink.inkType == .marker {
+                context.setBlendMode(.multiply)
+            }
+            context.addPath(vectorPath.path)
+            context.fillPath()
+            context.restoreGState()
+        }
+    }
+
+    private struct VectorInkPath {
+        let path: CGPath
+        let opacity: CGFloat
+    }
+
+    @MainActor
+    private func makeVectorPath(for stroke: PKStroke) -> VectorInkPath? {
+        let path = CGMutablePath()
+        var opacityTotal = CGFloat.zero
+        var opacitySampleCount = 0
+
+        let ranges = stroke.maskedPathRanges
+        if ranges.isEmpty {
+            let points: [PKStrokePoint]
+            if stroke.path.count > 1 {
+                points = Array(
+                    stroke.path.interpolatedPoints(
+                        in: 0...CGFloat(stroke.path.count - 1),
+                        by: .distance(Constants.vectorInkSampleDistance)
+                    )
+                )
+            } else {
+                points = Array(stroke.path)
+            }
+            appendVectorOutline(
+                points: points,
+                to: path,
+                opacityTotal: &opacityTotal,
+                opacitySampleCount: &opacitySampleCount
+            )
+        } else {
+            for range in ranges {
+                let points = Array(
+                    stroke.path.interpolatedPoints(
+                        in: range,
+                        by: .distance(Constants.vectorInkSampleDistance)
+                    )
+                )
+                appendVectorOutline(
+                    points: points,
+                    to: path,
+                    opacityTotal: &opacityTotal,
+                    opacitySampleCount: &opacitySampleCount
+                )
+            }
+        }
+
+        guard !path.isEmpty else { return nil }
+        let opacity = opacitySampleCount > 0
+            ? max(0, min(1, opacityTotal / CGFloat(opacitySampleCount)))
+            : 1
+        return VectorInkPath(path: path, opacity: opacity)
+    }
+
+    @MainActor
+    private func appendVectorOutline(
+        points: [PKStrokePoint],
+        to path: CGMutablePath,
+        opacityTotal: inout CGFloat,
+        opacitySampleCount: inout Int
+    ) {
+        let samples = points.compactMap { point -> (location: CGPoint, radius: CGFloat)? in
+            guard point.location.x.isFinite, point.location.y.isFinite else { return nil }
+            let radius = CGFloat(max(
+                Double(Constants.minimumVectorInkRadius),
+                max(abs(point.size.width), abs(point.size.height)) * 0.5
+            ))
+            opacityTotal += max(0, min(1, point.opacity))
+            opacitySampleCount += 1
+            return (point.location, radius)
+        }
+        guard let first = samples.first else { return }
+
+        if samples.count == 1 {
+            path.addEllipse(in: CGRect(
+                x: first.location.x - first.radius,
+                y: first.location.y - first.radius,
+                width: first.radius * 2,
+                height: first.radius * 2
+            ))
+            return
+        }
+
+        var leftEdge: [CGPoint] = []
+        var rightEdge: [CGPoint] = []
+        leftEdge.reserveCapacity(samples.count)
+        rightEdge.reserveCapacity(samples.count)
+
+        for index in samples.indices {
+            let previous = samples[index > samples.startIndex ? samples.index(before: index) : index].location
+            let next = samples[index < samples.index(before: samples.endIndex)
+                ? samples.index(after: index)
+                : index].location
+            let tangent = CGPoint(x: next.x - previous.x, y: next.y - previous.y)
+            let length = hypot(tangent.x, tangent.y)
+            let normal = length > 0.0001
+                ? CGPoint(x: -tangent.y / length, y: tangent.x / length)
+                : CGPoint(x: 0, y: 1)
+            let sample = samples[index]
+            leftEdge.append(CGPoint(
+                x: sample.location.x + normal.x * sample.radius,
+                y: sample.location.y + normal.y * sample.radius
+            ))
+            rightEdge.append(CGPoint(
+                x: sample.location.x - normal.x * sample.radius,
+                y: sample.location.y - normal.y * sample.radius
+            ))
+        }
+
+        path.move(to: leftEdge[0])
+        for point in leftEdge.dropFirst() {
+            path.addLine(to: point)
+        }
+        for point in rightEdge.reversed() {
+            path.addLine(to: point)
+        }
+        path.closeSubpath()
+
+        for sample in [first, samples[samples.index(before: samples.endIndex)]] {
+            path.addEllipse(in: CGRect(
+                x: sample.location.x - sample.radius,
+                y: sample.location.y - sample.radius,
+                width: sample.radius * 2,
+                height: sample.radius * 2
+            ))
+        }
+    }
+
+    private func rasterScale(for rect: CGRect) -> CGFloat {
+        let logicalPixels = rect.width * rect.height
+        guard logicalPixels.isFinite, logicalPixels > 0 else { return 1 }
+        return max(0.1, min(Constants.drawingScale, sqrt(Constants.maximumRasterPixels / logicalPixels)))
+    }
+}
+
+private extension ShareFormat {
+
+    var fileExtension: String {
+        switch self {
+        case .pdf: "pdf"
+        case .jpg: "jpg"
+        case .png: "png"
+        }
     }
 }

@@ -27,30 +27,27 @@ protocol JotsCoordinatorFactoryProtocol: Sendable {
 struct JotsCoordinatorFactory: JotsCoordinatorFactoryProtocol {
 
     let jotsViewControllerFactory: JotsViewControllerFactory
-
     let settingsCoordinatorFactory: SettingsCoordinatorFactory
-    let enableCloudCoordinatorFactory: EnableCloudCoordinatorFactory
     let editJotCoordinatorFactory: EditJotCoordinatorFactory
-    let cloudMigrationCoordinatorFactory: CloudMigrationCoordinatorFactory
     let createJotCoordinatorFactory: CreateJotCoordinatorFactoryProtocol
     let deleteJotCoordinatorFactory: DeleteJotCoordinatorFactoryProtocol
     let renameJotCoordinatorFactory: RenameJotCoordinatorFactoryProtocol
     let shareJotCoordinatorFactory: ShareJotCoordinatorFactoryProtocol
     let revealFileCoordinatorFactory: RevealFileCoordinatorFactoryProtocol
+    let trashViewControllerFactory: TrashViewControllerFactoryProtocol
 
     func make(navigation: Navigation) -> NavigationCoordinator {
         JotsCoordinator(
             navigation: navigation,
             jotsViewControllerFactory: jotsViewControllerFactory,
             settingsCoordinatorFactory: settingsCoordinatorFactory,
-            enableCloudCoordinatorFactory: enableCloudCoordinatorFactory,
             editJotCoordinatorFactory: editJotCoordinatorFactory,
-            cloudMigrationCoordinatorFactory: cloudMigrationCoordinatorFactory,
             createJotCoordinatorFactory: createJotCoordinatorFactory,
             deleteJotCoordinatorFactory: deleteJotCoordinatorFactory,
             renameJotCoordinatorFactory: renameJotCoordinatorFactory,
             shareJotCoordinatorFactory: shareJotCoordinatorFactory,
-            revealFileCoordinatorFactory: revealFileCoordinatorFactory
+            revealFileCoordinatorFactory: revealFileCoordinatorFactory,
+            trashViewControllerFactory: trashViewControllerFactory
         )
     }
 }

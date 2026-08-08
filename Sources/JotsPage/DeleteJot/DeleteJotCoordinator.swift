@@ -40,44 +40,39 @@ final class DeleteJotCoordinator: Coordinator {
 
     func start() {
         let alertController = UIAlertController(
-            title: L10n.Jots.Delete.title,
-            message: L10n.Jots.Delete.message,
+            title: String(localized: "jots.delete.moveToTrash.title", defaultValue: "Move to Trash?"),
+            message: nil,
             preferredStyle: .alert
         )
+        alertController.addAction(UIAlertAction(title: L10n.Action.cancel, style: .cancel))
         alertController.addAction(
             UIAlertAction(
-                title: L10n.Action.cancel,
-                style: .cancel
-            )
-        )
-        alertController.addAction(
-            UIAlertAction(
-                title: L10n.Action.delete,
+                title: String(localized: "jots.delete.moveToTrash.confirm", defaultValue: "Move to Trash"),
                 style: .destructive
             ) { [weak self] _ in
-                guard let self else {
-                    return
-                }
-                handleDeleteJot(jotFileInfo: jotFileInfo)
-                navigation.dismiss(animated: true) { [weak self] in
-                    Task { @MainActor in
-                        self?.onEnd?()
+                guard let self else { return }
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    guard await handleDeleteJot(jotFileInfo: jotFileInfo) else { return }
+                    navigation.dismiss(animated: true) { [weak self] in
+                        Task { @MainActor in self?.onEnd?() }
                     }
                 }
             }
         )
         navigation.present(alertController, animated: true)
-
     }
 
-    private func handleDeleteJot(jotFileInfo: JotFile.Info) {
+    private func handleDeleteJot(jotFileInfo: JotFile.Info) async -> Bool {
         do {
-            try repository.deleteJot(jotFileInfo: jotFileInfo)
+            try await repository.deleteJot(jotFileInfo: jotFileInfo)
+            return true
         } catch {
             showInfoAlert(
                 title: L10n.Jots.Delete.Error.generic(jotFileInfo.name),
                 message: error.localizedDescription
             )
+            return false
         }
     }
 

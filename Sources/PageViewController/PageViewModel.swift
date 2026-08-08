@@ -18,9 +18,37 @@
 
 import UIKit
 
+struct PageSelectionState: @unchecked Sendable {
+    let isSelecting: Bool
+    let selectedItemIDs: Set<AnyHashable>
+}
+
+@MainActor
+protocol PageSelectableViewModel: AnyObject {
+    var selectionState: AsyncStream<PageSelectionState> { get }
+
+    func didTapSelectButton()
+    func didTapCancelSelectionButton()
+    func didTapMoveSelectedButton()
+    func didTapDeleteSelectedButton()
+
+    func canSelectItem(_ item: PageCellItem) -> Bool
+    func didToggleSelection(for jotFileInfo: JotFile.Info)
+}
+
+extension PageSelectableViewModel {
+    func didTapSelectButton() { }
+    func didTapCancelSelectionButton() { }
+    func didTapMoveSelectedButton() { }
+    func didTapDeleteSelectedButton() { }
+    func canSelectItem(_ item: PageCellItem) -> Bool { false }
+    func didToggleSelection(for jotFileInfo: JotFile.Info) { }
+}
+
 @MainActor
 protocol PageViewModel: AnyObject {
     var title: String? { get }
+    var titleUpdates: AsyncStream<String?> { get }
     var leftNavigationItems: AsyncStream<[PageNavigationItem]> { get }
     var rightNavigationItems: AsyncStream<[PageNavigationItem]> { get }
 
@@ -30,15 +58,32 @@ protocol PageViewModel: AnyObject {
     func didLoad()
 }
 
+@MainActor
+protocol PageDragDropViewModel: AnyObject {
+    func canDrag(cellItem: PageCellItem) -> Bool
+    func canAddToDragSession(cellItem: PageCellItem, existingItems: [PageCellItem]) -> Bool
+    func canDrop(draggedCellItems: [PageCellItem], onto targetCellItem: PageCellItem) -> Bool
+    func performDrop(draggedCellItems: [PageCellItem], onto targetCellItem: PageCellItem)
+    func shouldSpringLoad(draggedCellItems: [PageCellItem], onto targetCellItem: PageCellItem) -> Bool
+    func springLoad(onto targetCellItem: PageCellItem)
+    func canDropIntoCurrentDirectory(draggedCellItems: [PageCellItem]) -> Bool
+    func performDropIntoCurrentDirectory(draggedCellItems: [PageCellItem])
+}
+
+extension PageDragDropViewModel {
+    func canAddToDragSession(cellItem: PageCellItem, existingItems: [PageCellItem]) -> Bool { canDrag(cellItem: cellItem) }
+    func shouldSpringLoad(draggedCellItems: [PageCellItem], onto targetCellItem: PageCellItem) -> Bool { false }
+    func springLoad(onto targetCellItem: PageCellItem) { }
+    func canDropIntoCurrentDirectory(draggedCellItems: [PageCellItem]) -> Bool { false }
+    func performDropIntoCurrentDirectory(draggedCellItems: [PageCellItem]) { }
+}
+
 extension PageViewModel {
+    var title: String? { nil }
 
-    var title: String? {
-        nil
-    }
+    var titleUpdates: AsyncStream<String?> { AsyncStream { $0.finish() } }
 
-    var actions: [PageCallToActionView.ActionConfiguration] {
-        []
-    }
+    var actions: [PageCallToActionView.ActionConfiguration] { [] }
 
     var leftNavigationItems: AsyncStream<[PageNavigationItem]> {
         AsyncStream { continuation in

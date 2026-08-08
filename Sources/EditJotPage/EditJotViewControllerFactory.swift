@@ -32,11 +32,12 @@ struct EditJotViewControllerFactory: EditJotViewControllerFactoryProtocol {
     let repository: EditJotRepositoryProtocol
     let menuConfigurationFactory: JotMenuConfigurationFactory
     let symbolBarButtonItemFactory: SymbolBarButtonItemFactory
+    let defaultsService: DefaultsServiceProtocol
     let logger: LoggerProtocol
 
     func make(
         jotFileInfo: JotFile.Info,
-        coordinator: EditJotCoordinatorProtocol,
+        coordinator: EditJotCoordinatorProtocol
     ) -> UIViewController {
         EditJotViewController(
             viewModel: EditJotViewModel(
@@ -44,9 +45,11 @@ struct EditJotViewControllerFactory: EditJotViewControllerFactoryProtocol {
                 repository: repository,
                 coordinator: coordinator,
                 menuConfigurationFactory: menuConfigurationFactory,
+                webDAVBackupService: WebDAVBackupService(defaultsService: defaultsService),
                 logger: logger
             ),
-            symbolBarButtonItemFactory: symbolBarButtonItemFactory
+            symbolBarButtonItemFactory: symbolBarButtonItemFactory,
+            defaultsService: defaultsService
         )
     }
 }

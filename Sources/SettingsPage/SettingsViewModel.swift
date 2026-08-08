@@ -22,7 +22,6 @@ import UIKit
 final class SettingsViewModel: PageViewModel {
 
     private enum Constants {
-
         static let userInterfaceStyleOptions: [UIUserInterfaceStyle] = [.unspecified, .dark, .light]
     }
 
@@ -40,6 +39,8 @@ final class SettingsViewModel: PageViewModel {
     private weak var coordinator: SettingsCoordinatorProtocol?
 
     private var loadingTask: Task<Void, Never>?
+    private var currentUserInterfaceStyle: UIUserInterfaceStyle = .unspecified
+    private var appVersion: String = "-"
 
     init(
         repository: SettingsRepositoryProtocol,
@@ -51,87 +52,57 @@ final class SettingsViewModel: PageViewModel {
             of: [PageCellItem].self,
             bufferingPolicy: .bufferingNewest(1)
         )
-
         (rightNavigationItems, rightNavigationItemsContinuation) = AsyncStream.makeStream(
             of: [PageNavigationItem].self,
             bufferingPolicy: .bufferingNewest(1)
         )
-
         rightNavigationItemsContinuation.yield([
             .symbol(systemImageName: "xmark") { [weak coordinator] in
-                Task { @MainActor in
-                    coordinator?.dismiss()
-                }
+                Task { @MainActor in coordinator?.dismiss() }
             }
         ])
     }
 
     func didLoad() {
+        appVersion = repository.appVersion()
         loadingTask = Task { [weak self] in
-            guard let repository = self?.repository else {
-                return
-            }
-            let shouldShowEnableICloudButton = repository.shouldShowEnableICloudButton()
-            let appVersion = repository.appVersion()
+            guard let repository = self?.repository else { return }
             for await userInterfaceStyle in repository.userInterfaceStyle() {
-                guard let self else {
-                    return
-                }
-                itemsContinuation.yield(
-                    makePageItems(
-                        userInterfaceStyle: userInterfaceStyle,
-                        shouldShowEnableICloudButton: shouldShowEnableICloudButton,
-                        appVersion: appVersion
-                    )
-                )
+                guard let self else { return }
+                currentUserInterfaceStyle = userInterfaceStyle
+                refreshItems()
             }
         }
     }
 
-    private func makePageItems(
-        userInterfaceStyle: UIUserInterfaceStyle,
-        shouldShowEnableICloudButton: Bool,
-        appVersion: String
-    ) -> [PageCellItem] {
-        var items = [
-            PageCellItem.settingsDropdown(
+    private func refreshItems() {
+        itemsContinuation.yield(makePageItems(userInterfaceStyle: currentUserInterfaceStyle))
+    }
+
+    private func makePageItems(userInterfaceStyle: UIUserInterfaceStyle) -> [PageCellItem] {
+        var items: [PageCellItem] = [
+            .settingsDropdown(
                 settingsDropdown: SettingsDropdownBusinessModel(
                     name: L10n.Settings.Appearance.title,
                     current: SettingsDropdownBusinessModel.Option(
                         label: SettingsViewModel.makeLabel(userInterfaceStyle: userInterfaceStyle),
                         value: userInterfaceStyle
                     ),
-                    options: Constants.userInterfaceStyleOptions.map { userInterfaceStyleOption in
+                    options: Constants.userInterfaceStyleOptions.map { style in
                         SettingsDropdownBusinessModel.Option(
-                            label: SettingsViewModel.makeLabel(userInterfaceStyle: userInterfaceStyleOption),
-                            value: userInterfaceStyleOption
+                            label: SettingsViewModel.makeLabel(userInterfaceStyle: style),
+                            value: style
                         )
                     }
                 ),
                 onAction: { [weak self] option in
-                    guard let style = option.value as? UIUserInterfaceStyle else {
-                        return
-                    }
+                    guard let style = option.value as? UIUserInterfaceStyle else { return }
                     self?.repository.updateUserInterfaceStyle(style)
                 }
             )
         ]
 
-        if shouldShowEnableICloudButton {
-            items.append(
-                .settingsExternalLink(
-                    settingsExternalLink: SettingsExternalLinkBusinessModel(
-                        name: L10n.Settings.ICloud.title,
-                        info: L10n.Settings.ICloud.info
-                    ),
-                    onAction: { [weak self] in
-                        Task { @MainActor [weak self] in
-                            self?.coordinator?.openExternalLink(url: EnableICloudSupportURL().toURL())
-                        }
-                    }
-                )
-            )
-        }
+        items.append(contentsOf: makeWebDAVItems())
 
         items.append(contentsOf: [
             .settingsExternalLink(
@@ -150,10 +121,55 @@ final class SettingsViewModel: PageViewModel {
                     name: L10n.Settings.Version.title,
                     value: appVersion
                 )
-            ),
+            )
         ])
 
         return items
+    }
+
+    private func makeWebDAVItems() -> [PageCellItem] {
+        let url = repository.getWebDAVURL()
+        let info = url.flatMap { $0.isEmpty ? nil : $0 } ?? "Not configured"
+        return [
+            .settingsExternalLink(
+                settingsExternalLink: SettingsExternalLinkBusinessModel(
+                    name: "WebDAV Backup",
+                    info: info
+                ),
+                onAction: { [weak self] in
+                    Task { @MainActor [weak self] in
+                        self?.showWebDAVSettings()
+                    }
+                }
+            )
+        ]
+    }
+
+    private func showWebDAVSettings() {
+        let initial = WebDAVSettingsViewController.Configuration(
+            url: repository.getWebDAVURL() ?? "",
+            username: repository.getWebDAVUsername() ?? "",
+            password: repository.getWebDAVPassword() ?? ""
+        )
+        coordinator?.showWebDAVSettings(
+            initial: initial,
+            onSave: { [weak self] config in
+                self?.repository.setWebDAVURL(config.url)
+                self?.repository.setWebDAVUsername(config.username)
+                self?.repository.setWebDAVPassword(config.password)
+                self?.refreshItems()
+            },
+            onTest: { [weak self] config in
+                await self?.repository.testWebDAVConnection(
+                    url: config.url,
+                    username: config.username,
+                    password: config.password
+                ) ?? false
+            },
+            onBackupAll: { [weak self] in
+                self?.repository.backupAllJots() ?? AsyncStream { $0.finish() }
+            }
+        )
     }
 
     private static func makeLabel(userInterfaceStyle: UIUserInterfaceStyle) -> String {

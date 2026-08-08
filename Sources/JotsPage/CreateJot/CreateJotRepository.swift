@@ -20,7 +20,17 @@ import UIKit
 
 protocol CreateJotRepositoryProtocol: Sendable {
 
-    func createJot(name: String) async throws -> JotFile.Info
+    func createJot(
+        name: String,
+        directory: CreateJotCoordinatorFactory.Directory?,
+        pdfData: Data?
+    ) async throws -> JotFile.Info
+
+    func importJotFile(
+        name: String,
+        data: Data,
+        directory: CreateJotCoordinatorFactory.Directory?
+    ) async throws -> JotFile.Info
 }
 
 struct CreateJotRepository: CreateJotRepositoryProtocol {
@@ -30,39 +40,34 @@ struct CreateJotRepository: CreateJotRepositoryProtocol {
         case fileExists
     }
 
-    private let localFileService: FileServiceProtocol
-    private let ubiquitousFileService: FileServiceProtocol
+    private let fileService: FileServiceProtocol
     private let jotFileService: JotFileServiceProtocol
 
     init(
-        localFileService: FileServiceProtocol,
-        ubiquitousFileService: FileServiceProtocol,
+        fileService: FileServiceProtocol,
         jotFileService: JotFileServiceProtocol
     ) {
-        self.localFileService = localFileService
-        self.ubiquitousFileService = ubiquitousFileService
+        self.fileService = fileService
         self.jotFileService = jotFileService
     }
 
-    func createJot(name: String) async throws -> JotFile.Info {
-        let fileService: FileServiceProtocol
-        let directory: URL
-        let isUbiquitous: Bool
+    func createJot(
+        name: String,
+        directory: CreateJotCoordinatorFactory.Directory?,
+        pdfData: Data?
+    ) async throws -> JotFile.Info {
+        let resolvedDirectory: URL
 
-        if let ubiquitousDirectory = try await ubiquitousFileService.documentsDirectory() {
-            fileService = ubiquitousFileService
-            directory = ubiquitousDirectory
-            isUbiquitous = true
-        } else if let localDirectory = try await localFileService.documentsDirectory() {
-            fileService = localFileService
-            directory = localDirectory
-            isUbiquitous = false
+        if let directory {
+            resolvedDirectory = directory.url
+        } else if let documentsDirectory = try await fileService.documentsDirectory() {
+            resolvedDirectory = documentsDirectory
         } else {
             throw Failure.couldNotCreateFile
         }
 
         let fileURL =
-            directory
+            resolvedDirectory
             .appendingPathComponent(name, isDirectory: false)
             .appendingPathExtension(JotFile.Info.fileExtension)
 
@@ -70,16 +75,44 @@ struct CreateJotRepository: CreateJotRepositoryProtocol {
             throw Failure.fileExists
         }
 
+        let jot: Jot
+        if let pdfData {
+            let empty = Jot.makeEmpty()
+            jot = Jot(version: empty.version, drawing: empty.drawing, width: empty.width, pdfData: pdfData)
+        } else {
+            jot = .makeEmpty()
+        }
         let jotFile = JotFile(
-            info: JotFile.Info(
-                url: fileURL,
-                name: name,
-                modificationDate: nil,
-                ubiquitousInfo: isUbiquitous ? UbiquitousInfo(downloadStatus: .current, isDownloading: false) : nil
-            ),
-            jot: .makeEmpty()
+            info: JotFile.Info(url: fileURL, name: name, modificationDate: nil),
+            jot: jot
         )
         try jotFileService.write(jotFile: jotFile)
         return jotFile.info
+    }
+
+    func importJotFile(
+        name: String,
+        data: Data,
+        directory: CreateJotCoordinatorFactory.Directory?
+    ) async throws -> JotFile.Info {
+        let resolvedDirectory: URL
+        if let directory {
+            resolvedDirectory = directory.url
+        } else if let documentsDirectory = try await fileService.documentsDirectory() {
+            resolvedDirectory = documentsDirectory
+        } else {
+            throw Failure.couldNotCreateFile
+        }
+
+        let fileURL = resolvedDirectory
+            .appendingPathComponent(name, isDirectory: false)
+            .appendingPathExtension(JotFile.Info.fileExtension)
+
+        guard !fileService.fileExists(fileURL: fileURL) else {
+            throw Failure.fileExists
+        }
+
+        try fileService.writeFile(fileURL: fileURL, data: data)
+        return JotFile.Info(url: fileURL, name: name, modificationDate: nil)
     }
 }

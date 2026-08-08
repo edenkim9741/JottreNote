@@ -30,15 +30,17 @@ final class JotCellViewModel: PageCellViewModel {
     let preview: Preview
     let jotMenuConfigurations: JotMenuConfigurations
     let onAction: @Sendable () -> Void
+    let onSelect: @Sendable () -> Void
 
     private let jot: JotBusinessModel
-    private let repository: JotsRepositoryProtocol
+    private let repository: JotPreviewProviderProtocol
 
     init(
         jot: JotBusinessModel,
         jotMenuConfigurations: JotMenuConfigurations,
-        repository: JotsRepositoryProtocol,
-        onAction: @Sendable @escaping () -> Void
+        repository: JotPreviewProviderProtocol,
+        onAction: @Sendable @escaping () -> Void,
+        onSelect: @Sendable @escaping () -> Void
     ) {
         self.name = jot.name
         self.preview =
@@ -51,6 +53,7 @@ final class JotCellViewModel: PageCellViewModel {
             }
         self.jotMenuConfigurations = jotMenuConfigurations
         self.onAction = onAction
+        self.onSelect = onSelect
         self.jot = jot
         self.repository = repository
     }
@@ -83,9 +86,14 @@ final class JotCellViewModel: PageCellViewModel {
             guard let self else {
                 return nil
             }
-            return UIMenu.make(
-                jotMenuConfigurations: self.jotMenuConfigurations.make(popoverAnchorProvider: {
-                    [weak sourceView] in
+            let selectAction = UIAction(
+                title: L10n.Action.select,
+                image: UIImage(systemName: "checkmark.circle")
+            ) { _ in
+                self.onSelect()
+            }
+            let menu = UIMenu.make(
+                jotMenuConfigurations: self.jotMenuConfigurations.make(popoverAnchorProvider: { [weak sourceView] in
                     guard let sourceView else {
                         return nil
                     }
@@ -95,6 +103,7 @@ final class JotCellViewModel: PageCellViewModel {
                     }
                 })
             )
+            return UIMenu(title: "", children: [selectAction] + menu.children)
         }
     }
 }

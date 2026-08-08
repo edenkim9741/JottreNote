@@ -34,4 +34,12 @@ struct Jot: Codable, Sendable {
     let width: CGFloat
     // NOTE: Kept for backwards compatibility.
     var lastModified: Double? = Double.zero
+    var pdfData: Data?
+    var extraPages: Int = 0
+    var pdfInsertedPageSlots: [Int] = []
+    // Per-stroke page index mapping. Each entry corresponds to the stroke at the
+    // same index inside the `PKDrawing.strokes` array. Used to record which
+    // logical page an ink stroke was created on so we can remove or query
+    // all strokes for a specific page efficiently.
+    var strokePageIndices: [Int] = []
 }

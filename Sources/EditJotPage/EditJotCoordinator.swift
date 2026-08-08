@@ -16,6 +16,7 @@
  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+import UniformTypeIdentifiers
 import UIKit
 
 protocol EditJotCoordinatorProtocol: NavigationCoordinator {
@@ -37,11 +38,23 @@ protocol EditJotCoordinatorProtocol: NavigationCoordinator {
     func canGoBack() -> Bool
     func goBack()
     func showInfoAlert(title: String, message: String)
+
+    func showConfirmAlert(
+        title: String,
+        message: String?,
+        confirmTitle: String,
+        isDestructive: Bool,
+        onConfirm: @escaping @Sendable () -> Void
+    )
+
+    func showPDFPicker(onPick: @MainActor @Sendable @escaping (Data?) -> Void)
 }
 
 final class EditJotCoordinator: NavigationCoordinator, EditJotCoordinatorProtocol {
 
     private var retainedInfoAlertCoordinator: Coordinator?
+
+    private var documentPickerAdapter: DocumentPickerAdapter?
 
     private var retainedJotConflictCoordinator: Coordinator?
     private var retainedShareJotCoordinator: Coordinator?
@@ -51,6 +64,7 @@ final class EditJotCoordinator: NavigationCoordinator, EditJotCoordinatorProtoco
 
     private let navigation: Navigation
     private let repository: EditJotRepositoryProtocol
+    private let externalFileImportService: ExternalFileImportServiceProtocol
     private let editJotViewControllerFactory: EditJotViewControllerFactoryProtocol
     private let jotConflictCoordinatorFactory: JotConflictCoordinatorFactoryProtocol
     private let renameJotCoordinatorFactory: RenameJotCoordinatorFactoryProtocol
@@ -61,6 +75,7 @@ final class EditJotCoordinator: NavigationCoordinator, EditJotCoordinatorProtoco
     init(
         navigation: Navigation,
         repository: EditJotRepositoryProtocol,
+        externalFileImportService: ExternalFileImportServiceProtocol,
         editJotViewControllerFactory: EditJotViewControllerFactoryProtocol,
         jotConflictCoordinatorFactory: JotConflictCoordinatorFactoryProtocol,
         renameJotCoordinatorFactory: RenameJotCoordinatorFactoryProtocol,
@@ -70,6 +85,7 @@ final class EditJotCoordinator: NavigationCoordinator, EditJotCoordinatorProtoco
     ) {
         self.navigation = navigation
         self.repository = repository
+        self.externalFileImportService = externalFileImportService
         self.editJotViewControllerFactory = editJotViewControllerFactory
         self.jotConflictCoordinatorFactory = jotConflictCoordinatorFactory
         self.renameJotCoordinatorFactory = renameJotCoordinatorFactory
@@ -88,21 +104,11 @@ final class EditJotCoordinator: NavigationCoordinator, EditJotCoordinatorProtoco
     func handle(url: URL) -> [UIViewController] {
         guard
             let editJotURL = EditJotURL(url: url),
-            let jotFileInfo = JotFile.Info(
-                url: editJotURL.fileURL,
-                modificationDate: nil,
-                ubiquitousInfo: repository.ubiquitousInfo(url: editJotURL.fileURL)
-            )
+            let jotFileInfo = JotFile.Info(url: editJotURL.fileURL, modificationDate: nil)
         else {
             return []
         }
-
-        return [
-            editJotViewControllerFactory.make(
-                jotFileInfo: jotFileInfo,
-                coordinator: self
-            )
-        ]
+        return [editJotViewControllerFactory.make(jotFileInfo: jotFileInfo, coordinator: self)]
     }
 
     func showShareJot(
@@ -208,5 +214,99 @@ final class EditJotCoordinator: NavigationCoordinator, EditJotCoordinatorProtoco
             self?.retainedInfoAlertCoordinator = nil
         }
         infoAlertCoordinator.start()
+    }
+
+    func showConfirmAlert(
+        title: String,
+        message: String?,
+        confirmTitle: String,
+        isDestructive: Bool,
+        onConfirm: @escaping @Sendable () -> Void
+    ) {
+        let alertController = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        alertController.addAction(
+            UIAlertAction(title: L10n.Action.cancel, style: .cancel)
+        )
+        let style: UIAlertAction.Style = isDestructive ? .destructive : .default
+        alertController.addAction(
+            UIAlertAction(title: confirmTitle, style: style) { _ in
+                onConfirm()
+            }
+        )
+        navigation.present(alertController, animated: true)
+    }
+
+    func showPDFPicker(onPick: @MainActor @Sendable @escaping (Data?) -> Void) {
+        let adapter = DocumentPickerAdapter(
+            externalFileImportService: externalFileImportService,
+            onPick: { @MainActor [weak self] data in
+                guard let self else {
+                    onPick(nil)
+                    return
+                }
+                self.navigation.dismiss(animated: true) {
+                    Task { @MainActor in onPick(data) }
+                }
+            },
+            onCancel: { @MainActor [weak self] in
+                self?.navigation.dismiss(animated: true) {
+                    Task { @MainActor in onPick(nil) }
+                }
+            }
+        )
+
+        documentPickerAdapter = adapter
+
+        let picker = UIDocumentPickerViewController(
+            forOpeningContentTypes: [UTType.pdf],
+            asCopy: true
+        )
+        picker.delegate = adapter
+        picker.allowsMultipleSelection = false
+        navigation.present(picker, animated: true)
+    }
+}
+
+// MARK: - Document Picker
+
+private final class DocumentPickerAdapter: NSObject, UIDocumentPickerDelegate {
+
+    private let externalFileImportService: ExternalFileImportServiceProtocol
+    private let onPick: @MainActor @Sendable (Data?) -> Void
+    private let onCancel: @MainActor @Sendable () -> Void
+
+    init(
+        externalFileImportService: ExternalFileImportServiceProtocol,
+        onPick: @MainActor @Sendable @escaping (Data?) -> Void,
+        onCancel: @MainActor @Sendable @escaping () -> Void
+    ) {
+        self.externalFileImportService = externalFileImportService
+        self.onPick = onPick
+        self.onCancel = onCancel
+    }
+
+    func documentPicker(
+        _ controller: UIDocumentPickerViewController,
+        didPickDocumentsAt urls: [URL]
+    ) {
+        guard let url = urls.first else {
+            Task { @MainActor [onCancel] in onCancel() }
+            return
+        }
+
+        Task.detached { [url, externalFileImportService, onPick] in
+            let data: Data?
+            do {
+                let imported = try externalFileImportService.importAndReadFile(sourceURL: url)
+                data = imported.data
+            } catch {
+                data = nil
+            }
+            await MainActor.run { onPick(data) }
+        }
+    }
+
+    func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+        Task { @MainActor [onCancel] in onCancel() }
     }
 }

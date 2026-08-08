@@ -21,9 +21,9 @@ import UIKit
 protocol JotsCoordinatorProtocol: NavigationCoordinator {
 
     func openSettings()
-    func openCreateJot()
+    func openCreateJot(location: JotsLocation)
     func openJot(jotFileInfo: JotFile.Info, prefersNewWindow: Bool)
-    func openEnableCloudPage()
+    func openFolder(folder: FolderBusinessModel)
     func showShareJot(
         jotFileInfo: JotFile.Info,
         format: ShareFormat,
@@ -33,24 +33,46 @@ protocol JotsCoordinatorProtocol: NavigationCoordinator {
     func openDeleteJot(jotFileInfo: JotFile.Info)
     func showInfoAlert(title: String, message: String)
     func showInFiles(jotFileInfo: JotFile.Info)
+    func openRoot()
+
+    func openTrash()
+
+    func showTextInputAlert(
+        title: String,
+        message: String?,
+        placeholder: String,
+        initialValue: String?,
+        onSubmit: @escaping @Sendable (_ text: String) -> Void
+    )
+
+    func showFolderSelectionAlert(
+        title: String,
+        message: String?,
+        folders: [FolderBusinessModel],
+        onSelect: @escaping @Sendable (_ folder: FolderBusinessModel?) -> Void
+    )
+
+    func showConfirmAlert(
+        title: String,
+        message: String?,
+        confirmTitle: String,
+        isDestructive: Bool,
+        onConfirm: @escaping @Sendable () -> Void
+    )
 }
 
 @MainActor
 final class JotsCoordinator: NavigationCoordinator, JotsCoordinatorProtocol {
-
-    private var cloudMigrationTask: Task<Void, Never>?
 
     private var retainedInfoAlertCoordinator: Coordinator?
     private var retainedShareJotCoordinator: Coordinator?
     private var retainedRenameJotCoordinator: Coordinator?
     private var retainedDeleteJotCoordinator: Coordinator?
     private var retainedCreateJotCoordinator: Coordinator?
-    private var retainedCloudMigrationCoordinator: Coordinator?
     private var retainedRevealFileCoordinator: Coordinator?
     private var retainedSettingsCoordinator: Coordinator?
-    private var retainedEnableCloudCoordinator: Coordinator?
-
     private var retainedJotsViewController: UIViewController?
+    private var retainedTrashViewController: UIViewController?
 
     private lazy var childCoordinators: [NavigationCoordinator] = [
         editJotCoordinatorFactory.make(navigation: navigation)
@@ -59,44 +81,39 @@ final class JotsCoordinator: NavigationCoordinator, JotsCoordinatorProtocol {
     private let navigation: Navigation
     private let jotsViewControllerFactory: JotsViewControllerFactoryProtocol
     private let settingsCoordinatorFactory: SettingsCoordinatorFactoryProtocol
-    private let enableCloudCoordinatorFactory: EnableCloudCoordinatorFactoryProtocol
     private let editJotCoordinatorFactory: EditJotCoordinatorFactoryProtocol
-    private let cloudMigrationCoordinatorFactory: CloudMigrationCoordinatorFactoryProtocol
     private let createJotCoordinatorFactory: CreateJotCoordinatorFactoryProtocol
     private let deleteJotCoordinatorFactory: DeleteJotCoordinatorFactoryProtocol
     private let renameJotCoordinatorFactory: RenameJotCoordinatorFactoryProtocol
     private let shareJotCoordinatorFactory: ShareJotCoordinatorFactoryProtocol
     private let revealFileCoordinatorFactory: RevealFileCoordinatorFactoryProtocol
+    private let trashViewControllerFactory: TrashViewControllerFactoryProtocol
 
     init(
         navigation: Navigation,
         jotsViewControllerFactory: JotsViewControllerFactoryProtocol,
         settingsCoordinatorFactory: SettingsCoordinatorFactoryProtocol,
-        enableCloudCoordinatorFactory: EnableCloudCoordinatorFactoryProtocol,
         editJotCoordinatorFactory: EditJotCoordinatorFactoryProtocol,
-        cloudMigrationCoordinatorFactory: CloudMigrationCoordinatorFactoryProtocol,
         createJotCoordinatorFactory: CreateJotCoordinatorFactoryProtocol,
         deleteJotCoordinatorFactory: DeleteJotCoordinatorFactoryProtocol,
         renameJotCoordinatorFactory: RenameJotCoordinatorFactoryProtocol,
         shareJotCoordinatorFactory: ShareJotCoordinatorFactoryProtocol,
-        revealFileCoordinatorFactory: RevealFileCoordinatorFactoryProtocol
+        revealFileCoordinatorFactory: RevealFileCoordinatorFactoryProtocol,
+        trashViewControllerFactory: TrashViewControllerFactoryProtocol
     ) {
         self.navigation = navigation
         self.jotsViewControllerFactory = jotsViewControllerFactory
         self.settingsCoordinatorFactory = settingsCoordinatorFactory
-        self.enableCloudCoordinatorFactory = enableCloudCoordinatorFactory
         self.editJotCoordinatorFactory = editJotCoordinatorFactory
-        self.cloudMigrationCoordinatorFactory = cloudMigrationCoordinatorFactory
         self.createJotCoordinatorFactory = createJotCoordinatorFactory
         self.deleteJotCoordinatorFactory = deleteJotCoordinatorFactory
         self.renameJotCoordinatorFactory = renameJotCoordinatorFactory
         self.shareJotCoordinatorFactory = shareJotCoordinatorFactory
         self.revealFileCoordinatorFactory = revealFileCoordinatorFactory
+        self.trashViewControllerFactory = trashViewControllerFactory
     }
 
-    func shouldHandle(url: URL) -> Bool {
-        true
-    }
+    func shouldHandle(url: URL) -> Bool { true }
 
     func handle(url: URL) -> [UIViewController] {
         var viewControllers: [UIViewController]
@@ -104,43 +121,81 @@ final class JotsCoordinator: NavigationCoordinator, JotsCoordinatorProtocol {
         if let retainedJotsViewController {
             viewControllers = [retainedJotsViewController]
         } else {
-            let jotsViewController = jotsViewControllerFactory.make(coordinator: self)
+            let jotsViewController = jotsViewControllerFactory.make(coordinator: self, location: .root)
             self.retainedJotsViewController = jotsViewController
             viewControllers = [jotsViewController]
         }
 
-        if let childCoordinator = childCoordinators.first(where: { $0.shouldHandle(url: url) }) {
-            viewControllers.append(contentsOf: childCoordinator.handle(url: url))
+        if TrashURL(url: url) != nil {
+            let trashVC = trashViewControllerFactory.make(coordinator: self)
+            retainedTrashViewController = trashVC
+            viewControllers.append(trashVC)
             return viewControllers
         }
 
-        showCloudMigrationPageIfNeeded()
+        if let folderURL = JotsFolderURL(url: url) {
+            viewControllers.append(contentsOf: makeFolderViewControllers(folderURL: folderURL))
+            return viewControllers
+        }
+
+        if let childCoordinator = childCoordinators.first(where: { $0.shouldHandle(url: url) }) {
+            if let editJotURL = EditJotURL(url: url) {
+                viewControllers.append(contentsOf: makeFolderViewControllersForFile(fileURL: editJotURL.fileURL))
+            }
+            viewControllers.append(contentsOf: childCoordinator.handle(url: url))
+        }
 
         return viewControllers
     }
 
+    private func makeFolderViewControllersForFile(fileURL: URL) -> [UIViewController] {
+        let parentFolder = fileURL.deletingLastPathComponent()
+        guard parentFolder.lastPathComponent != "Documents" else { return [] }
+        return makeFolderViewControllers(folderURL: JotsFolderURL(folderURL: parentFolder))
+    }
+
+    private func makeFolderViewControllers(folderURL: JotsFolderURL) -> [UIViewController] {
+        var chain = [URL]()
+        var pointer = folderURL.folderURL
+        while pointer.lastPathComponent != "Documents" {
+            chain.append(pointer)
+            pointer = pointer.deletingLastPathComponent()
+        }
+        chain.reverse()
+
+        return chain.map { url in
+            jotsViewControllerFactory.make(
+                coordinator: self,
+                location: .directory(.init(url: url, name: url.lastPathComponent))
+            )
+        }
+    }
+
     func openSettings() {
-        let settingsCoordinator = settingsCoordinatorFactory.make(navigation: navigation)
-        retainedSettingsCoordinator = settingsCoordinator
-        settingsCoordinator.onEnd = { [weak self] in
-            self?.retainedSettingsCoordinator = nil
-        }
-        settingsCoordinator.start()
+        let coordinator = settingsCoordinatorFactory.make(navigation: navigation)
+        retainedSettingsCoordinator = coordinator
+        coordinator.onEnd = { [weak self] in self?.retainedSettingsCoordinator = nil }
+        coordinator.start()
     }
 
-    func openCreateJot() {
-        let createJotCoordinator = createJotCoordinatorFactory.make(navigation: navigation)
-        retainedCreateJotCoordinator = createJotCoordinator
-        createJotCoordinator.onEnd = { [weak self] in
-            self?.retainedCreateJotCoordinator = nil
+    func openCreateJot(location: JotsLocation) {
+        let directory: CreateJotCoordinatorFactory.Directory?
+        if case let .directory(directoryLocation) = location {
+            directory = CreateJotCoordinatorFactory.Directory(url: directoryLocation.url)
+        } else {
+            directory = nil
         }
-        createJotCoordinator.start()
+        let coordinator = createJotCoordinatorFactory.make(navigation: navigation, directory: directory, pdfData: nil)
+        retainedCreateJotCoordinator = coordinator
+        coordinator.onEnd = { [weak self] in self?.retainedCreateJotCoordinator = nil }
+        coordinator.start()
     }
 
-    func openJot(
-        jotFileInfo: JotFile.Info,
-        prefersNewWindow: Bool
-    ) {
+    func openFolder(folder: FolderBusinessModel) {
+        navigation.open(url: JotsFolderURL(folderURL: folder.url))
+    }
+
+    func openJot(jotFileInfo: JotFile.Info, prefersNewWindow: Bool) {
         let url = EditJotURL(jotFileInfo: jotFileInfo)
         #if targetEnvironment(macCatalyst)
         navigation.openScene(url: url)
@@ -151,15 +206,6 @@ final class JotsCoordinator: NavigationCoordinator, JotsCoordinatorProtocol {
             navigation.open(url: url)
         }
         #endif
-    }
-
-    func openEnableCloudPage() {
-        let enableCloudCoordinator = enableCloudCoordinatorFactory.make(navigation: navigation)
-        retainedEnableCloudCoordinator = enableCloudCoordinator
-        enableCloudCoordinator.onEnd = { [weak self] in
-            self?.retainedEnableCloudCoordinator = nil
-        }
-        enableCloudCoordinator.start()
     }
 
     func showShareJot(
@@ -174,80 +220,104 @@ final class JotsCoordinator: NavigationCoordinator, JotsCoordinatorProtocol {
             configurePopoverAnchor: configurePopoverAnchor
         )
         retainedShareJotCoordinator = coordinator
-        coordinator.onEnd = { [weak self] in
-            self?.retainedShareJotCoordinator = nil
-        }
+        coordinator.onEnd = { [weak self] in self?.retainedShareJotCoordinator = nil }
         coordinator.start()
     }
 
     func showRenameAlert(jotFileInfo: JotFile.Info) {
         let coordinator = renameJotCoordinatorFactory.make(
-            jotFileInfo: jotFileInfo,
-            navigation: navigation
-        ) { _ in
-            /* no-op */
-        }
+            jotFileInfo: jotFileInfo, navigation: navigation
+        ) { _ in }
         retainedRenameJotCoordinator = coordinator
-        coordinator.onEnd = { [weak self] in
-            self?.retainedRenameJotCoordinator = nil
-        }
+        coordinator.onEnd = { [weak self] in self?.retainedRenameJotCoordinator = nil }
         coordinator.start()
     }
 
     func openDeleteJot(jotFileInfo: JotFile.Info) {
-        let deleteJotCoordinator = deleteJotCoordinatorFactory.make(
-            jotFileInfo: jotFileInfo,
-            navigation: navigation
-        )
-        retainedDeleteJotCoordinator = deleteJotCoordinator
-        deleteJotCoordinator.onEnd = { [weak self] in
-            self?.retainedDeleteJotCoordinator = nil
-        }
-        deleteJotCoordinator.start()
+        let coordinator = deleteJotCoordinatorFactory.make(jotFileInfo: jotFileInfo, navigation: navigation)
+        retainedDeleteJotCoordinator = coordinator
+        coordinator.onEnd = { [weak self] in self?.retainedDeleteJotCoordinator = nil }
+        coordinator.start()
     }
 
-    func showInfoAlert(
-        title: String,
-        message: String
-    ) {
-        let infoAlertCoordinator = InfoAlertCoordinator(
-            navigation: navigation,
-            title: title,
-            message: message
-        )
-        retainedInfoAlertCoordinator = infoAlertCoordinator
-        infoAlertCoordinator.onEnd = { [weak self] in
-            self?.retainedInfoAlertCoordinator = nil
-        }
-        infoAlertCoordinator.start()
+    func showInfoAlert(title: String, message: String) {
+        let coordinator = InfoAlertCoordinator(navigation: navigation, title: title, message: message)
+        retainedInfoAlertCoordinator = coordinator
+        coordinator.onEnd = { [weak self] in self?.retainedInfoAlertCoordinator = nil }
+        coordinator.start()
+    }
+
+    func openRoot() {
+        navigation.open(url: JotsPageURL())
+    }
+
+    func openTrash() {
+        navigation.open(url: TrashURL().toURL())
     }
 
     func showInFiles(jotFileInfo: JotFile.Info) {
-        let revealFileCoordinator = revealFileCoordinatorFactory.make(
-            jotFileInfo: jotFileInfo,
-            navigation: navigation
+        let coordinator = revealFileCoordinatorFactory.make(jotFileInfo: jotFileInfo, navigation: navigation)
+        retainedRevealFileCoordinator = coordinator
+        coordinator.onEnd = { [weak self] in self?.retainedRevealFileCoordinator = nil }
+        coordinator.start()
+    }
+
+    func showTextInputAlert(
+        title: String,
+        message: String?,
+        placeholder: String,
+        initialValue: String?,
+        onSubmit: @escaping @Sendable (String) -> Void
+    ) {
+        let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        alert.addTextField { field in
+            field.placeholder = placeholder
+            field.text = initialValue
+            field.autocapitalizationType = .sentences
+            field.returnKeyType = .done
+        }
+        alert.addAction(UIAlertAction(title: L10n.Action.cancel, style: .cancel))
+        alert.addAction(
+            UIAlertAction(title: L10n.Action.done, style: .default) { _ in
+                guard let text = alert.textFields?.first?.text else { return }
+                onSubmit(text)
+            }
         )
-        retainedRevealFileCoordinator = revealFileCoordinator
-        revealFileCoordinator.onEnd = { [weak self] in
-            self?.retainedRevealFileCoordinator = nil
-        }
-        revealFileCoordinator.start()
+        navigation.present(alert, animated: true)
     }
 
-    private func showCloudMigrationPageIfNeeded() {
-        let cloudMigrationCoordinator = cloudMigrationCoordinatorFactory.make(navigation: navigation)
-        guard cloudMigrationCoordinator.shouldStart() else {
-            return
-        }
-
-        retainedCloudMigrationCoordinator = cloudMigrationCoordinator
-        cloudMigrationCoordinator.onEnd = { [weak self] in
-            self?.retainedCloudMigrationCoordinator = nil
-        }
-        cloudMigrationCoordinator.start()
+    func showFolderSelectionAlert(
+        title: String,
+        message: String?,
+        folders: [FolderBusinessModel],
+        onSelect: @escaping @Sendable (FolderBusinessModel?) -> Void
+    ) {
+        let picker = FolderPickerViewController(
+            title: title,
+            folders: folders,
+            onConfirm: { folder in onSelect(folder) }
+        )
+        let nav = UINavigationController(rootViewController: picker)
+        nav.modalPresentationStyle = .formSheet
+        navigation.present(nav, animated: true)
     }
 
-    deinit {
-        cloudMigrationTask?.cancel()
+    func showConfirmAlert(
+        title: String,
+        message: String?,
+        confirmTitle: String,
+        isDestructive: Bool,
+        onConfirm: @escaping @Sendable () -> Void
+    ) {
+        let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: L10n.Action.cancel, style: .cancel))
+        alert.addAction(
+            UIAlertAction(title: confirmTitle, style: isDestructive ? .destructive : .default) { _ in
+                onConfirm()
+            }
+        )
+        navigation.present(alert, animated: true)
     }
 }
+
+extension JotsCoordinator: TrashCoordinatorProtocol { }

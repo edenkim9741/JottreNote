@@ -1,6 +1,6 @@
 name: Jottre
 options:
-  bundleIdPrefix: com.antonlorani
+  bundleIdPrefix: com.edenkim
   deploymentTarget:
     iOS: "15.0"
   knownRegions:
@@ -29,13 +29,13 @@ options:
 
 settings:
   base:
-    DEVELOPMENT_TEAM: Y78RPE9KK3
+    DEVELOPMENT_TEAM: VKZ635AGJ6
 
 targets:
   Jottre:
     type: application
     platform: iOS
-    deploymentTarget: "15.0"
+    deploymentTarget: "16.0"
     sources:
       - Sources
       - path: Resources/Assets.xcassets
@@ -61,11 +61,17 @@ targets:
             CFBundleTypeRole: Editor
             LSHandlerRank: Owner
             LSItemContentTypes:
-              - com.antonlorani.jottre.jot
+              - com.edenkim.jottre.jot
+          - CFBundleTypeName: PDF
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Alternate
+            LSItemContentTypes:
+              - com.adobe.pdf
+              - public.data
         LSApplicationQueriesSchemes:
           - shareddocuments
         UTExportedTypeDeclarations:
-          - UTTypeIdentifier: com.antonlorani.jottre.jot
+          - UTTypeIdentifier: com.edenkim.jottre.jot
             UTTypeDescription: Jottre Jot
             UTTypeConformsTo:
               - public.data
@@ -76,31 +82,21 @@ targets:
         LSSupportsOpeningDocumentsInPlace: true
         NSQuitAlwaysKeepsWindows: true
         NSUserActivityTypes:
-          - com.antonlorani.jottre.openJot
+          - com.edenkim.jottre.openJot
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: true
           UISceneConfigurations:
             UIWindowSceneSessionRoleApplication:
               - UISceneConfigurationName: "Default Configuration"
                 UISceneDelegateClassName: "$(PRODUCT_MODULE_NAME).SceneDelegate"
-        NSUbiquitousContainers:
-          iCloud.com.antonlorani.jottre:
-            NSUbiquitousContainerIsDocumentScopePublic: true
-            NSUbiquitousContainerSupportedFolderLevels: Any
-            NSUbiquitousContainerName: Jottre
     entitlements:
       path: Jottre.entitlements
       properties:
         com.apple.security.files.user-selected.read-write: true
-        com.apple.developer.icloud-container-identifiers:
-          - iCloud.com.antonlorani.jottre
-        com.apple.developer.icloud-services:
-          - CloudDocuments
-        com.apple.developer.ubiquity-container-identifiers:
-          - iCloud.com.antonlorani.jottre
+
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.antonlorani.jottre
+        PRODUCT_BUNDLE_IDENTIFIER: com.edenkim.jottre
         PRODUCT_NAME: Jottre
         SWIFT_VERSION: "6.0"
         SWIFT_STRICT_CONCURRENCY: complete
@@ -108,7 +104,7 @@ targets:
         SUPPORTS_MACCATALYST: YES
         MACCATALYST_UI_IDIOM: mac
         DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: NO
-        BUNDLE_IDENTIFIER_MACCATALYST: com.antonlorani.jottre
+        BUNDLE_IDENTIFIER_MACCATALYST: com.edenkim.jottre
         SWIFT_EMIT_LOC_STRINGS: YES
         ENABLE_HARDENED_RUNTIME: YES
         ENABLE_APP_SANDBOX: YES
@@ -135,7 +131,7 @@ targets:
       - target: Jottre
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.antonlorani.jottre.JottreTests
+        PRODUCT_BUNDLE_IDENTIFIER: com.edenkim.jottre.JottreTests
         SWIFT_VERSION: "6.0"
         SWIFT_STRICT_CONCURRENCY: complete
         GENERATE_INFOPLIST_FILE: YES
@@ -150,14 +146,14 @@ targets:
       path: AppKitPlugin/Info.plist
       properties:
         CFBundleName: AppKitPlugin
-        CFBundleIdentifier: com.antonlorani.jottre.AppKitPlugin
-        CFBundleVersion: 1
-        CFBundleShortVersionString: 1.0
+        CFBundleIdentifier: com.edenkim.jottre.AppKitPlugin
+        CFBundleVersion: 1.3.0
+        CFBundleShortVersionString: 1.3.0
         CFBundlePackageType: BNDL
         CFBundleExecutable: AppKitPlugin
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.antonlorani.jottre.AppKitPlugin
+        PRODUCT_BUNDLE_IDENTIFIER: com.edenkim.jottre.AppKitPlugin
         SWIFT_VERSION: "6.0"
         CODE_SIGN_STYLE: Manual
         CODE_SIGN_IDENTITY: "-"

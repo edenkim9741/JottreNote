@@ -43,6 +43,9 @@ struct JotMenuConfigurationFactory: Sendable {
         onDuplicate: @Sendable @escaping () -> Void,
         onDelete: @Sendable @escaping () -> Void,
         onShowInFiles: @Sendable @escaping () -> Void,
+        onImportPDF: (@Sendable () -> Void)? = nil,
+        onAddPage: (@Sendable () -> Void)? = nil,
+        onDeletePage: (@Sendable () -> Void)? = nil,
         onOpenInNewWindow: (@Sendable () -> Void)? = nil
     ) -> JotMenuConfigurations {
         JotMenuConfigurations { popoverAnchorProvider in
@@ -61,7 +64,7 @@ struct JotMenuConfigurationFactory: Sendable {
                 )
             }
 
-            menuConfiguration.append(contentsOf: [
+            menuConfiguration.append(
                 .action(
                     JotMenuConfiguration.Action(
                         title: L10n.Action.rename,
@@ -69,7 +72,9 @@ struct JotMenuConfigurationFactory: Sendable {
                     ) {
                         onRename()
                     }
-                ),
+                )
+            )
+            menuConfiguration.append(
                 .action(
                     JotMenuConfiguration.Action(
                         title: L10n.Action.duplicate,
@@ -77,7 +82,9 @@ struct JotMenuConfigurationFactory: Sendable {
                     ) {
                         onDuplicate()
                     }
-                ),
+                )
+            )
+            menuConfiguration.append(
                 .action(
                     JotMenuConfiguration.Action(
                         title: L10n.Action.delete,
@@ -86,7 +93,9 @@ struct JotMenuConfigurationFactory: Sendable {
                     ) {
                         onDelete()
                     }
-                ),
+                )
+            )
+            menuConfiguration.append(
                 .action(
                     JotMenuConfiguration.Action(
                         title: {
@@ -100,7 +109,42 @@ struct JotMenuConfigurationFactory: Sendable {
                     ) {
                         onShowInFiles()
                     }
-                ),
+                )
+            )
+
+            let pagesActions: [JotMenuConfiguration.Action] = [
+                onAddPage.map { onAddPage in
+                    JotMenuConfiguration.Action(
+                        title: L10n.EditJot.PDF.Action.addPage,
+                        systemImageName: "plus.app"
+                    ) {
+                        onAddPage()
+                    }
+                },
+                onDeletePage.map { onDeletePage in
+                    JotMenuConfiguration.Action(
+                        title: L10n.EditJot.PDF.Action.deletePage,
+                        systemImageName: "trash",
+                        isDestructive: true
+                    ) {
+                        onDeletePage()
+                    }
+                },
+            ].compactMap { $0 }
+
+            if !pagesActions.isEmpty {
+                menuConfiguration.append(
+                    .group(
+                        JotMenuConfiguration.Group(
+                            title: L10n.EditJot.Pages.title,
+                            systemImageName: "doc.fill",
+                            actions: pagesActions
+                        )
+                    )
+                )
+            }
+
+            menuConfiguration.append(
                 .group(
                     JotMenuConfiguration.Group(
                         title: L10n.Action.share,
@@ -126,8 +170,8 @@ struct JotMenuConfigurationFactory: Sendable {
                             },
                         ]
                     )
-                ),
-            ])
+                )
+            )
 
             return menuConfiguration
         }

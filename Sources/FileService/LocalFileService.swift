@@ -74,27 +74,18 @@ struct LocalFileService: FileServiceProtocol {
         )
     }
 
-    func startDownload(fileURL: URL) throws {
-        assertionFailure("Shouldn't have called \(#function) in \(Self.self)")
-    }
-
-    func ubiquitousInfo(url: URL) -> UbiquitousInfo? {
-        assertionFailure("Shouldn't have called \(#function) in \(Self.self)")
-        return nil
-    }
-
     func directoryChanges(directory: URL) -> AsyncStream<Void> {
         AsyncStream { continuation in
             continuation.yield()
 
-            let fd = open(directory.path, O_EVTONLY)
-            guard fd >= 0 else {
+            let fileDescriptor = open(directory.path, O_EVTONLY)
+            guard fileDescriptor >= 0 else {
                 continuation.finish()
                 return
             }
 
             let source = DispatchSource.makeFileSystemObjectSource(
-                fileDescriptor: fd,
+                fileDescriptor: fileDescriptor,
                 eventMask: [.write, .rename, .delete, .extend],
                 queue: .global()
             )
@@ -104,7 +95,7 @@ struct LocalFileService: FileServiceProtocol {
             }
 
             source.setCancelHandler {
-                close(fd)
+                close(fileDescriptor)
             }
 
             continuation.onTermination = { _ in
@@ -207,5 +198,9 @@ struct LocalFileService: FileServiceProtocol {
                 continue
             }
         }
+    }
+
+    func createDirectory(directoryURL: URL) throws {
+        try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
     }
 }

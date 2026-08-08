@@ -23,18 +23,20 @@ extension PageCellItem {
         jot: JotBusinessModel,
         jotMenuConfigurations: JotMenuConfigurations,
         sizing: PageCellSizingStrategy,
-        repository: JotsRepositoryProtocol,
-        onAction: @Sendable @escaping () -> Void
+        repository: JotPreviewProviderProtocol,
+        onAction: @Sendable @escaping () -> Void,
+        onSelect: @Sendable @escaping () -> Void
     ) -> PageCellItem {
         PageCellItem(
-            id: jot,
+            id: jot.toJotFileInfo(),
             cellType: JotCell.self,
             sizing: sizing,
             viewModel: JotCellViewModel(
                 jot: jot,
                 jotMenuConfigurations: jotMenuConfigurations,
                 repository: repository,
-                onAction: onAction
+                onAction: onAction,
+                onSelect: onSelect
             )
         )
     }
