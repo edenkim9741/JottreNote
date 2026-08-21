@@ -19,7 +19,7 @@
 extension AsyncSequence where Self: Sendable, Element: Sendable {
 
     func toAsyncThrowingStream() -> AsyncThrowingStream<Element, Error> {
-        AsyncThrowingStream { continuation in
+        AsyncThrowingStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
             let task = Task {
                 do {
                     for try await element in self {
@@ -37,7 +37,7 @@ extension AsyncSequence where Self: Sendable, Element: Sendable {
     }
 
     func toAsyncStream() -> AsyncStream<Element> {
-        AsyncStream { continuation in
+        AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
             let task = Task {
                 do {
                     for try await element in self {

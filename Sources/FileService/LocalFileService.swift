@@ -75,9 +75,7 @@ struct LocalFileService: FileServiceProtocol {
     }
 
     func directoryChanges(directory: URL) -> AsyncStream<Void> {
-        AsyncStream { continuation in
-            continuation.yield()
-
+        AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
             let fileDescriptor = open(directory.path, O_EVTONLY)
             guard fileDescriptor >= 0 else {
                 continuation.finish()
@@ -117,7 +115,7 @@ struct LocalFileService: FileServiceProtocol {
             error: &error
         ) { url in
             result = Result(catching: {
-                try Data(contentsOf: url)
+                try Data(contentsOf: url, options: .mappedIfSafe)
             })
         }
 
@@ -144,6 +142,34 @@ struct LocalFileService: FileServiceProtocol {
         ) { url in
             result = Result(catching: {
                 try data.write(to: url, options: .atomic)
+            })
+        }
+
+        if let error {
+            throw error
+        }
+
+        guard let result else {
+            throw Failure.couldNotWriteFileContents
+        }
+
+        try result.get()
+    }
+
+    func createFile(fileURL: URL, data: Data) throws {
+        let coordinator = NSFileCoordinator()
+        var error: NSError?
+        var result: Result<Void, Error>?
+
+        coordinator.coordinate(
+            writingItemAt: fileURL,
+            options: [],
+            error: &error
+        ) { url in
+            result = Result(catching: {
+                // `.withoutOverwriting` makes collision handling atomic. Do
+                // not combine it with `.atomic`; Foundation rejects that pair.
+                try data.write(to: url, options: .withoutOverwriting)
             })
         }
 

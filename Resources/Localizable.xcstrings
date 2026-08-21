@@ -1916,6 +1916,17 @@
         }
       }
     },
+    "editJot.save.error" : {
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Unable to Save"
+          }
+        }
+      }
+    },
     "enableCloud.action.learnHowToEnable" : {
       "comment" : "Call-to-action button on the Enable iCloud screen",
       "extractionState" : "manual",

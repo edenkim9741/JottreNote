@@ -402,10 +402,9 @@ final class PDFRenderDocument: @unchecked Sendable {
 ///
 /// The PDF pages stay vector-backed. Callers render only the page and resolution
 /// they currently need instead of eagerly allocating a full-size bitmap per page.
-@MainActor
-final class PDFLoadService {
+struct PDFLoadService: Sendable {
 
-    struct Result {
+    struct Result: Sendable {
         let document: PDFRenderDocument
         let pageSize: CGSize
 

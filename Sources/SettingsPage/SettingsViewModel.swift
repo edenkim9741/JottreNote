@@ -185,5 +185,7 @@ final class SettingsViewModel: PageViewModel {
 
     deinit {
         loadingTask?.cancel()
+        itemsContinuation.finish()
+        rightNavigationItemsContinuation.finish()
     }
 }

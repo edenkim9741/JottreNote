@@ -48,7 +48,7 @@ struct TrashRepository: TrashRepositoryProtocol {
     }
 
     func observeTrashedJots() -> AsyncThrowingStream<[TrashJotInfo], Error> {
-        AsyncThrowingStream { continuation in
+        AsyncThrowingStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
             let task = Task {
                 do {
                     guard let docsDir = try await fileService.documentsDirectory() else {
@@ -58,10 +58,18 @@ struct TrashRepository: TrashRepositoryProtocol {
                     if !fileService.fileExists(fileURL: trashDir) {
                         try fileService.createDirectory(directoryURL: trashDir)
                     }
-                    for await _ in fileService.directoryChanges(directory: trashDir) {
+                    let updates = fileService.directoryChanges(directory: trashDir)
+                    continuation.yield(
+                        try trashService.listTrashedJots(in: trashDir, fileService: fileService)
+                    )
+                    for await _ in updates {
+                        try Task.checkCancellation()
                         let items = try trashService.listTrashedJots(in: trashDir, fileService: fileService)
                         continuation.yield(items)
                     }
+                    continuation.finish()
+                } catch is CancellationError {
+                    continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
                 }

@@ -37,6 +37,7 @@ struct ShareJotRepository: ShareJotRepositoryProtocol {
         static let jpegCompressionQuality = CGFloat(0.9)
         static let vectorInkSampleDistance = CGFloat(1.5)
         static let minimumVectorInkRadius = CGFloat(0.1)
+        static let maximumPageCount = 10_000
     }
 
     enum Failure: Error {
@@ -61,10 +62,11 @@ struct ShareJotRepository: ShareJotRepositoryProtocol {
         let jotFile = try jotFileService.readJotFile(jotFileInfo: jotFileInfo)
         let drawing = try PKDrawing(data: jotFile.jot.drawing)
         let temporaryDirectory = fileService.temporaryDirectory()
+        let background = makeBackground(jot: jotFile.jot)
 
         return try await exportOnMainActor(
             drawing: drawing,
-            jot: jotFile.jot,
+            background: background,
             format: format,
             url: temporaryDirectory
                 .appendingPathComponent(jotFileInfo.name)
@@ -75,11 +77,10 @@ struct ShareJotRepository: ShareJotRepositoryProtocol {
     @MainActor
     private func exportOnMainActor(
         drawing: PKDrawing,
-        jot: Jot,
+        background: Background,
         format: ShareFormat,
         url: URL
     ) throws -> URL {
-        let background = makeBackground(jot: jot)
         switch format {
         case .pdf:
             return try exportPDF(drawing: drawing, background: background, url: url)
@@ -210,7 +211,7 @@ struct ShareJotRepository: ShareJotRepositoryProtocol {
     private struct Background {
         let document: PDFRenderDocument?
         let pageSize: CGSize
-        let insertedPageSlots: [Int]
+        let logicalToPDFPage: [Int?]
         let totalPages: Int
 
         var pageStride: CGFloat { pageSize.height + Constants.pageSpacing }
@@ -221,38 +222,51 @@ struct ShareJotRepository: ShareJotRepositoryProtocol {
         }
 
         func pdfPageIndex(at logicalIndex: Int) -> Int? {
-            guard let document, !insertedPageSlots.contains(logicalIndex) else { return nil }
-            let precedingInsertions = insertedPageSlots.filter { $0 < logicalIndex }.count
-            let pageIndex = logicalIndex - precedingInsertions
-            guard pageIndex >= 0, pageIndex < document.pageCount else { return nil }
-            return pageIndex
+            guard document != nil, logicalToPDFPage.indices.contains(logicalIndex) else { return nil }
+            return logicalToPDFPage[logicalIndex]
         }
     }
 
-    @MainActor
     private func makeBackground(jot: Jot) -> Background {
         let defaultSize = CGSize(width: jot.width, height: jot.width * (4.0 / 3.0))
         guard
             let pdfData = jot.pdfData,
             let result = try? PDFLoadService().load(data: pdfData, normalizedPageSize: defaultSize)
         else {
+            let safeExtraPages = min(max(0, jot.extraPages), Constants.maximumPageCount - 1)
             return Background(
                 document: nil,
                 pageSize: defaultSize,
-                insertedPageSlots: [],
-                totalPages: max(1, 1 + jot.extraPages)
+                logicalToPDFPage: [],
+                totalPages: 1 + safeExtraPages
             )
         }
 
-        let legacySlots = Array(result.pageCount..<(result.pageCount + jot.extraPages))
+        let pdfPageCount = min(result.pageCount, Constants.maximumPageCount)
+        let safeExtraPages = min(
+            max(0, jot.extraPages),
+            Constants.maximumPageCount - pdfPageCount
+        )
+        let legacySlots = Array(pdfPageCount..<(pdfPageCount + safeExtraPages))
         let sourceSlots = jot.pdfInsertedPageSlots.isEmpty ? legacySlots : jot.pdfInsertedPageSlots
-        let maximumSlot = result.pageCount + sourceSlots.count
+        let maximumSlot = min(
+            Constants.maximumPageCount,
+            pdfPageCount + min(sourceSlots.count, Constants.maximumPageCount - pdfPageCount)
+        )
         let slots = Array(Set(sourceSlots.filter { $0 >= 0 && $0 < maximumSlot })).sorted()
+        let totalPages = max(1, pdfPageCount + slots.count)
+        let slotSet = Set(slots)
+        var nextPDFPage = 0
+        let logicalToPDFPage: [Int?] = (0..<totalPages).map { logicalPage in
+            guard !slotSet.contains(logicalPage), nextPDFPage < pdfPageCount else { return nil }
+            defer { nextPDFPage += 1 }
+            return nextPDFPage
+        }
         return Background(
             document: result.document,
             pageSize: result.pageSize,
-            insertedPageSlots: slots,
-            totalPages: max(1, result.pageCount + slots.count)
+            logicalToPDFPage: logicalToPDFPage,
+            totalPages: totalPages
         )
     }
 

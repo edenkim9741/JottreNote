@@ -55,16 +55,18 @@ struct JotFilePreviewImageService: JotFilePreviewImageServiceProtocol {
         )
         let scale = displayScale * Constants.size.width / jotFile.jot.width
 
-        let backgroundPageImage: UIImage? = if let pdfData {
-            try? await MainActor.run {
-                let service = PDFLoadService()
-                let result = try service.load(
-                    data: pdfData,
-                    normalizedPageSize: CGSize(
-                        width: jotFile.jot.width,
-                        height: jotFile.jot.width * (4.0 / 3.0)
-                    )
+        let pdfLoadResult = pdfData.flatMap { data in
+            try? PDFLoadService().load(
+                data: data,
+                normalizedPageSize: CGSize(
+                    width: jotFile.jot.width,
+                    height: jotFile.jot.width * (4.0 / 3.0)
                 )
+            )
+        }
+        let backgroundPageImage: UIImage? = if let result = pdfLoadResult {
+            await MainActor.run {
+                let service = PDFLoadService()
                 let previewPageSize = CGSize(
                     width: Constants.size.width,
                     height: Constants.size.width * result.pageSize.height / result.pageSize.width

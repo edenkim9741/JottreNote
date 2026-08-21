@@ -121,10 +121,11 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
             session: session, connectionOptions: connectionOptions
         )
         self.window?.makeKeyAndVisible()
-        if let firstURL = connectionOptions.urlContexts.first?.url,
-            firstURL.isFileURL,
-            firstURL.pathExtension.lowercased() == "pdf" {
-            sceneCoordinator.handleURLContexts(urlContexts: connectionOptions.urlContexts)
+        let incomingURLs = connectionOptions.urlContexts.map(\.url)
+        if incomingURLs.contains(where: {
+            $0.isFileURL && $0.pathExtension.lowercased() == "pdf"
+        }) {
+            sceneCoordinator.handleURLs(incomingURLs)
         }
     }
 
@@ -144,7 +145,8 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         _ scene: UIScene,
         openURLContexts URLContexts: Set<UIOpenURLContext>
     ) {
-        sceneCoordinator?.handleURLContexts(urlContexts: URLContexts)
+        let urls = Array(URLContexts.map { $0.url })
+        sceneCoordinator?.handleURLs(urls)
     }
 
     func stateRestorationActivity(for scene: UIScene) -> NSUserActivity? {
@@ -161,11 +163,15 @@ private extension SceneDelegate {
         session: UISceneSession,
         connectionOptions: UIScene.ConnectionOptions
     ) -> Bool {
-        let url = connectionOptions.urlContexts.first?.url
-        guard url?.isFileURL == true, url?.pathExtension.lowercased() == "pdf" else { return false }
+        let pdfURLs = connectionOptions.urlContexts
+            .map(\.url)
+            .filter { $0.isFileURL && $0.pathExtension.lowercased() == "pdf" }
+            .sorted { $0.absoluteString.localizedStandardCompare($1.absoluteString) == .orderedAscending }
+        guard !pdfURLs.isEmpty else { return false }
+
         let readyWindowScene = UIApplication.shared.connectedScenes
             .compactMap { $0 as? UIWindowScene }
-            .first { candidate in
+            .filter { candidate in
                 guard candidate !== scene, candidate.activationState != .unattached else {
                     return false
                 }
@@ -175,6 +181,8 @@ private extension SceneDelegate {
                 // that file, so only target a fully initialized scene.
                 return (candidate.delegate as? SceneDelegate)?.sceneCoordinator != nil
             }
+            .sorted(by: isPreferredRedirectTarget)
+            .first
         guard
             let windowScene = readyWindowScene,
             let existingDelegate = windowScene.delegate as? SceneDelegate,
@@ -182,9 +190,6 @@ private extension SceneDelegate {
         else {
             return false
         }
-        let pdfURLs = connectionOptions.urlContexts
-            .map(\.url)
-            .filter { $0.isFileURL && $0.pathExtension.lowercased() == "pdf" }
         // Acquire the grants before returning from `willConnectTo`. Some File
         // Providers revoke the URLs as soon as this source scene is released.
         let scopedURLs = pdfURLs.filter { $0.startAccessingSecurityScopedResource() }
@@ -204,6 +209,40 @@ private extension SceneDelegate {
         return true
     }
 
+    func isPreferredRedirectTarget(_ lhs: UIWindowScene, _ rhs: UIWindowScene) -> Bool {
+        let lhsIsKey = lhs.windows.contains { $0.isKeyWindow }
+        let rhsIsKey = rhs.windows.contains { $0.isKeyWindow }
+        if lhsIsKey != rhsIsKey {
+            return lhsIsKey
+        }
+
+        let lhsActivationRank = redirectTargetActivationRank(lhs.activationState)
+        let rhsActivationRank = redirectTargetActivationRank(rhs.activationState)
+        if lhsActivationRank != rhsActivationRank {
+            return lhsActivationRank < rhsActivationRank
+        }
+
+        // `connectedScenes` is a Set. A stable tie-break keeps sibling scene
+        // callbacks from selecting different target coordinators as that Set
+        // changes while redirected source scenes are being destroyed.
+        return lhs.session.persistentIdentifier < rhs.session.persistentIdentifier
+    }
+
+    func redirectTargetActivationRank(_ activationState: UIScene.ActivationState) -> Int {
+        switch activationState {
+        case .foregroundActive:
+            return 0
+        case .foregroundInactive:
+            return 1
+        case .background:
+            return 2
+        case .unattached:
+            return 3
+        @unknown default:
+            return 4
+        }
+    }
+
     func makeServices(fileManager: FileManager, fileService: LocalFileService) -> SceneServices {
         let jotFileService = JotFileService(fileService: fileService)
         let jotFilePreviewImageService = CachedJotFilePreviewImageService(
@@ -212,10 +251,7 @@ private extension SceneDelegate {
         )
         return SceneServices(
             fileService: fileService,
-            externalFileImportService: ExternalFileImportService(
-                fileManager: fileManager,
-                temporaryDirectory: fileManager.temporaryDirectory
-            ),
+            externalFileImportService: ExternalFileImportService(),
             applicationService: ApplicationService(application: .shared),
             deviceService: DeviceService(device: .current),
             bundleService: BundleService(bundle: .main),

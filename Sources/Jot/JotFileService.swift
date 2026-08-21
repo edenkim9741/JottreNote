@@ -23,6 +23,8 @@ protocol JotFileServiceProtocol: Sendable {
 
     func write(jotFile: JotFile) throws
 
+    func create(jotFile: JotFile) throws
+
     func duplicate(jotFileInfo: JotFile.Info) throws -> JotFile.Info
 
     func rename(jotFileInfo: JotFile.Info, newName: String) throws -> JotFile.Info
@@ -36,9 +38,6 @@ struct JotFileService: JotFileServiceProtocol {
         case couldNotResolveDocumentsDirectory
     }
 
-    private let propertyListDecoder = PropertyListDecoder()
-    private let propertyListEncoder = PropertyListEncoder()
-
     private let fileService: FileServiceProtocol
 
     init(fileService: FileServiceProtocol) {
@@ -47,13 +46,25 @@ struct JotFileService: JotFileServiceProtocol {
 
     func readJotFile(jotFileInfo: JotFile.Info) throws -> JotFile {
         let data = try fileService.readFile(fileURL: jotFileInfo.url)
-        let jot = try propertyListDecoder.decode(Jot.self, from: data)
+        // Encoder/decoder instances are intentionally scoped to one operation.
+        // The service is Sendable and can be used by preview, editor and backup
+        // tasks concurrently; sharing mutable Foundation coders is unnecessary.
+        let jot = try PropertyListDecoder().decode(Jot.self, from: data)
         return JotFile(info: jotFileInfo, jot: jot)
     }
 
     func write(jotFile: JotFile) throws {
-        let data = try propertyListEncoder.encode(jotFile.jot)
+        let encoder = PropertyListEncoder()
+        encoder.outputFormat = .binary
+        let data = try encoder.encode(jotFile.jot)
         try fileService.writeFile(fileURL: jotFile.info.url, data: data)
+    }
+
+    func create(jotFile: JotFile) throws {
+        let encoder = PropertyListEncoder()
+        encoder.outputFormat = .binary
+        let data = try encoder.encode(jotFile.jot)
+        try fileService.createFile(fileURL: jotFile.info.url, data: data)
     }
 
     func duplicate(jotFileInfo: JotFile.Info) throws -> JotFile.Info {

@@ -31,6 +31,7 @@ final class DefaultsService: DefaultsServiceProtocol, @unchecked Sendable {
 
     private let userDefaults: UserDefaults
     private let continuationStorage = DefaultsContinuationStorage()
+    private let lock = NSLock()
 
     init(userDefaults: UserDefaults) {
         self.userDefaults = userDefaults
@@ -39,22 +40,27 @@ final class DefaultsService: DefaultsServiceProtocol, @unchecked Sendable {
     func getValue<T: LosslessStringConvertible & Sendable>(
         _ defaultsKey: DefaultsKey<T>
     ) -> T? {
-        guard let value = userDefaults.value(forKey: defaultsKey.description) as? String else {
-            return nil
+        lock.withLock {
+            value(for: defaultsKey)
         }
-        return T(value)
     }
 
     func set<T: LosslessStringConvertible & Sendable>(
         _ defaultsKey: DefaultsKey<T>,
         value: T?
     ) {
-        let key = defaultsKey.description
-        userDefaults.setValue(value?.description, forKey: key)
+        lock.withLock {
+            let key = defaultsKey.description
+            if let value {
+                userDefaults.set(value.description, forKey: key)
+            } else {
+                userDefaults.removeObject(forKey: key)
+            }
 
-        if let continuations = continuationStorage.continuations(defaultsKey: defaultsKey) {
-            for continuation in continuations {
-                continuation.yield(value)
+            if let continuations = continuationStorage.continuations(defaultsKey: defaultsKey) {
+                for continuation in continuations {
+                    continuation.yield(value)
+                }
             }
         }
     }
@@ -62,20 +68,48 @@ final class DefaultsService: DefaultsServiceProtocol, @unchecked Sendable {
     func getValueStream<T: LosslessStringConvertible & Sendable>(
         _ defaultsKey: DefaultsKey<T>
     ) -> AsyncStream<T?> {
-        AsyncStream { [weak self] continuation in
-            continuation.yield(self?.getValue(defaultsKey))
-
-            self?.continuationStorage.add(
-                continuation,
-                defaultsKey: defaultsKey
-            )
+        AsyncStream(bufferingPolicy: .bufferingNewest(1)) { [weak self] continuation in
+            guard let self else {
+                continuation.finish()
+                return
+            }
+            let id = UUID()
 
             continuation.onTermination = { [weak self] _ in
                 self?.continuationStorage.remove(
+                    id: id,
+                    defaultsKey: defaultsKey
+                )
+            }
+
+            let yieldResult = lock.withLock {
+                continuationStorage.add(
                     continuation,
+                    id: id,
+                    defaultsKey: defaultsKey
+                )
+                return continuation.yield(value(for: defaultsKey))
+            }
+
+            if case .terminated = yieldResult {
+                continuationStorage.remove(
+                    id: id,
                     defaultsKey: defaultsKey
                 )
             }
         }
+    }
+
+    /// Internal diagnostics used by lifecycle regression tests.
+    func activeSubscriberCount<T: LosslessStringConvertible & Sendable>(
+        for defaultsKey: DefaultsKey<T>
+    ) -> Int {
+        continuationStorage.continuationCount(defaultsKey: defaultsKey)
+    }
+
+    private func value<T: LosslessStringConvertible & Sendable>(
+        for defaultsKey: DefaultsKey<T>
+    ) -> T? {
+        userDefaults.string(forKey: defaultsKey.description).flatMap(T.init)
     }
 }

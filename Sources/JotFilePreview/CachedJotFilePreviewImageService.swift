@@ -24,6 +24,10 @@ actor CachedJotFilePreviewImageService: JotFilePreviewImageServiceProtocol {
     private enum Constants {
         static let diskCacheDirectoryName = "JotFilePreviewCache"
         static let memoryCacheSizeLimit = 20 * 1024 * 1024  // 20 MB
+        static let diskCacheSizeLimit = 100 * 1024 * 1024  // 100 MB
+        static let diskCacheTrimTarget = 80 * 1024 * 1024  // 80 MB
+        static let diskSweepInterval = 32
+        static let cacheSchemaVersion = 1
     }
 
     private struct CacheKey: CustomStringConvertible {
@@ -48,6 +52,8 @@ actor CachedJotFilePreviewImageService: JotFilePreviewImageServiceProtocol {
     private let jotFilePreviewImageService: JotFilePreviewImageServiceProtocol
     private let memoryCache: NSCache<NSString, NSData>
     private let temporaryDirectory: URL
+    private var inFlightRequests: [String: Task<Data, any Error>] = [:]
+    private var requestsSinceDiskSweep = Constants.diskSweepInterval
 
     init(
         localFileService: FileServiceProtocol,
@@ -65,10 +71,7 @@ actor CachedJotFilePreviewImageService: JotFilePreviewImageServiceProtocol {
             .temporaryDirectory()
             .appendingPathComponent(Constants.diskCacheDirectoryName, isDirectory: true)
 
-        try? FileManager.default.createDirectory(
-            at: temporaryDirectory,
-            withIntermediateDirectories: true
-        )
+        try? localFileService.createDirectory(directoryURL: temporaryDirectory)
     }
 
     func getPreviewImageData(
@@ -76,72 +79,18 @@ actor CachedJotFilePreviewImageService: JotFilePreviewImageServiceProtocol {
         userInterfaceStyle: UIUserInterfaceStyle,
         displayScale: CGFloat
     ) async throws -> Data {
-        let memoryCacheKey = makeMemoryCacheKey(
-            jotFileInfo: jotFileInfo,
-            userInterfaceStyle: userInterfaceStyle,
-            displayScale: displayScale
-        )
-
-        if let cached = memoryCache.object(forKey: memoryCacheKey) {
-            return cached as Data
-        }
-
-        let diskCacheFileURL = makeDiskCacheFileURL(
-            jotFileInfo: jotFileInfo,
-            userInterfaceStyle: userInterfaceStyle,
-            displayScale: displayScale
-        )
-
-        if let diskCacheFileURL,
-            let cachedPreviewImageData = try? localFileService.readFile(fileURL: diskCacheFileURL)
-        {
-            memoryCache.setObject(
-                cachedPreviewImageData as NSData,
-                forKey: memoryCacheKey,
-                cost: cachedPreviewImageData.count
-            )
-            return cachedPreviewImageData
-        }
-
-        let previewImageData = try await jotFilePreviewImageService.getPreviewImageData(
-            jotFileInfo: jotFileInfo,
-            userInterfaceStyle: userInterfaceStyle,
-            displayScale: displayScale
-        )
-
-        memoryCache.setObject(
-            previewImageData as NSData,
-            forKey: memoryCacheKey,
-            cost: previewImageData.count
-        )
-
-        if let diskCacheFileURL {
-            try? localFileService.writeFile(fileURL: diskCacheFileURL, data: previewImageData)
-        }
-
-        return previewImageData
-    }
-
-    private func makeMemoryCacheKey(
-        jotFileInfo: JotFile.Info,
-        userInterfaceStyle: UIUserInterfaceStyle,
-        displayScale: CGFloat
-    ) -> NSString {
-        makeCacheKey(
-            jotFilePath: jotFileInfo.url.path,
-            modificationDate: jotFileInfo.modificationDate,
-            userInterfaceStyle: userInterfaceStyle,
-            displayScale: displayScale
-        ) as NSString
-    }
-
-    private func makeDiskCacheFileURL(
-        jotFileInfo: JotFile.Info,
-        userInterfaceStyle: UIUserInterfaceStyle,
-        displayScale: CGFloat
-    ) -> URL? {
+        try Task.checkCancellation()
+        sweepDiskCacheIfNeeded()
+        // Without a file revision there is no safe invalidation key. Caching
+        // such entries would return a permanently stale preview after edits.
         guard let modificationDate = jotFileInfo.modificationDate else {
-            return nil
+            let rendered = try await jotFilePreviewImageService.getPreviewImageData(
+                jotFileInfo: jotFileInfo,
+                userInterfaceStyle: userInterfaceStyle,
+                displayScale: displayScale
+            )
+            try Task.checkCancellation()
+            return rendered
         }
 
         let cacheKey = makeCacheKey(
@@ -150,27 +99,107 @@ actor CachedJotFilePreviewImageService: JotFilePreviewImageServiceProtocol {
             userInterfaceStyle: userInterfaceStyle,
             displayScale: displayScale
         )
+        let memoryCacheKey = cacheKey as NSString
 
-        return temporaryDirectory.appendingPathComponent(cacheKey, isDirectory: false)
+        if let cached = memoryCache.object(forKey: memoryCacheKey) {
+            return cached as Data
+        }
+
+        if let request = inFlightRequests[cacheKey] {
+            return try await request.value
+        }
+
+        let diskCacheFileURL = temporaryDirectory.appendingPathComponent(
+            cacheKey,
+            isDirectory: false
+        )
+        let localFileService = localFileService
+        let renderer = jotFilePreviewImageService
+        let request = Task<Data, any Error> {
+            if let cached = try? localFileService.readFile(fileURL: diskCacheFileURL) {
+                return cached
+            }
+
+            let rendered = try await renderer.getPreviewImageData(
+                jotFileInfo: jotFileInfo,
+                userInterfaceStyle: userInterfaceStyle,
+                displayScale: displayScale
+            )
+            try? localFileService.writeFile(fileURL: diskCacheFileURL, data: rendered)
+            return rendered
+        }
+        inFlightRequests[cacheKey] = request
+
+        do {
+            let previewImageData = try await request.value
+            try Task.checkCancellation()
+            inFlightRequests.removeValue(forKey: cacheKey)
+
+            memoryCache.setObject(
+                previewImageData as NSData,
+                forKey: memoryCacheKey,
+                cost: previewImageData.count
+            )
+            return previewImageData
+        } catch {
+            inFlightRequests.removeValue(forKey: cacheKey)
+            throw error
+        }
     }
 
     private func makeCacheKey(
         jotFilePath: String,
-        modificationDate: Date?,
+        modificationDate: Date,
         userInterfaceStyle: UIUserInterfaceStyle,
         displayScale: CGFloat
     ) -> String {
-        SHA256.hash(
-            data: Data(
-                CacheKey(
-                    jotFilePath: jotFilePath,
-                    modificationDate: modificationDate,
-                    userInterfaceStyle: userInterfaceStyle,
-                    displayScale: displayScale
-                ).description.utf8
-            )
+        let keyDescription = CacheKey(
+            jotFilePath: jotFilePath,
+            modificationDate: modificationDate,
+            userInterfaceStyle: userInterfaceStyle,
+            displayScale: displayScale
+        ).description
+        let versionedKey = "v\(Constants.cacheSchemaVersion)|\(keyDescription)"
+        return SHA256.hash(
+            data: Data(versionedKey.utf8)
         )
         .map { String(format: "%02x", $0) }
         .joined()
+    }
+
+    private func sweepDiskCacheIfNeeded() {
+        requestsSinceDiskSweep += 1
+        guard requestsSinceDiskSweep >= Constants.diskSweepInterval else { return }
+        requestsSinceDiskSweep = 0
+
+        let keys: [URLResourceKey] = [
+            .isRegularFileKey,
+            .fileSizeKey,
+            .contentModificationDateKey,
+        ]
+        guard let urls = try? localFileService.listContents(
+            directory: temporaryDirectory,
+            properties: keys
+        ) else { return }
+
+        let resourceKeys = Set(keys)
+        let entries = urls.compactMap { url -> (url: URL, size: Int, date: Date)? in
+            guard let values = try? url.resourceValues(forKeys: resourceKeys),
+                  values.isRegularFile == true else { return nil }
+            return (url, max(0, values.fileSize ?? 0), values.contentModificationDate ?? .distantPast)
+        }
+        var totalSize = entries.reduce(into: 0) { $0 += $1.size }
+        guard totalSize > Constants.diskCacheSizeLimit else { return }
+
+        for entry in entries.sorted(by: { $0.date < $1.date }) {
+            guard totalSize > Constants.diskCacheTrimTarget else { break }
+            do {
+                try localFileService.removeFile(fileURL: entry.url)
+                totalSize -= entry.size
+            } catch {
+                // Cache eviction is best-effort; a concurrently used file can
+                // be retried during the next bounded sweep.
+            }
+        }
     }
 }

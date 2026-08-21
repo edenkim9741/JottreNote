@@ -77,10 +77,10 @@ struct CreateJotCoordinatorFactory: CreateJotCoordinatorFactoryProtocol {
         pdfs: [(data: Data, name: String)]
     ) -> Coordinator {
         CreateJotBatchCoordinator(
-            navigation: navigation,
             repository: repository,
             directory: directory,
-            pdfs: pdfs
+            pdfs: pdfs,
+            logger: OSLogLogger(category: "CreateJotBatchCoordinator")
         )
     }
 }

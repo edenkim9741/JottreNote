@@ -6,16 +6,17 @@ struct WebDAVBackupService: Sendable {
 
     // Mirrors Self.pageSpacing (32 pt); keep in sync if that constant changes.
     private static let pageSpacing: CGFloat = 32
+    private static let maximumPageCount = 10_000
 
     private struct PageLayout {
         let pageSize: CGSize
         let pdfPageCount: Int
-        let insertedPageSlots: [Int]
+        let logicalToPDFPage: [Int?]
         let totalPages: Int
 
         func pdfPageIndex(for logicalPageIndex: Int) -> Int? {
-            guard !insertedPageSlots.contains(logicalPageIndex) else { return nil }
-            return logicalPageIndex - insertedPageSlots.filter { $0 < logicalPageIndex }.count
+            guard logicalToPDFPage.indices.contains(logicalPageIndex) else { return nil }
+            return logicalToPDFPage[logicalPageIndex]
         }
     }
 
@@ -29,46 +30,47 @@ struct WebDAVBackupService: Sendable {
 
     func backup(
         jotFileInfo: JotFile.Info,
-        drawing: PKDrawing,
-        pdfData: Data?,
-        extraPages: Int,
-        pdfInsertedPageSlots: [Int],
-        width: CGFloat
-    ) {
-        Task.detached { [defaultsService] in
-            guard
-                let urlString = defaultsService.getValue(DefaultsKey<String>.webDAVURL),
-                !urlString.isEmpty,
-                let baseURL = URL(string: urlString)
-            else { return }
+        content: JotContent
+    ) async {
+        guard
+            let urlString = defaultsService.getValue(DefaultsKey<String>.webDAVURL),
+            !urlString.isEmpty,
+            let baseURL = URL(string: urlString)
+        else { return }
+        guard !Task.isCancelled,
+              let jotData = try? Data(contentsOf: jotFileInfo.url, options: .mappedIfSafe)
+        else { return }
 
-            let username = defaultsService.getValue(DefaultsKey<String>.webDAVUsername) ?? ""
-            let password = defaultsService.getValue(DefaultsKey<String>.webDAVPassword) ?? ""
-            let service = WebDAVService(baseURL: baseURL, username: username, password: password)
+        let username = defaultsService.getValue(DefaultsKey<String>.webDAVUsername) ?? ""
+        let password = defaultsService.getValue(DefaultsKey<String>.webDAVPassword) ?? ""
+        let service = WebDAVService(baseURL: baseURL, username: username, password: password)
 
-            let remoteFolderPath = remoteFolder(for: jotFileInfo)
-            if let folder = remoteFolderPath {
-                try? await service.makeDirectory(remotePath: folder)
-            }
+        let remoteFolderPath = remoteFolder(for: jotFileInfo)
+        if let folder = remoteFolderPath {
+            try? await service.makeDirectory(remotePath: folder)
+        }
 
-            let jotRemotePath = remotePath(for: jotFileInfo, extension: "jot", folder: remoteFolderPath)
-            if let jotData = try? Data(contentsOf: jotFileInfo.url) {
-                try? await service.upload(data: jotData, remotePath: jotRemotePath)
-            }
+        guard !Task.isCancelled else { return }
+        let jotRemotePath = remotePath(for: jotFileInfo, extension: "jot", folder: remoteFolderPath)
+        do {
+            try await service.upload(data: jotData, remotePath: jotRemotePath)
+        } catch {
+            return
+        }
 
-            // PDF rendering runs in background — UIGraphicsPDFRenderer graphics contexts
-            // and PKDrawing.image(from:scale:) are safe to use off the main thread on iOS 10+.
-            let pdfRemotePath = remotePath(for: jotFileInfo, extension: "pdf", folder: remoteFolderPath)
-            let renderedPDF = makePDF(
-                drawing: drawing,
-                pdfData: pdfData,
-                extraPages: extraPages,
-                pdfInsertedPageSlots: pdfInsertedPageSlots,
-                width: width
-            )
-            if let renderedPDF {
-                try? await service.upload(data: renderedPDF, remotePath: pdfRemotePath)
-            }
+        guard !Task.isCancelled else { return }
+        // The caller flushes this exact snapshot before backup, so the native
+        // jot and rendered PDF represent the same editor revision.
+        let pdfRemotePath = remotePath(for: jotFileInfo, extension: "pdf", folder: remoteFolderPath)
+        let renderedPDF = makePDF(
+            drawing: content.drawing,
+            pdfData: content.pdfData,
+            extraPages: content.extraPages,
+            pdfInsertedPageSlots: content.pdfInsertedPageSlots,
+            width: content.width
+        )
+        if let renderedPDF, !Task.isCancelled {
+            try? await service.upload(data: renderedPDF, remotePath: pdfRemotePath)
         }
     }
 
@@ -77,8 +79,8 @@ struct WebDAVBackupService: Sendable {
     /// Enumerates every .jot file under the Documents directory and uploads each to WebDAV.
     /// Reports progress in [0, 1] after each file completes. Finished when the stream ends.
     func backupAll() -> AsyncStream<Double> {
-        AsyncStream { continuation in
-            Task.detached { [defaultsService] in
+        AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
+            let task = Task.detached { [defaultsService] in
                 guard
                     let urlString = defaultsService.getValue(DefaultsKey<String>.webDAVURL),
                     !urlString.isEmpty,
@@ -101,11 +103,16 @@ struct WebDAVBackupService: Sendable {
 
                 var createdFolders = Set<String>()
                 for (index, jotURL) in jotURLs.enumerated() {
+                    guard !Task.isCancelled else {
+                        continuation.finish()
+                        return
+                    }
                     await backupJotFile(jotURL, service: service, createdFolders: &createdFolders)
                     continuation.yield(Double(index + 1) / Double(jotURLs.count))
                 }
                 continuation.finish()
             }
+            continuation.onTermination = { _ in task.cancel() }
         }
     }
 
@@ -119,6 +126,7 @@ struct WebDAVBackupService: Sendable {
         service: WebDAVService,
         createdFolders: inout Set<String>
     ) async -> Bool {
+        guard !Task.isCancelled else { return false }
         let info = JotFile.Info(
             url: jotURL,
             name: jotURL.deletingPathExtension().lastPathComponent,
@@ -134,14 +142,18 @@ struct WebDAVBackupService: Sendable {
             return false
         }
 
+        guard !Task.isCancelled else { return false }
+
         if let folderPath, !createdFolders.contains(folderPath) {
             await makeDirectoryHierarchy(folderPath, service: service)
             createdFolders.insert(folderPath)
         }
 
-        guard let rawData = try? Data(contentsOf: jotURL) else { return false }
+        guard let rawData = try? Data(contentsOf: jotURL, options: .mappedIfSafe) else { return false }
 
         try? await service.upload(data: rawData, remotePath: jotPath)
+
+        guard !Task.isCancelled else { return false }
 
         if let jot = try? PropertyListDecoder().decode(Jot.self, from: rawData),
            let drawing = try? PKDrawing(data: jot.drawing),
@@ -258,6 +270,7 @@ struct WebDAVBackupService: Sendable {
         pdfInsertedPageSlots: [Int],
         width: CGFloat
     ) -> Data? {
+        guard !Task.isCancelled else { return nil }
         let document = pdfData.flatMap { PDFDocument(data: $0) }
         let layout = makePageLayout(
             document: document,
@@ -267,8 +280,13 @@ struct WebDAVBackupService: Sendable {
         )
         let pageBounds = CGRect(x: 0, y: 0, width: layout.pageSize.width, height: layout.pageSize.height)
 
-        return UIGraphicsPDFRenderer(bounds: pageBounds).pdfData { context in
+        var wasCancelled = false
+        let data = UIGraphicsPDFRenderer(bounds: pageBounds).pdfData { context in
             for pageIndex in 0..<layout.totalPages {
+                guard !Task.isCancelled else {
+                    wasCancelled = true
+                    break
+                }
                 autoreleasepool {
                     context.beginPage()
                     let pageY = CGFloat(pageIndex) * (layout.pageSize.height + Self.pageSpacing)
@@ -293,6 +311,7 @@ struct WebDAVBackupService: Sendable {
                 }
             }
         }
+        return wasCancelled ? nil : data
     }
 
     private func makePageLayout(
@@ -311,18 +330,32 @@ struct WebDAVBackupService: Sendable {
         } else {
             pageSize = CGSize(width: width, height: defaultHeight)
         }
-        let pdfPageCount = document?.pageCount ?? 0
-        let legacySlots = Array(pdfPageCount..<(pdfPageCount + extraPages))
+        let pdfPageCount = min(document?.pageCount ?? 0, Self.maximumPageCount)
+        let safeExtraPages = min(
+            max(0, extraPages),
+            max(0, Self.maximumPageCount - max(1, pdfPageCount))
+        )
+        let legacySlots = Array(pdfPageCount..<(pdfPageCount + safeExtraPages))
         let sourceSlots = pdfInsertedPageSlots.isEmpty ? legacySlots : pdfInsertedPageSlots
-        let maximumSlot = pdfPageCount + sourceSlots.count
-        let slots = document == nil
-            ? []
-            : Array(Set(sourceSlots.filter { $0 >= 0 && $0 < maximumSlot })).sorted()
-        let totalPages = document == nil ? 1 + extraPages : pdfPageCount + slots.count
+        let maximumSlot = min(
+            Self.maximumPageCount,
+            pdfPageCount + min(sourceSlots.count, Self.maximumPageCount - pdfPageCount)
+        )
+        let slots = document == nil ? [] : Array(
+            Set(sourceSlots.lazy.filter { $0 >= 0 && $0 < maximumSlot })
+        ).sorted()
+        let totalPages = document == nil ? 1 + safeExtraPages : pdfPageCount + slots.count
+        let slotSet = Set(slots)
+        var nextPDFPage = 0
+        let logicalToPDFPage: [Int?] = (0..<max(1, totalPages)).map { logicalPage in
+            guard !slotSet.contains(logicalPage), nextPDFPage < pdfPageCount else { return nil }
+            defer { nextPDFPage += 1 }
+            return nextPDFPage
+        }
         return PageLayout(
             pageSize: pageSize,
             pdfPageCount: pdfPageCount,
-            insertedPageSlots: slots,
+            logicalToPDFPage: logicalToPDFPage,
             totalPages: max(1, totalPages)
         )
     }
@@ -357,8 +390,8 @@ struct WebDAVBackupService: Sendable {
         while lineY < pageRect.maxY {
             cgContext.move(to: CGPoint(x: pageRect.minX, y: lineY))
             cgContext.addLine(to: CGPoint(x: pageRect.maxX, y: lineY))
-            cgContext.strokePath()
             lineY += lineSpacing
         }
+        cgContext.strokePath()
     }
 }

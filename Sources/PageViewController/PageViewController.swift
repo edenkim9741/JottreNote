@@ -342,7 +342,7 @@ final class PageViewController: UIViewController {
         )
         let group = NSCollectionLayoutGroup.horizontal(
             layoutSize: .init(widthDimension: .fractionalWidth(1.0), heightDimension: .absolute(height)),
-            subitem: item,
+            repeatingSubitem: item,
             count: perRow
         )
         group.interItemSpacing = .fixed(columnSpacing)
@@ -369,7 +369,7 @@ final class PageViewController: UIViewController {
         )
         let group = NSCollectionLayoutGroup.horizontal(
             layoutSize: .init(widthDimension: .fractionalWidth(1.0), heightDimension: .absolute(itemHeight)),
-            subitem: item,
+            repeatingSubitem: item,
             count: columns
         )
         group.interItemSpacing = .fixed(columnSpacing)

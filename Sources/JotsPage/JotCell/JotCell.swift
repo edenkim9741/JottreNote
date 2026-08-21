@@ -199,14 +199,17 @@ final class JotCell: UICollectionViewCell, PageCell {
                 previewImageView.trailingAnchor.constraint(equalTo: previewLayoutGuide.trailingAnchor),
                 previewImageView.bottomAnchor.constraint(equalTo: previewLayoutGuide.bottomAnchor),
             ])
-            previewImageTask = Task { [weak self] in
-                guard let self else {
-                    return
-                }
-                previewImageView.image = await viewModel.getPreviewImage(
-                    userInterfaceStyle: traitCollection.userInterfaceStyle,
-                    displayScale: traitCollection.displayScale
+            let userInterfaceStyle = traitCollection.userInterfaceStyle
+            let displayScale = traitCollection.displayScale
+            previewImageTask = Task { [weak self, viewModel] in
+                let image = await viewModel.getPreviewImage(
+                    userInterfaceStyle: userInterfaceStyle,
+                    displayScale: displayScale
                 )
+                guard !Task.isCancelled,
+                      let self,
+                      self.viewModel === viewModel else { return }
+                previewImageView.image = image
             }
         case .cloudImage:
             contentView.addSubview(cloudIconImageView)

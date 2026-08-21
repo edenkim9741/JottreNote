@@ -96,9 +96,10 @@ final class JotsViewModel: PageViewModel, PageSelectableViewModel {
             of: [PageNavigationItem].self, bufferingPolicy: .bufferingNewest(1)
         )
 
+        let sortOrderValues = defaultsService.getValueStream(DefaultsKey<Int>("jots.sortOrder"))
         sortOrderTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            for await value in self.defaultsService.getValueStream(DefaultsKey<Int>.init("jots.sortOrder")) {
+            for await value in sortOrderValues {
+                guard let self else { return }
                 self.sortSymbolName = (value ?? 0) == 0 ? "clock" : "textformat"
                 self.publishNavigationItems()
             }
@@ -106,13 +107,15 @@ final class JotsViewModel: PageViewModel, PageSelectableViewModel {
 
         // Start loading immediately so data is ready by the time the view appears,
         // overlapping with the navigation push animation rather than waiting for viewDidLoad.
-        itemsTask = Task { [weak self] in
-            guard let self else { return }
+        let itemUpdates = repository.getItems(location: location)
+        itemsTask = Task { [weak self, logger] in
             do {
-                for try await items in repository.getItems(location: location) {
-                    handleItems(items)
+                for try await items in itemUpdates {
+                    guard let self else { return }
+                    self.handleItems(items)
                 }
             } catch {
+                guard !(error is CancellationError) else { return }
                 logger.error("Failed to observe jots items: \(error)")
             }
         }
@@ -372,6 +375,11 @@ final class JotsViewModel: PageViewModel, PageSelectableViewModel {
     deinit {
         itemsTask?.cancel()
         sortOrderTask?.cancel()
+        titleUpdatesContinuation.finish()
+        leftNavigationItemsContinuation.finish()
+        rightNavigationItemsContinuation.finish()
+        itemsContinuation.finish()
+        selectionStateContinuation.finish()
     }
 }
 

@@ -29,6 +29,7 @@ final class JotBackgroundView: UIView {
     private var zoomScale = CGFloat(1)
     private var viewportSize = CGSize.zero
     private var visiblePageViews: [Int: PageView] = [:]
+    private var lastVisiblePageRange: ClosedRange<Int>?
 
     func configureRuled(
         pageCount: Int,
@@ -93,6 +94,7 @@ final class JotBackgroundView: UIView {
         backgroundColor = .clear
         visiblePageViews.values.forEach { $0.removeFromSuperview() }
         visiblePageViews.removeAll()
+        lastVisiblePageRange = nil
         layoutVisiblePages()
     }
 
@@ -109,8 +111,11 @@ final class JotBackgroundView: UIView {
         guard let visibleRange = visiblePageRange() else {
             visiblePageViews.values.forEach { $0.removeFromSuperview() }
             visiblePageViews.removeAll()
+            lastVisiblePageRange = nil
             return
         }
+        guard visibleRange != lastVisiblePageRange else { return }
+        lastVisiblePageRange = visibleRange
 
         let staleIndices = visiblePageViews.keys.filter { !visibleRange.contains($0) }
         for index in staleIndices {
@@ -330,12 +335,16 @@ private final class PageTiledLayer: CATiledLayer {
         context.fill(rect)
         context.setStrokeColor(gray: isDark ? 0.45 : 0.62, alpha: 0.55)
         context.setLineWidth(0.5)
-        var lineY = rect.minY + JotBackgroundView.ruledLineSpacing
-        while lineY < rect.maxY {
+        let visibleBounds = context.boundingBoxOfClipPath.intersection(rect)
+        guard !visibleBounds.isNull else { return }
+        let spacing = JotBackgroundView.ruledLineSpacing
+        let firstLine = max(1, Int(floor((visibleBounds.minY - rect.minY) / spacing)))
+        var lineY = rect.minY + CGFloat(firstLine) * spacing
+        while lineY <= visibleBounds.maxY, lineY < rect.maxY {
             context.move(to: CGPoint(x: rect.minX, y: lineY))
             context.addLine(to: CGPoint(x: rect.maxX, y: lineY))
-            context.strokePath()
-            lineY += JotBackgroundView.ruledLineSpacing
+            lineY += spacing
         }
+        context.strokePath()
     }
 }

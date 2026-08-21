@@ -30,13 +30,11 @@ final class SceneCoordinator {
     private var lastActiveURL: URL?
     private var navigationController: UINavigationController?
     private var retainedRootCoordinator: NavigationCoordinator?
-    private var retainedCreateJotCoordinator: Coordinator?
-    private var pendingPDFImports: [(data: Data, name: String)] = []
-    private var pendingPDFImportSelectedCount = 0
-    private var pendingPDFImportFailures: [String] = []
-    private var activePDFMaterializationCount = 0
-    private var pendingPDFImportTask: Task<Void, Never>?
+    private var retainedCreateJotCoordinators: [UUID: Coordinator] = [:]
     private var userInterfaceStyleTask: Task<Void, Never>?
+    private lazy var externalPDFImportCoalescer = ExternalPDFImportCoalescer { [weak self] urls in
+        await self?.handleCoalescedExternalPDFURLs(urls)
+    }
     #if targetEnvironment(macCatalyst)
     private var securityScopedURL: URL?
     #endif
@@ -106,16 +104,19 @@ final class SceneCoordinator {
         return coordinator.handle(url: url)
     }
 
-    func handleURLContexts(urlContexts: Set<UIOpenURLContext>) {
-        let pdfURLs = urlContexts.map { $0.url }.filter { $0.isFileURL && $0.pathExtension.lowercased() == "pdf" }
-        if !pdfURLs.isEmpty {
-            Task { [weak self] in
-                await self?.materializeAndEnqueuePDFImports(from: pdfURLs)
-            }
+    func handleURLs(_ urls: [URL]) {
+        let pdfURLs = urls
+            .filter { $0.isFileURL && $0.pathExtension.lowercased() == "pdf" }
+            .sorted { $0.absoluteString.localizedStandardCompare($1.absoluteString) == .orderedAscending }
+
+        guard pdfURLs.isEmpty else {
+            // Acquiring the grants is synchronous. The coalescer therefore owns
+            // them before this UIKit URL-delivery callback is allowed to return.
+            externalPDFImportCoalescer.submit(pdfURLs)
             return
         }
 
-        guard let incomingURL = urlContexts.first?.url else { return }
+        guard let incomingURL = urls.first else { return }
 
         guard incomingURL.pathExtension == JotFile.Info.fileExtension else {
             navigation.open(url: incomingURL)
@@ -129,9 +130,9 @@ final class SceneCoordinator {
     /// alive. Callers that redirect a document-opening scene await this method
     /// before destroying that source scene.
     func handleRedirectedPDFURLs(_ urls: [URL], securityScopedURLs: [URL]) async {
-        await materializeAndEnqueuePDFImports(
-            from: urls,
-            preaccessedSecurityScopedURLs: securityScopedURLs
+        await externalPDFImportCoalescer.submitPreaccessed(
+            urls,
+            securityScopedURLs: securityScopedURLs
         )
     }
 
@@ -163,7 +164,6 @@ final class SceneCoordinator {
         #if targetEnvironment(macCatalyst)
         securityScopedURL?.stopAccessingSecurityScopedResource()
         #endif
-        pendingPDFImportTask?.cancel()
         userInterfaceStyleTask?.cancel()
     }
 }
@@ -212,8 +212,10 @@ private extension SceneCoordinator {
 
     func startUserInterfaceStyleTask() {
         userInterfaceStyleTask?.cancel()
+        let styleUpdates = defaultsService.getValueStream(.userInterfaceStyle)
+        let onUpdateUserInterfaceStyle = onUpdateUserInterfaceStyle
         userInterfaceStyleTask = Task {
-            for await userInterfaceStyle in defaultsService.getValueStream(.userInterfaceStyle) {
+            for await userInterfaceStyle in styleUpdates {
                 let userInterfaceStyle =
                     userInterfaceStyle
                     .flatMap(UIUserInterfaceStyle.init(rawValue:)) ?? .unspecified
@@ -234,90 +236,75 @@ private extension SceneCoordinator {
         }
     }
 
-    /// Files can deliver one multi-document Open operation as several scene URL
-    /// callbacks. Materialize every callback immediately, then collect the local
-    /// data before deciding between the single and batch UI.
-    func materializeAndEnqueuePDFImports(
-        from urls: [URL],
-        preaccessedSecurityScopedURLs: [URL]? = nil
-    ) async {
-        guard !urls.isEmpty else { return }
-        pendingPDFImportTask?.cancel()
-        pendingPDFImportTask = nil
-        activePDFMaterializationCount += 1
+    func handleCoalescedExternalPDFURLs(_ urls: [URL]) async {
+        // A Set-backed UIKit callback has no stable iteration order. Sorting the
+        // complete aggregate also makes duplicate-name suffixing deterministic.
+        let urls = urls.sorted {
+            $0.absoluteString.localizedStandardCompare($1.absoluteString) == .orderedAscending
+        }
 
-        let scopedURLs = preaccessedSecurityScopedURLs
-            ?? urls.filter { $0.startAccessingSecurityScopedResource() }
+        // Route on the number selected, before any individual read can fail and
+        // accidentally turn a batch into the single-file presentation path.
+        switch ExternalPDFImportRoute(urls: urls) {
+        case .none:
+            return
+        case .single(let url):
+            await importSinglePDF(from: url)
+        case .batch(let urls):
+            await importPDFBatch(from: urls)
+        }
+    }
+
+    func importSinglePDF(from url: URL) async {
+        let result = await materializePDFs(from: [url])
+
+        guard let pdf = result.documents.first else {
+            presentPDFImportFailure(names: result.failedNames)
+            return
+        }
+
+        presentFolderSelectionForImportedPDF(pdfData: pdf.data, pdfName: pdf.name)
+    }
+
+    func importPDFBatch(from urls: [URL]) async {
+        var failedNames = [String]()
+
+        for url in urls {
+            let result = await materializePDFs(from: [url])
+            failedNames.append(contentsOf: result.failedNames)
+
+            guard let document = result.documents.first else { continue }
+
+            // Persist each owned Data value before reading the next File
+            // Provider item so a large selection cannot accumulate in memory.
+            await startCreateJotsAndWait(directory: nil, pdfs: [document])
+        }
+
+        if !failedNames.isEmpty {
+            logger.error("Failed to read PDFs during batch import: \(failedNames.joined(separator: ", "))")
+        }
+    }
+
+    func materializePDFs(
+        from urls: [URL]
+    ) async -> (documents: [(data: Data, name: String)], failedNames: [String]) {
         let externalFileImportService = externalFileImportService
-        let result = await Task.detached {
-            defer {
-                for url in scopedURLs {
-                    url.stopAccessingSecurityScopedResource()
-                }
-            }
+        return await Task.detached(priority: .userInitiated) {
             var documents: [(data: Data, name: String)] = []
             var failedNames: [String] = []
+
             for url in urls {
-                let name = url.deletingPathExtension().lastPathComponent
+                let name = ExternalPDFImportRoute.suggestedTitle(for: url)
                 do {
-                    let file = try externalFileImportService.importAndReadFile(sourceURL: url)
-                    documents.append((data: file.data, name: name))
+                    let data = try externalFileImportService.readExternalFile(sourceURL: url)
+                    documents.append((data: data, name: name))
                 } catch {
                     failedNames.append(name)
                 }
             }
+
             return (documents: documents, failedNames: failedNames)
         }.value
-
-        pendingPDFImportSelectedCount += urls.count
-        pendingPDFImports.append(contentsOf: result.documents)
-        pendingPDFImportFailures.append(contentsOf: result.failedNames)
-        activePDFMaterializationCount -= 1
-        schedulePendingPDFImportPresentationIfReady()
-    }
-
-    func schedulePendingPDFImportPresentationIfReady() {
-        guard activePDFMaterializationCount == 0 else { return }
-        pendingPDFImportTask?.cancel()
-        pendingPDFImportTask = Task { @MainActor [weak self] in
-            do {
-                // Scene-based Open requests for one multi-selection arrive as
-                // sibling callbacks. Allow the connection callbacks to settle,
-                // while active File Provider copies keep this timer cancelled.
-                try await Task.sleep(for: .milliseconds(800))
-            } catch {
-                return
-            }
-            guard let self, activePDFMaterializationCount == 0 else { return }
-            let pdfs = pendingPDFImports
-            let selectedCount = pendingPDFImportSelectedCount
-            let failedNames = pendingPDFImportFailures
-            pendingPDFImports.removeAll(keepingCapacity: true)
-            pendingPDFImportSelectedCount = 0
-            pendingPDFImportFailures.removeAll(keepingCapacity: true)
-            pendingPDFImportTask = nil
-            presentMaterializedPDFImports(
-                pdfs: pdfs,
-                selectedCount: selectedCount,
-                failedNames: failedNames
-            )
-        }
-    }
-
-    func presentMaterializedPDFImports(
-        pdfs: [(data: Data, name: String)],
-        selectedCount: Int,
-        failedNames: [String]
-    ) {
-        guard !pdfs.isEmpty else {
-            presentPDFImportFailure(names: failedNames)
-            return
-        }
-        if selectedCount == 1, let pdf = pdfs.first {
-            presentFolderSelectionForImportedPDF(pdfData: pdf.data, pdfName: pdf.name)
-        } else {
-            presentFolderSelectionForImportedPDFs(pdfs: pdfs)
-        }
     }
 
     func presentPDFImportFailure(names: [String]) {
@@ -336,25 +323,39 @@ private extension SceneCoordinator {
         }
     }
 
-    func presentFolderSelectionForImportedPDFs(pdfs: [(data: Data, name: String)]) {
-        presentFolderPickerForPDFImport { [weak self] folder in
-            self?.startCreateJots(directory: folder.map { .init(url: $0.url) }, pdfs: pdfs)
-        }
-    }
-
     func startCreateJot(directory: CreateJotCoordinatorFactory.Directory?, pdfData: Data, pdfName: String) {
         let coordinator = createJotCoordinatorFactory.make(navigation: navigation, directory: directory,
             pdfData: pdfData, pdfName: pdfName)
-        retainedCreateJotCoordinator = coordinator
-        coordinator.onEnd = { [weak self] in self?.retainedCreateJotCoordinator = nil }
-        coordinator.start()
+        startAndRetainCreateJotCoordinator(coordinator)
     }
 
-    func startCreateJots(directory: CreateJotCoordinatorFactory.Directory?, pdfs: [(data: Data, name: String)]) {
-        let coordinator = createJotCoordinatorFactory.makeBatch(navigation: navigation, directory: directory,
-            pdfs: pdfs)
-        retainedCreateJotCoordinator = coordinator
-        coordinator.onEnd = { [weak self] in self?.retainedCreateJotCoordinator = nil }
+    func startCreateJotsAndWait(
+        directory: CreateJotCoordinatorFactory.Directory?,
+        pdfs: [(data: Data, name: String)]
+    ) async {
+        let coordinator = createJotCoordinatorFactory.makeBatch(
+            navigation: navigation,
+            directory: directory,
+            pdfs: pdfs
+        )
+        let id = UUID()
+        retainedCreateJotCoordinators[id] = coordinator
+
+        await withCheckedContinuation { continuation in
+            coordinator.onEnd = { [weak self] in
+                self?.retainedCreateJotCoordinators.removeValue(forKey: id)
+                continuation.resume()
+            }
+            coordinator.start()
+        }
+    }
+
+    func startAndRetainCreateJotCoordinator(_ coordinator: Coordinator) {
+        let id = UUID()
+        retainedCreateJotCoordinators[id] = coordinator
+        coordinator.onEnd = { [weak self] in
+            self?.retainedCreateJotCoordinators.removeValue(forKey: id)
+        }
         coordinator.start()
     }
 
@@ -435,10 +436,14 @@ private extension SceneCoordinator {
             return (url: url, isRestored: false)
         }
 
-        if let firstURLContextURL = connectionOptions.urlContexts.first?.url {
-            if firstURLContextURL.isFileURL, firstURLContextURL.pathExtension.lowercased() == "pdf" {
-                return (url: JotsPageURL().toURL(), isRestored: false)
-            }
+        let incomingURLs = connectionOptions.urlContexts.map(\.url)
+        if incomingURLs.contains(where: {
+            $0.isFileURL && $0.pathExtension.lowercased() == "pdf"
+        }) {
+            return (url: JotsPageURL().toURL(), isRestored: false)
+        }
+
+        if let firstURLContextURL = incomingURLs.first {
             return (url: firstURLContextURL, isRestored: false)
         }
 

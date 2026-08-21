@@ -19,6 +19,22 @@
 import Foundation
 import UIKit
 
+private final class JotsRefreshState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var requiresDirectoryReload = false
+
+    func recordDirectoryChange() {
+        lock.withLock { requiresDirectoryReload = true }
+    }
+
+    func consumeDirectoryReload() -> Bool {
+        lock.withLock {
+            defer { requiresDirectoryReload = false }
+            return requiresDirectoryReload
+        }
+    }
+}
+
 protocol JotsRepositoryProtocol: JotPreviewProviderProtocol {
 
     func getItems(location: JotsLocation) -> AsyncThrowingStream<[JotsItem], Error>
@@ -83,8 +99,8 @@ struct JotsRepository: JotsRepositoryProtocol {
     }
 
     func getItems(location: JotsLocation) -> AsyncThrowingStream<[JotsItem], Error> {
-        AsyncThrowingStream { continuation in
-            let task = Task {
+        AsyncThrowingStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
+            let producer = Task {
                 do {
                     let directory: URL
                     switch location {
@@ -98,33 +114,73 @@ struct JotsRepository: JotsRepositoryProtocol {
                         directory = directoryLocation.url
                     }
 
-                    // Emit initial state once before starting observation loops.
-                    // Both directoryChanges and getValueStream yield immediately on
-                    // subscription — skipping their first events avoids a redundant
-                    // double listItems() call and main-thread filesystem I/O.
-                    let initialItems = try listItems(directory: directory)
-                    continuation.yield(sortItems(initialItems))
+                    let refreshState = JotsRefreshState()
+                    let (changes, changesContinuation) = AsyncStream.makeStream(
+                        of: Void.self,
+                        bufferingPolicy: .bufferingNewest(1)
+                    )
+                    // Register invalidation sources before the potentially slow
+                    // initial directory scan so changes during that scan remain
+                    // buffered and force a follow-up refresh.
+                    let directoryUpdates = fileService.directoryChanges(directory: directory)
+                    let sortOrderUpdates = defaultsService.getValueStream(
+                        DefaultsKey<Int>("jots.sortOrder")
+                    )
 
-                    let dirTask = Task {
-                        var isFirst = true
-                        for try await _ in fileService.directoryChanges(directory: directory) {
-                            if isFirst { isFirst = false; continue }
-                            let items = try listItems(directory: directory)
-                            continuation.yield(sortItems(items))
+                    let initialItems = try await loadItems(directory: directory)
+                    let initialSortOrder = defaultsService.getValue(
+                        DefaultsKey<Int>("jots.sortOrder")
+                    )
+                    continuation.yield(sortItems(initialItems, sortOrderRaw: initialSortOrder))
+
+                    try await withThrowingTaskGroup(of: Void.self) { group in
+                        defer {
+                            changesContinuation.finish()
+                            group.cancelAll()
                         }
-                    }
 
-                    let defaultsTask = Task {
-                        var isFirst = true
-                        for await _ in defaultsService.getValueStream(DefaultsKey<Int>.init("jots.sortOrder")) {
-                            if isFirst { isFirst = false; continue }
-                            let items = try listItems(directory: directory)
-                            continuation.yield(sortItems(items))
+                        group.addTask {
+                            for await _ in directoryUpdates {
+                                try Task.checkCancellation()
+                                // Keep the expensive invalidation sticky. A
+                                // sort event may replace the buffered wake-up,
+                                // but cannot erase the required disk reload.
+                                refreshState.recordDirectoryChange()
+                                changesContinuation.yield()
+                            }
                         }
-                    }
 
-                    try await dirTask.value
-                    try await defaultsTask.value
+                        group.addTask {
+                            var isInitialValue = true
+                            for await value in sortOrderUpdates {
+                                try Task.checkCancellation()
+                                if isInitialValue, value == initialSortOrder {
+                                    isInitialValue = false
+                                    continue
+                                }
+                                isInitialValue = false
+                                changesContinuation.yield()
+                            }
+                        }
+
+                        group.addTask {
+                            var cachedItems = initialItems
+                            for await _ in changes {
+                                try Task.checkCancellation()
+                                if refreshState.consumeDirectoryReload() {
+                                    cachedItems = try await loadItems(directory: directory)
+                                }
+                                let sortOrder = defaultsService.getValue(
+                                    DefaultsKey<Int>("jots.sortOrder")
+                                )
+                                continuation.yield(sortItems(cachedItems, sortOrderRaw: sortOrder))
+                            }
+                        }
+
+                        try await group.waitForAll()
+                    }
+                } catch is CancellationError {
+                    continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
                     return
@@ -132,25 +188,40 @@ struct JotsRepository: JotsRepositoryProtocol {
                 continuation.finish()
             }
 
-            continuation.onTermination = { _ in task.cancel() }
+            continuation.onTermination = { _ in producer.cancel() }
         }
     }
 
-    private func sortItems(_ items: [JotsItem]) -> [JotsItem] {
+    private func loadItems(directory: URL) async throws -> [JotsItem] {
+        let items = try await Task.detached(priority: .userInitiated) {
+            try listItems(directory: directory)
+        }.value
+        try Task.checkCancellation()
+        return items
+    }
+
+    private func sortItems(_ items: [JotsItem], sortOrderRaw: Int?) -> [JotsItem] {
         enum SortOrder: Int {
             case modified = 0
             case name = 1
         }
 
-        let sortOrderRaw = defaultsService.getValue(DefaultsKey<Int>.init("jots.sortOrder"))
-            ?? SortOrder.modified.rawValue
-        let sortOrder = SortOrder(rawValue: sortOrderRaw) ?? .modified
+        let sortOrder = SortOrder(
+            rawValue: sortOrderRaw ?? SortOrder.modified.rawValue
+        ) ?? .modified
 
-        let folders = items.compactMap { item -> FolderBusinessModel? in
-            guard case let .folder(folder) = item else { return nil }
-            return folder
+        var folders: [FolderBusinessModel] = []
+        var jots: [JotFile.Info] = []
+        folders.reserveCapacity(items.count)
+        jots.reserveCapacity(items.count)
+        for item in items {
+            switch item {
+            case let .folder(folder): folders.append(folder)
+            case let .jot(jot): jots.append(jot)
+            }
         }
-        .sorted { lhs, rhs in
+
+        folders.sort { lhs, rhs in
             switch sortOrder {
             case .modified:
                 return (lhs.modificationDate ?? .distantPast) > (rhs.modificationDate ?? .distantPast)
@@ -159,11 +230,7 @@ struct JotsRepository: JotsRepositoryProtocol {
             }
         }
 
-        let jots = items.compactMap { item -> JotFile.Info? in
-            guard case let .jot(jotFileInfo) = item else { return nil }
-            return jotFileInfo
-        }
-        .sorted { lhs, rhs in
+        jots.sort { lhs, rhs in
             switch sortOrder {
             case .modified:
                 return (lhs.modificationDate ?? .distantPast) > (rhs.modificationDate ?? .distantPast)
@@ -192,36 +259,30 @@ struct JotsRepository: JotsRepositoryProtocol {
         )
 
         let resourceKeys = Set(ListConstants.urlResourceKeys)
-        let urlsWithProperties: [(url: URL, properties: URLResourceValues)] = try urls.map { url in
-            (url: url, properties: try url.resourceValues(forKeys: resourceKeys))
-        }
-        let accessible = urlsWithProperties.filter { _, properties in
-            properties.isReadable == true && properties.isWritable == true
-        }
-        return try accessible.compactMap { url, properties -> JotsItem? in
-                if properties.isDirectory == true {
-                    let name = url.lastPathComponent
-                    guard name != "Inbox", name != TrashService.directoryName else { return nil }
-                    return .folder(
-                        FolderBusinessModel(
-                            url: url,
-                            name: url.lastPathComponent,
-                            modificationDate: properties.contentModificationDate
-                        )
-                    )
-                }
-                guard properties.isRegularFile == true,
-                      url.pathExtension == JotFile.Info.fileExtension
-                else { return nil }
+        var items: [JotsItem] = []
+        items.reserveCapacity(urls.count)
+        for url in urls {
+            let properties = try url.resourceValues(forKeys: resourceKeys)
+            guard properties.isReadable == true, properties.isWritable == true else { continue }
 
-                return .jot(
-                    JotFile.Info(
-                        url: url,
-                        name: url.deletingPathExtension().lastPathComponent,
-                        modificationDate: properties.contentModificationDate
-                    )
-                )
+            if properties.isDirectory == true {
+                let name = url.lastPathComponent
+                guard name != "Inbox", name != TrashService.directoryName else { continue }
+                items.append(.folder(FolderBusinessModel(
+                    url: url,
+                    name: name,
+                    modificationDate: properties.contentModificationDate
+                )))
+            } else if properties.isRegularFile == true,
+                      url.pathExtension == JotFile.Info.fileExtension {
+                items.append(.jot(JotFile.Info(
+                    url: url,
+                    name: url.deletingPathExtension().lastPathComponent,
+                    modificationDate: properties.contentModificationDate
+                )))
             }
+        }
+        return items
     }
 
     func duplicate(jotFileInfo: JotFile.Info) throws -> JotFile.Info {

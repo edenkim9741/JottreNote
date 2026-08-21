@@ -25,6 +25,7 @@ final class CreateJotCoordinator: Coordinator {
     var onEnd: (() -> Void)?
 
     private var retainedInfoAlertCoordinator: Coordinator?
+    private var pdfDocumentPickerAdapter: PDFDocumentPickerAdapter?
     private var documentPickerAdapter: DocumentPickerAdapter?
 
     private let navigation: Navigation
@@ -108,58 +109,103 @@ final class CreateJotCoordinator: Coordinator {
     }
 
     private func presentPDFPicker() {
-        let adapter = DocumentPickerAdapter(
-            externalFileImportService: externalFileImportService,
-            onPick: { @MainActor [weak self] result in
+        let adapter = PDFDocumentPickerAdapter(
+            onRoute: { @MainActor [weak self] route in
                 guard let self else { return }
-                documentPickerAdapter = nil
-                if result.documents.isEmpty {
-                    showInfoAlert(
-                        title: L10n.EditJot.PDF.Error.importFailed,
-                        message: result.failedNames.joined(separator: "\n")
-                    )
-                } else if result.selectedCount == 1, let document = result.documents.first {
-                    showNameAlert(pdfData: document.data, suggestedName: document.name)
-                } else {
-                    handleCreateJots(
-                        pdfs: result.documents,
-                        failedNames: result.failedNames
-                    )
-                }
+                pdfDocumentPickerAdapter = nil
+                handlePickedPDFRoute(route)
             },
             onCancel: { @MainActor [weak self] in
+                self?.pdfDocumentPickerAdapter = nil
                 self?.onEnd?()
             }
         )
-        documentPickerAdapter = adapter
-        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.pdf], asCopy: true)
-        picker.delegate = adapter
-        picker.allowsMultipleSelection = true
-        navigation.present(picker, animated: true)
+        pdfDocumentPickerAdapter = adapter
+        navigation.present(makePDFPicker(delegate: adapter), animated: true)
     }
 
-    private func handleCreateJots(
-        pdfs: [(data: Data, name: String)],
-        failedNames: [String] = []
-    ) {
+    /// Internal construction seam for verifying the picker configuration
+    /// without driving the Create alert hierarchy in tests.
+    func makePDFPicker(delegate: PDFDocumentPickerAdapter) -> UIDocumentPickerViewController {
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.pdf], asCopy: true)
+        picker.delegate = delegate
+        picker.allowsMultipleSelection = true
+        return picker
+    }
+
+    /// Routes the original picker selection before any reads can reduce a
+    /// multi-file selection to a single successfully materialized document.
+    func handlePickedPDFRoute(_ route: ExternalPDFImportRoute) {
+        switch route {
+        case .none:
+            onEnd?()
+        case .single(let url):
+            importSinglePickedPDF(from: url)
+        case .batch(let urls):
+            importPickedPDFBatch(from: urls)
+        }
+    }
+
+    private func importSinglePickedPDF(from url: URL) {
+        let externalFileImportService = externalFileImportService
+        let name = ExternalPDFImportRoute.suggestedTitle(for: url)
+
         Task { [weak self] in
+            let data = await Task.detached(priority: .userInitiated) {
+                try? externalFileImportService.readExternalFile(sourceURL: url)
+            }.value
+
             guard let self else { return }
-            var failedNames = failedNames
-            for pdf in pdfs {
-                do {
-                    _ = try await repository.createJot(name: pdf.name, directory: directory, pdfData: pdf.data)
-                } catch {
-                    failedNames.append(pdf.name)
-                }
-            }
-            if !failedNames.isEmpty {
-                showInfoAlert(
-                    title: L10n.Jots.Create.Error.generic,
-                    message: failedNames.joined(separator: "\n")
-                )
+            if let data {
+                showNameAlert(pdfData: data, suggestedName: name)
             } else {
-                onEnd?()
+                showInfoAlert(
+                    title: L10n.EditJot.PDF.Error.importFailed,
+                    message: name
+                )
             }
+        }
+    }
+
+    private func importPickedPDFBatch(from urls: [URL]) {
+        let externalFileImportService = externalFileImportService
+        let repository = repository
+        let directory = directory
+        let logger = OSLogLogger(category: "CreateJotBatchCoordinator")
+
+        // Retain the coordinator until this silent batch finishes. Reads happen
+        // off the main actor and each file failure is isolated from the rest.
+        Task { [self] in
+            var failedNames = [String]()
+
+            for url in urls {
+                let name = ExternalPDFImportRoute.suggestedTitle(for: url)
+                let data = await Task.detached(priority: .userInitiated) {
+                    try? externalFileImportService.readExternalFile(sourceURL: url)
+                }.value
+
+                guard let data else {
+                    failedNames.append(name)
+                    continue
+                }
+
+                // Wait for this note to be persisted before loading the next
+                // PDF, bounding the batch to roughly one source file in memory.
+                _ = await CreateJotBatchCreationQueue.shared.enqueue(
+                    repository: repository,
+                    directory: directory,
+                    pdfs: [(data: data, name: name)],
+                    logger: logger
+                )
+            }
+
+            if !failedNames.isEmpty {
+                logger.error(
+                    "Failed to read PDFs during picker batch import: "
+                        + failedNames.joined(separator: ", ")
+                )
+            }
+            onEnd?()
         }
     }
 
@@ -264,6 +310,72 @@ final class CreateJotCoordinator: Coordinator {
     }
 }
 
+/// A route-only PDF picker delegate. It deliberately forwards the complete
+/// selection before file access, leaving single-versus-batch behavior to the
+/// coordinator. Internal visibility provides a direct delegate test seam.
+@MainActor
+final class PDFDocumentPickerAdapter: NSObject, UIDocumentPickerDelegate {
+
+    private let onRoute: @MainActor @Sendable (ExternalPDFImportRoute) -> Void
+    private let onCancel: @MainActor @Sendable () -> Void
+    private var didFinish = false
+
+    init(
+        onRoute: @MainActor @Sendable @escaping (ExternalPDFImportRoute) -> Void,
+        onCancel: @MainActor @Sendable @escaping () -> Void
+    ) {
+        self.onRoute = onRoute
+        self.onCancel = onCancel
+    }
+
+    func documentPicker(
+        _ controller: UIDocumentPickerViewController,
+        didPickDocumentsAt urls: [URL]
+    ) {
+        guard !didFinish else { return }
+        didFinish = true
+
+        // This route is computed synchronously from the delegate's original
+        // transaction. No `.first`, successful-read count, or timer is involved.
+        let route = ExternalPDFImportRoute(urls: urls)
+        Task { @MainActor [weak self, weak controller] in
+            if let controller {
+                await Self.dismissIfNeeded(controller)
+            }
+            self?.onRoute(route)
+        }
+    }
+
+    func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+        guard !didFinish else { return }
+        didFinish = true
+        onCancel()
+    }
+
+    private static func dismissIfNeeded(
+        _ controller: UIDocumentPickerViewController
+    ) async {
+        guard controller.presentingViewController != nil, controller.viewIfLoaded?.window != nil else {
+            return
+        }
+
+        if controller.isBeingDismissed, let transitionCoordinator = controller.transitionCoordinator {
+            await withCheckedContinuation { continuation in
+                transitionCoordinator.animate(alongsideTransition: nil) { _ in
+                    continuation.resume()
+                }
+            }
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            controller.dismiss(animated: true) {
+                continuation.resume()
+            }
+        }
+    }
+}
+
 private struct DocumentPickerImportResult: Sendable {
 
     let documents: [(data: Data, name: String)]
@@ -345,7 +457,7 @@ private final class DocumentPickerAdapter: NSObject, UIDocumentPickerDelegate {
             for url in urls {
                 let name = url.deletingPathExtension().lastPathComponent
                 do {
-                    let data = try externalFileImportService.readFileCoordinated(fileURL: url)
+                    let data = try externalFileImportService.readExternalFile(sourceURL: url)
                     documents.append((data: data, name: name))
                 } catch {
                     failedNames.append(name)
@@ -393,30 +505,72 @@ final class CreateJotBatchCoordinator: Coordinator {
 
     var onEnd: (() -> Void)?
 
-    private let navigation: Navigation
     private let repository: CreateJotRepositoryProtocol
     private let directory: CreateJotCoordinatorFactory.Directory?
     private let pdfs: [(data: Data, name: String)]
+    private let logger: LoggerProtocol
 
     init(
-        navigation: Navigation,
         repository: CreateJotRepositoryProtocol,
         directory: CreateJotCoordinatorFactory.Directory?,
-        pdfs: [(data: Data, name: String)]
+        pdfs: [(data: Data, name: String)],
+        logger: LoggerProtocol
     ) {
-        self.navigation = navigation
         self.repository = repository
         self.directory = directory
         self.pdfs = pdfs
+        self.logger = logger
     }
 
     func start() {
-        Task { [weak self] in
-            guard let self else { return }
-            for pdf in pdfs {
-                _ = try? await repository.createJot(name: pdf.name, directory: directory, pdfData: pdf.data)
-            }
+        Task { [self] in
+            _ = await CreateJotBatchCreationQueue.shared.enqueue(
+                repository: repository,
+                directory: directory,
+                pdfs: pdfs,
+                logger: logger
+            )
             onEnd?()
         }
+    }
+}
+
+private actor CreateJotBatchCreationQueue {
+
+    static let shared = CreateJotBatchCreationQueue()
+
+    private var precedingBatch: Task<[String], Never>?
+
+    func enqueue(
+        repository: CreateJotRepositoryProtocol,
+        directory: CreateJotCoordinatorFactory.Directory?,
+        pdfs: [(data: Data, name: String)],
+        logger: LoggerProtocol
+    ) async -> [String] {
+        let predecessor = precedingBatch
+        let batch = Task {
+            _ = await predecessor?.value
+            var failedNames = [String]()
+
+            for pdf in pdfs {
+                do {
+                    _ = try await repository.createJotResolvingNameCollision(
+                        name: pdf.name,
+                        directory: directory,
+                        pdfData: pdf.data
+                    )
+                } catch {
+                    failedNames.append(pdf.name)
+                    logger.error("Failed to import PDF named \(pdf.name): \(error)")
+                }
+            }
+
+            if !failedNames.isEmpty {
+                logger.error("PDF batch import failed for: \(failedNames.joined(separator: ", "))")
+            }
+            return failedNames
+        }
+        self.precedingBatch = batch
+        return await batch.value
     }
 }

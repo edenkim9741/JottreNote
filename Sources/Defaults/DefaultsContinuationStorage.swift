@@ -19,25 +19,34 @@
 import Foundation
 
 final class DefaultsContinuationStorage: @unchecked Sendable {
+
+    private struct StorageKey: Hashable {
+        let name: String
+        let valueType: ObjectIdentifier
+    }
+
     private let lock = NSLock()
-    private var continuations: [String: [Any]] = [:]
+    private var continuations: [StorageKey: [UUID: Any]] = [:]
 
     func add<T: LosslessStringConvertible & Sendable>(
         _ continuation: AsyncStream<T?>.Continuation,
+        id: UUID,
         defaultsKey: DefaultsKey<T>
     ) {
         lock.withLock {
-            continuations[defaultsKey.description, default: []].append(continuation)
+            continuations[storageKey(for: defaultsKey), default: [:]][id] = continuation
         }
     }
 
     func remove<T: LosslessStringConvertible & Sendable>(
-        _ continuation: AsyncStream<T?>.Continuation,
+        id: UUID,
         defaultsKey: DefaultsKey<T>
     ) {
         lock.withLock {
-            continuations[defaultsKey.description]?.removeAll {
-                ($0 as AnyObject) === (continuation as AnyObject)
+            let key = storageKey(for: defaultsKey)
+            continuations[key]?.removeValue(forKey: id)
+            if continuations[key]?.isEmpty == true {
+                continuations.removeValue(forKey: key)
             }
         }
     }
@@ -46,10 +55,28 @@ final class DefaultsContinuationStorage: @unchecked Sendable {
         defaultsKey: DefaultsKey<T>
     ) -> [AsyncStream<T?>.Continuation]? {
         lock.withLock {
-            continuations[defaultsKey.description]?
+            continuations[storageKey(for: defaultsKey)]?
+                .values
                 .compactMap { continuation in
                     continuation as? AsyncStream<T?>.Continuation
                 }
         }
+    }
+
+    func continuationCount<T: LosslessStringConvertible & Sendable>(
+        defaultsKey: DefaultsKey<T>
+    ) -> Int {
+        lock.withLock {
+            continuations[storageKey(for: defaultsKey)]?.count ?? 0
+        }
+    }
+
+    private func storageKey<T: LosslessStringConvertible & Sendable>(
+        for defaultsKey: DefaultsKey<T>
+    ) -> StorageKey {
+        StorageKey(
+            name: defaultsKey.description,
+            valueType: ObjectIdentifier(T.self)
+        )
     }
 }

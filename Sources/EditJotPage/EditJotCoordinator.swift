@@ -297,8 +297,7 @@ private final class DocumentPickerAdapter: NSObject, UIDocumentPickerDelegate {
         Task.detached { [url, externalFileImportService, onPick] in
             let data: Data?
             do {
-                let imported = try externalFileImportService.importAndReadFile(sourceURL: url)
-                data = imported.data
+                data = try externalFileImportService.readExternalFile(sourceURL: url)
             } catch {
                 data = nil
             }

@@ -38,7 +38,8 @@ protocol FileServiceProtocol: Sendable {
         properties: [URLResourceKey]
     ) throws -> [URL]
 
-    /// A stream that fires once the contents within the specified directory changes.
+    /// A stream that fires after the contents within the specified directory change.
+    /// Callers are responsible for loading their initial state.
     ///
     ///  - NOTE: Only recognizes file changes at the first level depth.
     ///
@@ -49,6 +50,9 @@ protocol FileServiceProtocol: Sendable {
 
     /// Writes the contents of a file.
     func writeFile(fileURL: URL, data: Data) throws
+
+    /// Creates a file without replacing an item that already exists.
+    func createFile(fileURL: URL, data: Data) throws
 
     /// Whether the file is present on the file system.
     func fileExists(fileURL: URL) -> Bool

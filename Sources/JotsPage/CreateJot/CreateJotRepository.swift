@@ -33,6 +33,35 @@ protocol CreateJotRepositoryProtocol: Sendable {
     ) async throws -> JotFile.Info
 }
 
+extension CreateJotRepositoryProtocol {
+
+    /// Batch imports keep the source title, adding a numeric suffix only when
+    /// a note with that title already exists. The single-note workflow still
+    /// reports collisions to the rename UI unchanged.
+    func createJotResolvingNameCollision(
+        name: String,
+        directory: CreateJotCoordinatorFactory.Directory?,
+        pdfData: Data
+    ) async throws -> JotFile.Info {
+        var index = 1
+
+        while true {
+            try Task.checkCancellation()
+            let candidateName = index == 1 ? name : "\(name) \(index)"
+
+            do {
+                return try await createJot(
+                    name: candidateName,
+                    directory: directory,
+                    pdfData: pdfData
+                )
+            } catch CreateJotRepository.Failure.fileExists {
+                index += 1
+            }
+        }
+    }
+}
+
 struct CreateJotRepository: CreateJotRepositoryProtocol {
 
     enum Failure: Error {
@@ -71,10 +100,6 @@ struct CreateJotRepository: CreateJotRepositoryProtocol {
             .appendingPathComponent(name, isDirectory: false)
             .appendingPathExtension(JotFile.Info.fileExtension)
 
-        guard !fileService.fileExists(fileURL: fileURL) else {
-            throw Failure.fileExists
-        }
-
         let jot: Jot
         if let pdfData {
             let empty = Jot.makeEmpty()
@@ -86,7 +111,11 @@ struct CreateJotRepository: CreateJotRepositoryProtocol {
             info: JotFile.Info(url: fileURL, name: name, modificationDate: nil),
             jot: jot
         )
-        try jotFileService.write(jotFile: jotFile)
+        do {
+            try jotFileService.create(jotFile: jotFile)
+        } catch CocoaError.fileWriteFileExists {
+            throw Failure.fileExists
+        }
         return jotFile.info
     }
 
@@ -108,11 +137,11 @@ struct CreateJotRepository: CreateJotRepositoryProtocol {
             .appendingPathComponent(name, isDirectory: false)
             .appendingPathExtension(JotFile.Info.fileExtension)
 
-        guard !fileService.fileExists(fileURL: fileURL) else {
+        do {
+            try fileService.createFile(fileURL: fileURL, data: data)
+        } catch CocoaError.fileWriteFileExists {
             throw Failure.fileExists
         }
-
-        try fileService.writeFile(fileURL: fileURL, data: data)
         return JotFile.Info(url: fileURL, name: name, modificationDate: nil)
     }
 }

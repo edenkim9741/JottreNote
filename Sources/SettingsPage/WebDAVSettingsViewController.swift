@@ -225,12 +225,13 @@ final class WebDAVSettingsViewController: UIViewController {
         statusLabel.text = "Testing..."
         statusLabel.textColor = .secondaryLabel
         testButton.isEnabled = false
-        Task { @MainActor [weak self] in
-            guard let self else { return }
+        let onTest = onTest
+        Task { @MainActor [weak self, configuration, onTest] in
             let success = await onTest(configuration)
-            statusLabel.text = success ? "✓ Connected successfully" : "✗ Connection failed"
-            statusLabel.textColor = success ? .systemGreen : .systemRed
-            testButton.isEnabled = true
+            guard !Task.isCancelled, let self else { return }
+            self.statusLabel.text = success ? "✓ Connected successfully" : "✗ Connection failed"
+            self.statusLabel.textColor = success ? .systemGreen : .systemRed
+            self.testButton.isEnabled = true
         }
     }
 
@@ -243,36 +244,49 @@ final class WebDAVSettingsViewController: UIViewController {
         backupStatusLabel.text = String(localized: "webdav.backup.testing", defaultValue: "Testing connection...")
         backupStatusLabel.textColor = .secondaryLabel
 
-        backupTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-
-            let connected = await onTest(currentConfiguration())
+        let configuration = currentConfiguration()
+        let onTest = onTest
+        let onBackupAll = onBackupAll
+        backupTask = Task { @MainActor [weak self, configuration, onTest, onBackupAll] in
+            let connected = await onTest(configuration)
             guard !Task.isCancelled else { return }
 
             guard connected else {
-                backupAllButton.isEnabled = true
-                backupStatusLabel.text = String(
-                    localized: "webdav.backup.connectionFailed",
-                    defaultValue: "✗ Connection failed — check your settings"
-                )
-                backupStatusLabel.textColor = .systemRed
+                if let self {
+                    backupAllButton.isEnabled = true
+                    backupStatusLabel.text = String(
+                        localized: "webdav.backup.connectionFailed",
+                        defaultValue: "✗ Connection failed — check your settings"
+                    )
+                    backupStatusLabel.textColor = .systemRed
+                }
                 return
             }
 
-            backupProgressView.isHidden = false
-            backupStatusLabel.text = String(localized: "webdav.backup.inProgress", defaultValue: "Backing up...")
-            backupStatusLabel.textColor = .secondaryLabel
+            if let self {
+                backupProgressView.isHidden = false
+                backupStatusLabel.text = String(
+                    localized: "webdav.backup.inProgress",
+                    defaultValue: "Backing up..."
+                )
+                backupStatusLabel.textColor = .secondaryLabel
+            }
 
             let stream = onBackupAll()
             for await progress in stream {
                 guard !Task.isCancelled else { break }
-                backupProgressView.progress = Float(progress)
+                self?.backupProgressView.progress = Float(progress)
             }
             guard !Task.isCancelled else { return }
-            backupAllButton.isEnabled = true
-            backupProgressView.isHidden = true
-            backupStatusLabel.text = String(localized: "webdav.backup.complete", defaultValue: "✓ Backup complete")
-            backupStatusLabel.textColor = .systemGreen
+            if let self {
+                backupAllButton.isEnabled = true
+                backupProgressView.isHidden = true
+                backupStatusLabel.text = String(
+                    localized: "webdav.backup.complete",
+                    defaultValue: "✓ Backup complete"
+                )
+                backupStatusLabel.textColor = .systemGreen
+            }
         }
     }
 

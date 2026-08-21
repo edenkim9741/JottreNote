@@ -18,14 +18,22 @@
 
 @preconcurrency import PencilKit
 import CoreGraphics
-import PDFKit
 
 @MainActor
 final class EditJotViewModel {
 
+    private static let maximumPageCount = 10_000
+
     struct Drawing: Sendable {
         let value: PKDrawing
         let width: CGFloat
+        let strokePageIndices: [Int]
+
+        init(value: PKDrawing, width: CGFloat, strokePageIndices: [Int] = []) {
+            self.value = value
+            self.width = width
+            self.strokePageIndices = strokePageIndices
+        }
     }
 
     struct ScribbleEraseEvent: Sendable {
@@ -41,7 +49,7 @@ final class EditJotViewModel {
     private(set) lazy var menuConfigurations = menuConfigurationFactory.make(
         onShare: { [weak self] (format: ShareFormat, configurePopoverAnchor: PopoverAnchor?) in
             Task { @MainActor [weak self] in
-                guard let self else { return }
+                guard let self, await self.flushPendingChanges() else { return }
                 self.coordinator?.showShareJot(
                     jotFileInfo: self.jotFileInfo,
                     format: format,
@@ -51,25 +59,25 @@ final class EditJotViewModel {
         },
         onRename: { [weak self] in
             Task { @MainActor [weak self] in
-                guard let self else { return }
+                guard let self, await self.prepareForFileMutation() else { return }
                 self.coordinator?.showRenameAlert(jotFileInfo: self.jotFileInfo)
             }
         },
         onDuplicate: { [weak self] in
             Task { @MainActor [weak self] in
-                guard let self else { return }
+                guard let self, await self.flushPendingChanges() else { return }
                 self.didTapDuplicateJot(jotFileInfo: self.jotFileInfo)
             }
         },
         onDelete: { [weak self] in
             Task { @MainActor [weak self] in
-                guard let self else { return }
+                guard let self, await self.prepareForFileMutation() else { return }
                 self.coordinator?.openDeleteJot(jotFileInfo: self.jotFileInfo)
             }
         },
         onShowInFiles: { [weak self] in
             Task { @MainActor [weak self] in
-                guard let self else { return }
+                guard let self, await self.flushPendingChanges() else { return }
                 self.coordinator?.showInFiles(jotFileInfo: self.jotFileInfo)
             }
         },
@@ -106,22 +114,24 @@ final class EditJotViewModel {
     let loadingProgress: AsyncStream<Double?>
     private let loadingProgressContinuation: AsyncStream<Double?>.Continuation
 
-    private var drawingUpdateTask: Task<Void, Never>?
-    private let drawingUpdateContinuation: AsyncStream<PKDrawing>.Continuation
     private var loadingTask: Task<Void, Never>?
+    private var backupTask: Task<Void, Never>?
+    private var persistenceRevision = UInt64.zero
+    private var isPersistenceReady = false
+    private var isDirty = false
+    private let persistenceWriter: EditJotPersistenceWriter
 
-    var currentPdfData: Data? {
-        didSet { cacheCurrentPDFPageAspectRatio() }
-    }
+    var currentPdfData: Data?
     var currentExtraPages: Int = 0
     var currentPdfInsertedPageSlots: [Int] = []
     var currentDrawing: PKDrawing = PKDrawing()
     var previousDrawing: PKDrawing = PKDrawing()
-    var currentWidth: CGFloat = 1200
+    var currentWidth: CGFloat = Jot.defaultWidth
     // Per-stroke page indices aligned with `currentDrawing.strokes`.
     // Each entry records the logical page index the stroke was created on.
     var currentStrokePageIndices: [Int] = []
     private var cachedPDFPageAspectRatio: CGFloat?
+    private var cachedPDFPageCount: Int?
 
     let jotFileInfo: JotFile.Info
     let repository: EditJotRepositoryProtocol
@@ -144,6 +154,11 @@ final class EditJotViewModel {
         self.menuConfigurationFactory = menuConfigurationFactory
         self.webDAVBackupService = webDAVBackupService
         self.logger = logger
+        persistenceWriter = EditJotPersistenceWriter(
+            jotFileInfo: jotFileInfo,
+            repository: repository,
+            logger: logger
+        )
         (isEditing, isEditingContinuation) = AsyncStream.makeStream(
             of: Bool?.self, bufferingPolicy: .bufferingNewest(1)
         )
@@ -169,27 +184,6 @@ final class EditJotViewModel {
         isEditingContinuation.yield(true)
         #endif
 
-        let (drawingUpdate, drawingUpdateContinuation) = AsyncStream.makeStream(
-            of: PKDrawing.self, bufferingPolicy: .bufferingNewest(1)
-        )
-        self.drawingUpdateContinuation = drawingUpdateContinuation
-
-        drawingUpdateTask = Task { [logger] in
-            for await drawing in drawingUpdate.dropFirst().debounce(for: 0.3) {
-                do {
-                    try await repository.writeContent(
-                        jotFileInfo: jotFileInfo,
-                        drawing: drawing,
-                        pdfData: self.currentPdfData,
-                        extraPages: self.currentExtraPages,
-                        pdfInsertedPageSlots: self.currentPdfInsertedPageSlots,
-                        strokePageIndices: self.currentStrokePageIndices
-                    )
-                } catch {
-                    logger.error("Failed to write drawing: \(error)")
-                }
-            }
-        }
     }
 
     func didLoad() {
@@ -209,33 +203,30 @@ final class EditJotViewModel {
             }
         } else {
             loadingProgressContinuation.yield(0.0)
-            loadingTask = Task { [weak self] in
-                guard let self else { return }
+            loadingTask?.cancel()
+            let progressContinuation = loadingProgressContinuation
+            loadingTask = Task { [weak self, repository, jotFileInfo, logger] in
                 do {
                     let content = try await repository.readContent(
                         jotFileInfo: jotFileInfo,
-                        onProgress: { [weak self] pct in self?.loadingProgressContinuation.yield(pct) }
+                        onProgress: { progressContinuation.yield($0) }
                     )
-                    currentPdfData = content.pdfData
-                    currentExtraPages = content.extraPages
-                    currentPdfInsertedPageSlots = content.pdfInsertedPageSlots
-                    if currentPdfData != nil, currentPdfInsertedPageSlots.isEmpty, currentExtraPages > 0 {
-                        let basePages = PDFDocument(data: currentPdfData ?? Data())?.pageCount ?? 1
-                        currentPdfInsertedPageSlots = Array(basePages..<(basePages + currentExtraPages))
+                    try Task.checkCancellation()
+                    if let self {
+                        applyLoadedContent(content)
+                    } else {
+                        return
                     }
-                    currentExtraPages = currentPdfInsertedPageSlots.isEmpty
-                        ? currentExtraPages : currentPdfInsertedPageSlots.count
-                    currentDrawing = content.drawing
-                    previousDrawing = content.drawing
-                    currentStrokePageIndices = content.strokePageIndices
-                    currentWidth = content.width
-                    drawingContinuation.yield(Drawing(value: content.drawing, width: content.width))
-                    yieldBackground()
-                    loadingProgressContinuation.yield(1.0)
-                    try? await Task.sleep(nanoseconds: 350_000_000)
-                    loadingProgressContinuation.yield(nil)
+                    progressContinuation.yield(1.0)
+                    do {
+                        try await Task.sleep(for: .milliseconds(350))
+                    } catch {
+                        return
+                    }
+                    progressContinuation.yield(nil)
                 } catch {
-                    loadingProgressContinuation.yield(nil)
+                    guard !(error is CancellationError) else { return }
+                    progressContinuation.yield(nil)
                     logger.error("Failed to read drawing: \(error)")
                 }
             }
@@ -246,52 +237,70 @@ final class EditJotViewModel {
         isEditingContinuation.yield(!isEditing)
     }
 
-    func didChangeDrawing(_ drawing: PKDrawing) {
+    func didChangeDrawing(
+        _ drawing: PKDrawing,
+        strokePageIndices: [Int]? = nil,
+        detectsScribbleErase: Bool = true
+    ) {
+        guard isPersistenceReady else { return }
         let prev = previousDrawing
         previousDrawing = drawing
 
-        if let result = ScribbleEraseProcessor.process(newDrawing: drawing, previousDrawing: prev) {
+        if detectsScribbleErase,
+           let result = ScribbleEraseProcessor.process(newDrawing: drawing, previousDrawing: prev) {
             let processed = result.processedDrawing
             previousDrawing = processed
             currentDrawing = processed
+            currentStrokePageIndices = strokePageIndices(
+                after: result,
+                previousDrawing: prev
+            )
             scribbleEraseContinuation.yield(ScribbleEraseEvent(
                 beforeDrawing: drawing,
-                result: Drawing(value: processed, width: currentWidth)
+                result: Drawing(
+                    value: processed,
+                    width: currentWidth,
+                    strokePageIndices: currentStrokePageIndices
+                )
             ))
-            drawingUpdateContinuation.yield(processed)
+            schedulePersistence()
             return
         }
 
         currentDrawing = drawing
 
-        if drawing.strokes.count != currentStrokePageIndices.count {
-            let pageHeight = normalizedPageHeight()
-            let pageStride = pageHeight + JotBackgroundView.pageSpacing
+        if let strokePageIndices, strokePageIndices.count == drawing.strokes.count {
+            currentStrokePageIndices = strokePageIndices.map {
+                min(max(0, $0), Self.maximumPageCount - 1)
+            }
+        } else if drawing.strokes.count != currentStrokePageIndices.count {
             if drawing.strokes.count > currentStrokePageIndices.count {
                 for idx in currentStrokePageIndices.count..<drawing.strokes.count {
-                    let page = Int(floor(drawing.strokes[idx].renderBounds.midY / pageStride))
-                    currentStrokePageIndices.append(max(0, page))
+                    currentStrokePageIndices.append(pageIndex(for: drawing.strokes[idx]))
                 }
             } else {
-                currentStrokePageIndices = drawing.strokes.map { stroke in
-                    max(0, Int(floor(stroke.renderBounds.midY / pageStride)))
-                }
+                currentStrokePageIndices = normalizedStrokePageIndices([], for: drawing)
             }
         }
 
-        drawingUpdateContinuation.yield(drawing)
+        schedulePersistence()
     }
 
     func didTapBackButton() {
-        if let jotFileVersions = repository.getConflictingVersions(jotFileInfo: jotFileInfo) {
-            coordinator?.showJotConflictPage(
-                jotFileInfo: jotFileInfo,
-                jotFileVersions: jotFileVersions
-            ) { [weak self] (_: JotConflictResult) in
-                Task { @MainActor in self?.coordinator?.goBack() }
+        Task { @MainActor [weak self] in
+            guard let self, await self.flushPendingChanges() else { return }
+            if let jotFileVersions = self.repository.getConflictingVersions(
+                jotFileInfo: self.jotFileInfo
+            ) {
+                self.coordinator?.showJotConflictPage(
+                    jotFileInfo: self.jotFileInfo,
+                    jotFileVersions: jotFileVersions
+                ) { [weak self] (_: JotConflictResult) in
+                    Task { @MainActor in self?.coordinator?.goBack() }
+                }
+            } else {
+                self.coordinator?.goBack()
             }
-        } else {
-            coordinator?.goBack()
         }
     }
 
@@ -300,17 +309,49 @@ final class EditJotViewModel {
     }
 
     func didDisappear() {
-        webDAVBackupService.backup(
-            jotFileInfo: jotFileInfo,
-            drawing: currentDrawing,
-            pdfData: currentPdfData,
-            extraPages: currentExtraPages,
-            pdfInsertedPageSlots: currentPdfInsertedPageSlots,
-            width: currentWidth
-        )
+        // A quick back/background event can arrive before an asynchronous read
+        // completes. Never replace an existing note with the VM's empty defaults.
+        guard isPersistenceReady else { return }
+        let snapshot = makePersistenceSnapshot()
+        let shouldFlush = isDirty
+        let writer = persistenceWriter
+        let backupService = webDAVBackupService
+        let jotFileInfo = jotFileInfo
+        let logger = logger
+
+        backupTask?.cancel()
+        backupTask = Task { [weak self] in
+            if shouldFlush {
+                do {
+                    try await writer.saveImmediately(snapshot)
+                    self?.markPersisted(revision: snapshot.revision)
+                } catch {
+                    logger.error("Failed to flush jot before backup: \(error)")
+                    return
+                }
+            }
+            guard !Task.isCancelled else { return }
+            await backupService.backup(jotFileInfo: jotFileInfo, content: snapshot.content)
+        }
     }
 
-    deinit { drawingUpdateTask?.cancel() }
+    /// Flushes local state while UIKit grants finite background execution time.
+    /// WebDAV remains best-effort and is launched only after the durable local
+    /// write has completed.
+    func didEnterBackground() async {
+        guard await flushPendingChanges(presentsError: false), !Task.isCancelled else { return }
+        didDisappear()
+    }
+
+    deinit {
+        loadingTask?.cancel()
+        isEditingContinuation.finish()
+        drawingContinuation.finish()
+        scribbleEraseContinuation.finish()
+        backgroundContinuation.finish()
+        showsBackButtonContinuation.finish()
+        loadingProgressContinuation.finish()
+    }
 }
 
 // MARK: - Page Management
@@ -318,95 +359,73 @@ final class EditJotViewModel {
 extension EditJotViewModel {
 
     func importPDF(data: Data) {
+        guard isPersistenceReady else { return }
         currentPdfData = data
-        currentPdfInsertedPageSlots = []
-        yieldBackground()
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                try await repository.writeContent(
-                    jotFileInfo: jotFileInfo,
-                    drawing: currentDrawing,
-                    pdfData: data,
-                    extraPages: currentExtraPages,
-                    pdfInsertedPageSlots: currentPdfInsertedPageSlots,
-                    strokePageIndices: currentStrokePageIndices
-                )
-            } catch {
-                logger.error("Failed to save PDF: \(error)")
-                coordinator?.showInfoAlert(
-                    title: L10n.EditJot.PDF.Error.importFailed,
-                    message: error.localizedDescription
-                )
-            }
+        cacheCurrentPDFMetadata()
+        guard cachedPDFPageCount != nil else {
+            currentPdfData = nil
+            cacheCurrentPDFMetadata()
+            coordinator?.showInfoAlert(
+                title: L10n.EditJot.PDF.Error.importFailed,
+                message: ""
+            )
+            return
         }
+
+        let basePages = basePageCount()
+        currentPdfInsertedPageSlots = currentExtraPages > 0
+            ? Array(basePages..<(basePages + currentExtraPages))
+            : []
+        yieldBackground()
+
+        persistCurrentContent()
     }
 
     func addPage() { addPage(afterPageIndex: nil) }
 
     func addPage(afterPageIndex: Int?) {
+        guard isPersistenceReady else { return }
         let pageHeight = normalizedPageHeight()
         let pageStride = pageHeight + JotBackgroundView.pageSpacing
-        let basePages: Int = currentPdfData.flatMap { PDFDocument(data: $0)?.pageCount } ?? 1
+        let basePages = basePageCount()
+        let totalPages = currentPdfData == nil
+            ? 1 + currentExtraPages
+            : basePages + currentPdfInsertedPageSlots.count
+        guard totalPages < Self.maximumPageCount else { return }
+
+        let insertIndex = insertionIndex(after: afterPageIndex, totalPages: totalPages)
+        let mutation = drawingByInsertingPage(at: insertIndex, pageStride: pageStride)
+        currentDrawing = mutation.drawing
+        previousDrawing = mutation.drawing
+        currentStrokePageIndices = mutation.indices
+
+        if mutation.didMoveStrokes {
+            drawingContinuation.yield(Drawing(
+                value: mutation.drawing,
+                width: currentWidth,
+                strokePageIndices: mutation.indices
+            ))
+        }
 
         if currentPdfData != nil {
-            if currentPdfInsertedPageSlots.isEmpty, currentExtraPages > 0 {
-                currentPdfInsertedPageSlots = Array(basePages..<(basePages + currentExtraPages))
+            for index in currentPdfInsertedPageSlots.indices
+                where currentPdfInsertedPageSlots[index] >= insertIndex {
+                currentPdfInsertedPageSlots[index] += 1
             }
-
-            let totalPages = basePages + currentPdfInsertedPageSlots.count
-            let insertIndex = afterPageIndex.map { min(max(0, $0 + 1), totalPages) } ?? totalPages
-            let insertionBoundaryY = CGFloat(insertIndex) * pageStride
-            let oldStrokes = currentDrawing.strokes
-            let oldIndices = currentStrokePageIndices
-            let shiftedDrawing = shiftDrawing(currentDrawing, by: pageStride, afterY: insertionBoundaryY)
-
-            currentDrawing = shiftedDrawing
-            previousDrawing = shiftedDrawing
-            drawingContinuation.yield(Drawing(value: shiftedDrawing, width: currentWidth))
-            drawingUpdateContinuation.yield(shiftedDrawing)
-
-            if !oldIndices.isEmpty {
-                var newIndices = oldIndices
-                for (idx, stroke) in oldStrokes.enumerated() where stroke.renderBounds.minY >= insertionBoundaryY {
-                    newIndices[idx] += 1
-                }
-                currentStrokePageIndices = newIndices
-            } else {
-                currentStrokePageIndices = currentDrawing.strokes.map { stroke in
-                    max(0, Int(floor(stroke.renderBounds.midY / pageStride)))
-                }
-            }
-
-            currentPdfInsertedPageSlots = currentPdfInsertedPageSlots
-                .map { $0 >= insertIndex ? $0 + 1 : $0 }
-            currentPdfInsertedPageSlots.append(insertIndex)
-            currentPdfInsertedPageSlots.sort()
+            let position = currentPdfInsertedPageSlots.firstIndex { $0 >= insertIndex }
+                ?? currentPdfInsertedPageSlots.endIndex
+            currentPdfInsertedPageSlots.insert(insertIndex, at: position)
             currentExtraPages = currentPdfInsertedPageSlots.count
-
-            yieldBackground()
-            persistCurrentDrawing()
-            return
+        } else {
+            currentExtraPages += 1
         }
 
-        let totalPages = basePages + currentExtraPages
-        let insertIndex = afterPageIndex.map { min(max(0, $0 + 1), totalPages) } ?? totalPages
-        let insertionBoundaryY = CGFloat(insertIndex) * pageStride
-        let shiftedDrawing = shiftDrawing(currentDrawing, by: pageStride, afterY: insertionBoundaryY)
-
-        if insertIndex < totalPages {
-            currentDrawing = shiftedDrawing
-            previousDrawing = shiftedDrawing
-            drawingContinuation.yield(Drawing(value: shiftedDrawing, width: currentWidth))
-            drawingUpdateContinuation.yield(shiftedDrawing)
-        }
-
-        currentExtraPages += 1
         yieldBackground()
-        persistCurrentDrawing(drawing: shiftedDrawing)
+        persistCurrentContent()
     }
 
     func promptDeletePage() {
+        guard isPersistenceReady else { return }
         guard currentExtraPages > 0 else {
             coordinator?.showInfoAlert(title: L10n.EditJot.PDF.DeletePage.nothingToDelete, message: "")
             return
@@ -434,25 +453,30 @@ extension EditJotViewModel {
     /// so it will remove exactly the ink objects that were created on that
     /// page regardless of their current render position.
     func deleteInkObjects(onPage page: Int) {
+        guard isPersistenceReady else { return }
         guard !currentDrawing.strokes.isEmpty else { return }
 
         var newStrokes: [PKStroke] = []
         var newIndices: [Int] = []
+        newStrokes.reserveCapacity(currentDrawing.strokes.count)
+        newIndices.reserveCapacity(currentDrawing.strokes.count)
         for (idx, stroke) in currentDrawing.strokes.enumerated() {
-            let pageIdx = (idx < currentStrokePageIndices.count) ? currentStrokePageIndices[idx] : -1
-            if pageIdx == page {
-                // drop
-            } else {
-                newStrokes.append(stroke)
-                if pageIdx >= 0 { newIndices.append(pageIdx) }
-            }
+            let pageIndex = resolvedPageIndex(for: stroke, at: idx)
+            guard pageIndex != page else { continue }
+            newStrokes.append(stroke)
+            newIndices.append(pageIndex)
         }
 
         let newDrawing = PKDrawing(strokes: newStrokes)
         currentDrawing = newDrawing
+        previousDrawing = newDrawing
         currentStrokePageIndices = newIndices
-        drawingContinuation.yield(Drawing(value: newDrawing, width: currentWidth))
-        persistCurrentDrawing(drawing: newDrawing)
+        drawingContinuation.yield(Drawing(
+            value: newDrawing,
+            width: currentWidth,
+            strokePageIndices: newIndices
+        ))
+        persistCurrentContent()
     }
 
     func deleteInkObjectsForVisiblePage() {
@@ -461,11 +485,12 @@ extension EditJotViewModel {
     }
 
     func deleteExtraPage(at index: Int?) {
+        guard isPersistenceReady else { return }
         guard currentExtraPages > 0 else { return }
 
         let pageHeight = normalizedPageHeight()
         let pageStride = pageHeight + JotBackgroundView.pageSpacing
-        let basePages: Int = currentPdfData.flatMap { PDFDocument(data: $0)?.pageCount } ?? 1
+        let basePages = basePageCount()
 
         let deleteIndex: Int
         if currentPdfData != nil {
@@ -483,6 +508,9 @@ extension EditJotViewModel {
             } else {
                 _ = currentPdfInsertedPageSlots.popLast()
             }
+            currentPdfInsertedPageSlots = currentPdfInsertedPageSlots.map {
+                $0 > deleteIndex ? $0 - 1 : $0
+            }
             currentExtraPages = currentPdfInsertedPageSlots.count
         } else {
             let totalPages = max(1, basePages + currentExtraPages)
@@ -490,14 +518,22 @@ extension EditJotViewModel {
             currentExtraPages = max(0, currentExtraPages - 1)
         }
 
-        schedulePageTrashSave(deleteIndex: deleteIndex, pageStride: pageStride)
-
-        let (newDrawing, newIndices) = shiftedDrawingAfterPageDeletion(deleteIndex: deleteIndex, pageStride: pageStride)
-        currentDrawing = newDrawing
-        currentStrokePageIndices = newIndices
-        drawingContinuation.yield(Drawing(value: newDrawing, width: currentWidth))
+        let mutation = drawingByDeletingPage(at: deleteIndex, pageStride: pageStride)
+        currentDrawing = mutation.drawing
+        previousDrawing = mutation.drawing
+        currentStrokePageIndices = mutation.indices
+        drawingContinuation.yield(Drawing(
+            value: mutation.drawing,
+            width: currentWidth,
+            strokePageIndices: mutation.indices
+        ))
         yieldBackground()
-        persistCurrentDrawing(drawing: newDrawing)
+        persistCurrentContent()
+        schedulePageTrashSave(
+            strokes: mutation.removedStrokes,
+            deleteIndex: deleteIndex,
+            pageStride: pageStride
+        )
     }
 }
 
@@ -505,127 +541,364 @@ extension EditJotViewModel {
 
 private extension EditJotViewModel {
 
+    struct PageDeletionMutation {
+        let drawing: PKDrawing
+        let indices: [Int]
+        let removedStrokes: [PKStroke]
+    }
+
+    func applyLoadedContent(_ content: JotContent) {
+        currentWidth = content.width.isFinite && content.width > 0
+            ? content.width
+            : Jot.defaultWidth
+        currentPdfData = content.pdfData
+        cachedPDFPageAspectRatio = content.pdfMetadata?.pageAspectRatio
+        cachedPDFPageCount = content.pdfMetadata.map {
+            min($0.pageCount, Self.maximumPageCount)
+        }
+
+        if currentPdfData != nil {
+            let basePages = basePageCount()
+            if content.pdfInsertedPageSlots.isEmpty, content.extraPages > 0 {
+                let count = min(
+                    content.extraPages,
+                    max(0, Self.maximumPageCount - basePages)
+                )
+                currentPdfInsertedPageSlots = Array(basePages..<(basePages + count))
+            } else {
+                currentPdfInsertedPageSlots = normalizedPDFInsertedPageSlots(
+                    content.pdfInsertedPageSlots,
+                    basePageCount: basePages
+                )
+            }
+            currentExtraPages = currentPdfInsertedPageSlots.count
+        } else {
+            currentPdfInsertedPageSlots = []
+            currentExtraPages = min(content.extraPages, Self.maximumPageCount - 1)
+        }
+
+        let loadedIndices = normalizedStrokePageIndices(
+            content.strokePageIndices,
+            for: content.drawing
+        )
+        var highlighterStrokes: [PKStroke] = []
+        var foregroundStrokes: [PKStroke] = []
+        var highlighterIndices: [Int] = []
+        var foregroundIndices: [Int] = []
+        for (stroke, pageIndex) in zip(content.drawing.strokes, loadedIndices) {
+            if stroke.ink.inkType == .marker {
+                highlighterStrokes.append(stroke)
+                highlighterIndices.append(pageIndex)
+            } else {
+                foregroundStrokes.append(stroke)
+                foregroundIndices.append(pageIndex)
+            }
+        }
+        let layeredDrawing = PKDrawing(strokes: highlighterStrokes + foregroundStrokes)
+        currentDrawing = layeredDrawing
+        previousDrawing = layeredDrawing
+        currentStrokePageIndices = highlighterIndices + foregroundIndices
+        isDirty = false
+        isPersistenceReady = true
+        drawingContinuation.yield(Drawing(
+            value: layeredDrawing,
+            width: currentWidth,
+            strokePageIndices: currentStrokePageIndices
+        ))
+        yieldBackground()
+    }
+
     /// Returns the page height in the same rotation-aware coordinate system used
     /// by `PDFLoadService`, so page operations and the visible PDF stay aligned.
     /// The aspect ratio is cached when `currentPdfData` changes; this method is
     /// called after every newly committed ink stroke and must stay allocation-free.
     func normalizedPageHeight() -> CGFloat {
         let aspectRatio = cachedPDFPageAspectRatio ?? (4.0 / 3.0)
-        let height = currentWidth * aspectRatio
-        return height.isFinite && height > 0 ? height : currentWidth * (4.0 / 3.0)
+        let width = currentWidth.isFinite && currentWidth > 0 ? currentWidth : Jot.defaultWidth
+        let height = width * aspectRatio
+        return height.isFinite && height > 0 ? height : width * (4.0 / 3.0)
     }
 
     /// Page boxes do not depend on PDF painting or transparency masks. Read
     /// their geometry directly once instead of constructing the sanitized,
     /// render-ready document for every PencilKit stroke.
-    func cacheCurrentPDFPageAspectRatio() {
+    func cacheCurrentPDFMetadata() {
         guard let data = currentPdfData else {
             cachedPDFPageAspectRatio = nil
+            cachedPDFPageCount = nil
             return
         }
 
-        let fallback = CGFloat(4.0 / 3.0)
-        cachedPDFPageAspectRatio = fallback
-        guard
-            let provider = CGDataProvider(data: data as CFData),
-            let document = CGPDFDocument(provider),
-            document.isUnlocked,
-            let page = document.page(at: 1)
-        else { return }
-
-        let bounds = PDFPageRenderer.displayBounds(for: page)
-        guard bounds.width.isFinite,
-              bounds.height.isFinite,
-              bounds.width > 0,
-              bounds.height > 0 else {
+        guard let metadata = JotPDFMetadata(pdfData: data) else {
+            cachedPDFPageAspectRatio = 4.0 / 3.0
+            cachedPDFPageCount = nil
             return
         }
-        let aspectRatio = bounds.height / bounds.width
-        if aspectRatio.isFinite, aspectRatio > 0 {
-            cachedPDFPageAspectRatio = aspectRatio
+        cachedPDFPageAspectRatio = metadata.pageAspectRatio
+        cachedPDFPageCount = min(metadata.pageCount, Self.maximumPageCount)
+    }
+
+    func basePageCount() -> Int {
+        currentPdfData == nil ? 1 : max(1, cachedPDFPageCount ?? 1)
+    }
+
+    func normalizedPDFInsertedPageSlots(
+        _ slots: [Int],
+        basePageCount: Int
+    ) -> [Int] {
+        var result = Array(Set(slots.lazy.filter { $0 >= 0 })).sorted()
+        result = Array(result.prefix(max(0, Self.maximumPageCount - basePageCount)))
+
+        // A high invalid slot can make another high slot appear valid through
+        // the count it contributes. Re-filter until the logical page count is
+        // stable; malformed persisted arrays are expected to be very small.
+        while true {
+            let upperBound = basePageCount + result.count
+            let filtered = result.filter { $0 < upperBound }
+            guard filtered.count != result.count else { return result }
+            result = filtered
         }
     }
 
-    func schedulePageTrashSave(deleteIndex: Int, pageStride: CGFloat) {
-        let startY = CGFloat(deleteIndex) * pageStride
-        let endY = CGFloat(deleteIndex + 1) * pageStride
-        let strokes = currentDrawing.strokes.filter {
-            $0.renderBounds.minY < endY && $0.renderBounds.maxY > startY
+    func normalizedStrokePageIndices(
+        _ indices: [Int],
+        for drawing: PKDrawing
+    ) -> [Int] {
+        drawing.strokes.enumerated().map { index, stroke in
+            guard index < indices.count,
+                  indices[index] >= 0,
+                  indices[index] < Self.maximumPageCount else {
+                return pageIndex(for: stroke)
+            }
+            return indices[index]
         }
+    }
+
+    func strokePageIndices(
+        after result: ScribbleEraseProcessor.Result,
+        previousDrawing: PKDrawing
+    ) -> [Int] {
+        let previousIndices = normalizedStrokePageIndices(
+            currentStrokePageIndices,
+            for: previousDrawing
+        )
+        var resultIndices: [Int] = []
+        resultIndices.reserveCapacity(result.processedDrawing.strokes.count)
+        for index in result.retainedPreviousStrokeIndices where index < previousIndices.count {
+            resultIndices.append(previousIndices[index])
+        }
+        resultIndices.append(contentsOf: result.retainedAddedStrokes.map(pageIndex(for:)))
+        return resultIndices
+    }
+
+    func resolvedPageIndex(for stroke: PKStroke, at index: Int) -> Int {
+        guard index < currentStrokePageIndices.count,
+              currentStrokePageIndices[index] >= 0,
+              currentStrokePageIndices[index] < Self.maximumPageCount else {
+            return pageIndex(for: stroke)
+        }
+        return currentStrokePageIndices[index]
+    }
+
+    func pageIndex(for stroke: PKStroke) -> Int {
+        let stride = normalizedPageHeight() + JotBackgroundView.pageSpacing
+        guard stride.isFinite, stride > 0 else { return 0 }
+        let value = floor(stroke.renderBounds.midY / stride)
+        guard value.isFinite, value > 0 else { return 0 }
+        return min(Int(min(value, CGFloat(Self.maximumPageCount - 1))), Self.maximumPageCount - 1)
+    }
+
+    func insertionIndex(after index: Int?, totalPages: Int) -> Int {
+        guard let index else { return totalPages }
+        guard index < Int.max else { return totalPages }
+        return min(max(0, index + 1), totalPages)
+    }
+
+    func drawingByInsertingPage(
+        at insertionIndex: Int,
+        pageStride: CGFloat
+    ) -> (drawing: PKDrawing, indices: [Int], didMoveStrokes: Bool) {
+        let strokes = currentDrawing.strokes
+        let indices = normalizedStrokePageIndices(currentStrokePageIndices, for: currentDrawing)
+        guard !strokes.isEmpty else { return (currentDrawing, [], false) }
+
+        var transformedStrokes: [PKStroke] = []
+        var transformedIndices: [Int] = []
+        transformedStrokes.reserveCapacity(strokes.count)
+        transformedIndices.reserveCapacity(strokes.count)
+        var didMoveStrokes = false
+
+        for (stroke, pageIndex) in zip(strokes, indices) {
+            guard pageIndex >= insertionIndex else {
+                transformedStrokes.append(stroke)
+                transformedIndices.append(pageIndex)
+                continue
+            }
+
+            didMoveStrokes = true
+            let transform = stroke.transform.translatedBy(x: 0, y: pageStride)
+            transformedStrokes.append(
+                PKStroke(ink: stroke.ink, path: stroke.path, transform: transform, mask: stroke.mask)
+            )
+            transformedIndices.append(min(pageIndex + 1, Self.maximumPageCount - 1))
+        }
+
+        return (
+            didMoveStrokes ? PKDrawing(strokes: transformedStrokes) : currentDrawing,
+            transformedIndices,
+            didMoveStrokes
+        )
+    }
+
+    func drawingByDeletingPage(
+        at deletionIndex: Int,
+        pageStride: CGFloat
+    ) -> PageDeletionMutation {
+        let strokes = currentDrawing.strokes
+        let indices = normalizedStrokePageIndices(currentStrokePageIndices, for: currentDrawing)
+        var transformedStrokes: [PKStroke] = []
+        var transformedIndices: [Int] = []
+        var removedStrokes: [PKStroke] = []
+        transformedStrokes.reserveCapacity(strokes.count)
+        transformedIndices.reserveCapacity(strokes.count)
+
+        for (stroke, pageIndex) in zip(strokes, indices) {
+            if pageIndex == deletionIndex {
+                removedStrokes.append(stroke)
+            } else if pageIndex > deletionIndex {
+                let transform = stroke.transform.translatedBy(x: 0, y: -pageStride)
+                transformedStrokes.append(
+                    PKStroke(ink: stroke.ink, path: stroke.path, transform: transform, mask: stroke.mask)
+                )
+                transformedIndices.append(pageIndex - 1)
+            } else {
+                transformedStrokes.append(stroke)
+                transformedIndices.append(pageIndex)
+            }
+        }
+
+        return PageDeletionMutation(
+            drawing: PKDrawing(strokes: transformedStrokes),
+            indices: transformedIndices,
+            removedStrokes: removedStrokes
+        )
+    }
+
+    func schedulePageTrashSave(
+        strokes: [PKStroke],
+        deleteIndex: Int,
+        pageStride: CGFloat
+    ) {
+        let startY = CGFloat(deleteIndex) * pageStride
         let pageName = "Page \(deleteIndex + 1) from \(jotFileInfo.name)"
         let width = currentWidth
+        let repository = repository
+        let logger = logger
         let pageDeletion = TrashService.PageDeletionInfo(
             sourceJotPath: jotFileInfo.url.path,
             deletedPageIndex: deleteIndex,
             pageStride: pageStride
         )
-        Task { [weak self] in
-            guard let self else { return }
-            try? await repository.saveDeletedPageToTrash(
-                strokes: strokes,
-                pageStartY: startY,
-                width: width,
-                pageName: pageName,
-                pageDeletion: pageDeletion
-            )
-        }
-    }
-
-    func shiftedDrawingAfterPageDeletion(
-        deleteIndex: Int,
-        pageStride: CGFloat
-    ) -> (drawing: PKDrawing, indices: [Int]) {
-        let deletedPageStartY = CGFloat(deleteIndex) * pageStride
-        let shiftThreshold = CGFloat(deleteIndex + 1) * pageStride
-
-        var newIndices: [Int] = []
-        var transformedStrokes: [PKStroke] = []
-        for (idx, stroke) in currentDrawing.strokes.enumerated() {
-            let pageIdx = (idx < currentStrokePageIndices.count)
-                ? currentStrokePageIndices[idx]
-                : Int(floor(stroke.renderBounds.midY / pageStride))
-            if stroke.renderBounds.minY >= shiftThreshold {
-                let transform = stroke.transform.translatedBy(x: 0, y: -pageStride)
-                let shifted = PKStroke(ink: stroke.ink, path: stroke.path, transform: transform, mask: stroke.mask)
-                transformedStrokes.append(shifted)
-                newIndices.append(max(0, pageIdx - 1))
-            } else if stroke.renderBounds.maxY <= deletedPageStartY {
-                transformedStrokes.append(stroke)
-                newIndices.append(pageIdx)
-            }
-        }
-        return (PKDrawing(strokes: transformedStrokes), newIndices)
-    }
-
-    func shiftDrawing(_ drawing: PKDrawing, by offsetY: CGFloat, afterY thresholdY: CGFloat) -> PKDrawing {
-        guard !drawing.strokes.isEmpty, offsetY != 0 else { return drawing }
-
-        let translatedStrokes = drawing.strokes.map { stroke in
-            guard stroke.renderBounds.minY >= thresholdY else { return stroke }
-            let translatedTransform = stroke.transform.translatedBy(x: 0, y: offsetY)
-            return PKStroke(ink: stroke.ink, path: stroke.path, transform: translatedTransform, mask: stroke.mask)
-        }
-
-        return PKDrawing(strokes: translatedStrokes)
-    }
-
-    func persistCurrentDrawing(drawing: PKDrawing? = nil) {
-        let drawingToPersist = drawing ?? currentDrawing
-        Task { [weak self] in
-            guard let self else { return }
+        Task {
             do {
-                try await repository.writeContent(
-                    jotFileInfo: jotFileInfo,
-                    drawing: drawingToPersist,
-                    pdfData: currentPdfData,
-                    extraPages: currentExtraPages,
-                    pdfInsertedPageSlots: currentPdfInsertedPageSlots,
-                    strokePageIndices: currentStrokePageIndices
+                try await repository.saveDeletedPageToTrash(
+                    strokes: strokes,
+                    pageStartY: startY,
+                    width: width,
+                    pageName: pageName,
+                    pageDeletion: pageDeletion
                 )
             } catch {
-                logger.error("Failed to save extra page: \(error)")
+                logger.error("Failed to save deleted page to trash: \(error)")
             }
         }
+    }
+
+    func schedulePersistence() {
+        guard isPersistenceReady else { return }
+        isDirty = true
+        let snapshot = makePersistenceSnapshot()
+        let writer = persistenceWriter
+        Task {
+            await writer.schedule(snapshot)
+        }
+    }
+
+    func persistCurrentContent() {
+        guard isPersistenceReady else { return }
+        isDirty = true
+        let snapshot = makePersistenceSnapshot()
+        let writer = persistenceWriter
+        let logger = logger
+        Task { [weak self] in
+            do {
+                try await writer.saveImmediately(snapshot)
+                self?.markPersisted(revision: snapshot.revision)
+            } catch {
+                logger.error("Failed to persist jot: \(error)")
+            }
+        }
+    }
+
+    func markPersisted(revision: UInt64) {
+        guard persistenceRevision == revision else { return }
+        isDirty = false
+    }
+
+    func flushPendingChanges(presentsError: Bool = true) async -> Bool {
+        // Before loading completes there is no editor-owned state to flush.
+        // Navigation/file actions may safely operate on the untouched file.
+        guard isPersistenceReady else { return !isDirty }
+
+        while isDirty {
+            let snapshot = makePersistenceSnapshot()
+            do {
+                try await persistenceWriter.saveImmediately(snapshot)
+                markPersisted(revision: snapshot.revision)
+            } catch {
+                logger.error("Failed to flush jot: \(error)")
+                if presentsError {
+                    coordinator?.showInfoAlert(
+                        title: String(localized: "editJot.save.error", defaultValue: "Unable to Save"),
+                        message: error.localizedDescription
+                    )
+                }
+                return false
+            }
+        }
+        return true
+    }
+
+    func prepareForFileMutation() async -> Bool {
+        if let backupTask {
+            backupTask.cancel()
+            await backupTask.value
+            self.backupTask = nil
+        }
+        return await flushPendingChanges()
+    }
+
+    func makePersistenceSnapshot() -> EditJotPersistenceSnapshot {
+        persistenceRevision += 1
+        let content = JotContent(
+            drawing: currentDrawing,
+            width: currentWidth,
+            pdfData: currentPdfData,
+            extraPages: currentExtraPages,
+            pdfInsertedPageSlots: currentPdfInsertedPageSlots,
+            strokePageIndices: normalizedStrokePageIndices(
+                currentStrokePageIndices,
+                for: currentDrawing
+            ),
+            pdfMetadata: cachedPDFPageCount.map {
+                JotPDFMetadata(
+                    pageCount: $0,
+                    pageAspectRatio: cachedPDFPageAspectRatio ?? (4.0 / 3.0)
+                )
+            }
+        )
+        currentStrokePageIndices = content.strokePageIndices
+        return EditJotPersistenceSnapshot(revision: persistenceRevision, content: content)
     }
 
     func yieldBackground() {

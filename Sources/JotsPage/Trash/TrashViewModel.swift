@@ -88,11 +88,12 @@ final class TrashViewModel: PageViewModel, PageSelectableViewModel {
             of: [PageNavigationItem].self, bufferingPolicy: .bufferingNewest(1)
         )
 
+        let updates = repository.observeTrashedJots()
         observeTask = Task { [weak self] in
-            guard let self else { return }
             do {
-                for try await trashItems in repository.observeTrashedJots() {
-                    handleItems(trashItems)
+                for try await trashItems in updates {
+                    guard let self else { return }
+                    self.handleItems(trashItems)
                 }
             } catch {
                 // Silently stop on error; the user can navigate back
@@ -350,6 +351,11 @@ final class TrashViewModel: PageViewModel, PageSelectableViewModel {
 
     deinit {
         observeTask?.cancel()
+        titleUpdatesContinuation.finish()
+        itemsContinuation.finish()
+        selectionStateContinuation.finish()
+        leftNavigationItemsContinuation.finish()
+        rightNavigationItemsContinuation.finish()
     }
 }
 

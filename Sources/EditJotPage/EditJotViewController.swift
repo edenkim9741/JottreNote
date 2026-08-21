@@ -30,6 +30,8 @@ final class EditJotViewController: UIViewController {
             /// Viewport-only breathing room above the first page. This is a
             /// scroll inset, so it never changes document or export coordinates.
             static let topWritingFreespace = CGFloat(64)
+            static let shapeHoldDuration = Duration.milliseconds(500)
+            static let shapeHoldMovementTolerance = CGFloat(5)
         }
 
         enum Page {
@@ -38,11 +40,41 @@ final class EditJotViewController: UIViewController {
         }
     }
 
+    private enum DrawingLayer {
+        case highlighter
+        case foreground
+    }
+
+    private struct ShapeHoldState {
+        let canvasView: PKCanvasView
+        let initialStrokeCount: Int
+        var lastLocation: CGPoint
+        var generation = UUID()
+        var didHold = false
+    }
+
     #if !targetEnvironment(macCatalyst)
     private lazy var toolPicker = PKToolPicker()
     #endif
 
     private lazy var canvasView: PKCanvasView = {
+        let canvasView = JotCanvasView()
+        canvasView.delegate = self
+        canvasView.isScrollEnabled = false
+        canvasView.drawingPolicy = .default
+        canvasView.minimumZoomScale = 1
+        canvasView.maximumZoomScale = 1
+        canvasView.bounces = false
+        canvasView.contentInsetAdjustmentBehavior = .never
+        canvasView.backgroundColor = .clear
+        canvasView.isOpaque = false
+        canvasView.layer.shouldRasterize = false
+        canvasView.layer.anchorPoint = .zero
+        canvasView.layer.position = .zero
+        return canvasView
+    }()
+
+    private lazy var highlighterCanvasView: PKCanvasView = {
         let canvasView = JotCanvasView()
         canvasView.delegate = self
         canvasView.isScrollEnabled = false
@@ -96,11 +128,30 @@ final class EditJotViewController: UIViewController {
         return view
     }()
 
+    /// Renders only the PDF's authored content, without the app-provided white
+    /// paper fill. It sits above marker ink so PDF text remains crisp and above
+    /// highlighting, while normal ink remains the topmost document layer.
+    private let pdfContentView: JotBackgroundView = {
+        let view = JotBackgroundView(layerRole: .pdfContent)
+        view.translatesAutoresizingMaskIntoConstraints = false
+        view.backgroundColor = .clear
+        view.isUserInteractionEnabled = false
+        return view
+    }()
+
     /// Carries the inverse of PencilKit's native zoom. Keeping that transform
     /// off `PKCanvasView` itself is important: PencilKit swaps from its static
     /// tiled renderer to a live renderer on pen-down, and the live renderer can
     /// compute an empty visible region when the canvas itself is transformed.
     private let inkContainerView: UIView = {
+        let view = UIView(frame: .zero)
+        view.backgroundColor = .clear
+        view.layer.anchorPoint = .zero
+        view.layer.position = .zero
+        return view
+    }()
+
+    private let highlighterInkContainerView: UIView = {
         let view = UIView(frame: .zero)
         view.backgroundColor = .clear
         view.layer.anchorPoint = .zero
@@ -120,8 +171,21 @@ final class EditJotViewController: UIViewController {
     private var documentContentSize = CGSize.zero
     private var nativeInkZoomScale = CGFloat(1)
     private var nativeInkZoomTask: Task<Void, Never>?
+    private var applicationBackgroundFlushTask: Task<Void, Never>?
+    private var applicationBackgroundTaskIdentifier = UIBackgroundTaskIdentifier.invalid
+    private var applicationBackgroundTaskGeneration: UUID?
+    private var isApplyingViewModelDrawing = false
+    private var isEditingEnabled = false
+    private var activeDrawingLayer = DrawingLayer.foreground
+    private var highlighterStrokePageIndices: [Int] = []
+    private var foregroundStrokePageIndices: [Int] = []
+    private var shapeHoldState: ShapeHoldState?
+    private var shapeHoldTask: Task<Void, Never>?
+    private var shapeHoldCleanupTask: Task<Void, Never>?
 
     private let pdfLoadService = PDFLoadService()
+    private var cachedPDFData: Data?
+    private var cachedPDFLoadResult: PDFLoadService.Result?
 
     #if !targetEnvironment(macCatalyst)
     private var didSelectInitialPenTool = false
@@ -175,7 +239,7 @@ final class EditJotViewController: UIViewController {
             for await drawing in viewModel.drawing {
                 guard let self else { return }
                 drawingWidth = drawing.width
-                canvasView.drawing = drawing.value
+                applyViewModelDrawing(drawing)
                 if canvasView.superview == nil {
                     setUpCanvasView()
                     pendingScrollPage = defaultsService.getValue(lastPageKey)
@@ -189,15 +253,8 @@ final class EditJotViewController: UIViewController {
                 let afterDrawing = event.result.value
                 drawingWidth = event.result.width
                 if canvasView.superview == nil { setUpCanvasView() }
-                canvasView.undoManager?.registerUndo(withTarget: canvasView) { [afterDrawing, weak viewModel] canvas in
-                    // Sync ViewModel's previousDrawing so it doesn't re-trigger scribble detection
-                    viewModel?.prepareForUndoRedo(expectedDrawing: beforeDrawing)
-                    canvas.drawing = beforeDrawing
-                    canvas.undoManager?.registerUndo(withTarget: canvas) { canvas in
-                        canvas.drawing = afterDrawing
-                    }
-                }
-                canvasView.drawing = afterDrawing
+                registerDrawingUndo(before: beforeDrawing, after: afterDrawing)
+                applyViewModelDrawing(event.result)
             }
         }
         backButtonTask = Task { @MainActor [weak self] in
@@ -207,7 +264,7 @@ final class EditJotViewController: UIViewController {
         }
         backgroundTask = Task { @MainActor [weak self] in
             for await background in viewModel.background {
-                self?.applyBackground(background)
+                await self?.applyBackground(background)
             }
         }
         loadingProgressTask = Task { @MainActor [weak self] in
@@ -224,20 +281,45 @@ final class EditJotViewController: UIViewController {
     }
 
     deinit {
+        applicationBackgroundFlushTask?.cancel()
+        if applicationBackgroundTaskIdentifier != .invalid {
+            let identifier = applicationBackgroundTaskIdentifier
+            Task { @MainActor in
+                UIApplication.shared.endBackgroundTask(identifier)
+            }
+        }
         nativeInkZoomTask?.cancel()
+        shapeHoldTask?.cancel()
+        shapeHoldCleanupTask?.cancel()
         isEditingTask?.cancel()
         drawingTask?.cancel()
         scribbleEraseTask?.cancel()
         backButtonTask?.cancel()
         backgroundTask?.cancel()
         loadingProgressTask?.cancel()
+        #if !targetEnvironment(macCatalyst)
+        MainActor.assumeIsolated {
+            if isViewLoaded {
+                toolPicker.removeObserver(canvasView)
+                toolPicker.removeObserver(highlighterCanvasView)
+                toolPicker.removeObserver(self)
+            }
+        }
+        #endif
+        NotificationCenter.default.removeObserver(self)
     }
 
     override func viewDidLoad() {
+        super.viewDidLoad()
         setUpNavigationBar()
         setUpViews()
-        super.viewDidLoad()
         restorePenTool()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationDidEnterBackground),
+            name: UIApplication.didEnterBackgroundNotification,
+            object: nil
+        )
         viewModel.didLoad()
     }
 
@@ -339,6 +421,44 @@ final class EditJotViewController: UIViewController {
     private func handleSwipeBack(_ gesture: UIScreenEdgePanGestureRecognizer) {
         guard gesture.state == .ended else { return }
         viewModel.didTapBackButton()
+    }
+
+    @objc
+    private func applicationDidEnterBackground() {
+        guard viewIfLoaded?.window != nil else { return }
+        flushPendingDrawingChange()
+        saveScrollPosition()
+
+        applicationBackgroundFlushTask?.cancel()
+        finishApplicationBackgroundTask()
+        let generation = UUID()
+        applicationBackgroundTaskGeneration = generation
+        applicationBackgroundTaskIdentifier = UIApplication.shared.beginBackgroundTask(
+            withName: "Persist open jot"
+        ) { [weak self, generation] in
+            Task { @MainActor [weak self] in
+                guard self?.applicationBackgroundTaskGeneration == generation else { return }
+                self?.applicationBackgroundFlushTask?.cancel()
+                _ = self?.finishApplicationBackgroundTask(generation: generation)
+            }
+        }
+        applicationBackgroundFlushTask = Task { @MainActor [weak self, generation] in
+            guard let self else { return }
+            await viewModel.didEnterBackground()
+            if finishApplicationBackgroundTask(generation: generation) {
+                applicationBackgroundFlushTask = nil
+            }
+        }
+    }
+
+    @discardableResult
+    private func finishApplicationBackgroundTask(generation: UUID? = nil) -> Bool {
+        if let generation, generation != applicationBackgroundTaskGeneration { return false }
+        guard applicationBackgroundTaskIdentifier != .invalid else { return false }
+        UIApplication.shared.endBackgroundTask(applicationBackgroundTaskIdentifier)
+        applicationBackgroundTaskIdentifier = .invalid
+        applicationBackgroundTaskGeneration = nil
+        return true
     }
 
     private func layoutCanvasContent() {
@@ -479,6 +599,12 @@ final class EditJotViewController: UIViewController {
         doubleTap.numberOfTapsRequired = 2
         canvasView.addGestureRecognizer(doubleTap)
         view.bringSubviewToFront(loadingProgressView)
+    }
+
+    private func applyViewModelDrawing(_ drawing: PKDrawing) {
+        isApplyingViewModelDrawing = true
+        canvasView.drawing = drawing
+        isApplyingViewModelDrawing = false
     }
 
     @objc
@@ -814,13 +940,15 @@ private extension EditJotViewController {
 
 private extension EditJotViewController {
 
-    func applyBackground(_ background: EditJotViewModel.Background) {
+    func applyBackground(_ background: EditJotViewModel.Background) async {
         let pageSize = CGSize(width: Constants.Page.width, height: Constants.Page.height)
         currentPageSize = pageSize
         let spacing = JotBackgroundView.pageSpacing
 
         switch background {
         case let .ruled(extraPages):
+            cachedPDFData = nil
+            cachedPDFLoadResult = nil
             applyDocumentAppearance(isPDFBacked: false)
             let totalPageCount = 1 + extraPages
             backgroundContentHeight = CGFloat(totalPageCount) * pageSize.height
@@ -835,7 +963,18 @@ private extension EditJotViewController {
         case let .pdf(data, _, insertedPageSlots):
             applyDocumentAppearance(isPDFBacked: true)
             do {
-                let result = try pdfLoadService.load(data: data, normalizedPageSize: pageSize)
+                let result: PDFLoadService.Result
+                if cachedPDFData == data, let cachedPDFLoadResult {
+                    result = cachedPDFLoadResult
+                } else {
+                    let loadService = pdfLoadService
+                    result = try await Task.detached(priority: .userInitiated) {
+                        try loadService.load(data: data, normalizedPageSize: pageSize)
+                    }.value
+                    guard !Task.isCancelled else { return }
+                    cachedPDFData = data
+                    cachedPDFLoadResult = result
+                }
                 let pdfPageSize = result.pageSize
                 currentPageSize = pdfPageSize
                 let totalPages = CGFloat(result.pageCount + insertedPageSlots.count)
@@ -849,6 +988,8 @@ private extension EditJotViewController {
                     zoomScale: documentScrollView.zoomScale
                 )
             } catch {
+                cachedPDFData = nil
+                cachedPDFLoadResult = nil
                 // A malformed/empty PDF must not take down the editor. Keep the
                 // handwriting available over a plain page so it can still be saved.
                 backgroundContentHeight = pageSize.height
@@ -924,6 +1065,7 @@ private extension UIColor {
 extension EditJotViewController: PKCanvasViewDelegate {
 
     func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
+        guard !isApplyingViewModelDrawing else { return }
         guard !isUsingDrawingTool else {
             hasPendingDrawingChange = true
             return
