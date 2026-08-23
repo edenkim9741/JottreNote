@@ -16,9 +16,14 @@
  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
-@preconcurrency import PencilKit
 import PDFKit
+@preconcurrency import PencilKit
 import UIKit
+
+extension DefaultsKey where T == Bool {
+    fileprivate static let drawAndHoldShapeConversionEnabled: DefaultsKey =
+        "editor.drawAndHoldShapeConversionEnabled"
+}
 
 final class EditJotViewController: UIViewController {
 
@@ -30,7 +35,7 @@ final class EditJotViewController: UIViewController {
             /// Viewport-only breathing room above the first page. This is a
             /// scroll inset, so it never changes document or export coordinates.
             static let topWritingFreespace = CGFloat(64)
-            static let shapeHoldDuration = Duration.milliseconds(500)
+            static let shapeHoldDuration = TimeInterval(0.42)
             static let shapeHoldMovementTolerance = CGFloat(5)
         }
 
@@ -40,24 +45,18 @@ final class EditJotViewController: UIViewController {
         }
     }
 
-    private enum DrawingLayer {
-        case highlighter
-        case foreground
-    }
-
     private struct ShapeHoldState {
-        let canvasView: PKCanvasView
         let initialStrokeCount: Int
-        var lastLocation: CGPoint
-        var generation = UUID()
-        var didHold = false
+        let beforeDrawing: EditJotViewModel.Drawing
+        var detector: EndpointHoldDetector
+        var didProvideHoldFeedback = false
     }
 
     #if !targetEnvironment(macCatalyst)
     private lazy var toolPicker = PKToolPicker()
     #endif
 
-    private lazy var canvasView: PKCanvasView = {
+    private lazy var canvasView: JotCanvasView = {
         let canvasView = JotCanvasView()
         canvasView.delegate = self
         canvasView.isScrollEnabled = false
@@ -74,9 +73,10 @@ final class EditJotViewController: UIViewController {
         return canvasView
     }()
 
-    private lazy var highlighterCanvasView: PKCanvasView = {
+    private lazy var highlighterCanvasView: JotCanvasView = {
         let canvasView = JotCanvasView()
         canvasView.delegate = self
+        canvasView.isUserInteractionEnabled = false
         canvasView.isScrollEnabled = false
         canvasView.drawingPolicy = .default
         canvasView.minimumZoomScale = 1
@@ -91,9 +91,17 @@ final class EditJotViewController: UIViewController {
         return canvasView
     }()
 
-    private lazy var documentScrollView: UIScrollView = {
-        let scrollView = UIScrollView()
+    private lazy var inkCanvasCoordinator = JotInkCanvasCoordinator(
+        highlighterCanvas: highlighterCanvasView,
+        foregroundCanvas: canvasView
+    )
+
+    private lazy var documentScrollView: JotDocumentScrollView = {
+        let scrollView = JotDocumentScrollView()
         scrollView.delegate = documentScrollDelegate
+        scrollView.shouldRouteDirectTouch = { [weak self] in
+            self?.updateCanvasTouchRouting() ?? false
+        }
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.minimumZoomScale = 1
         scrollView.maximumZoomScale = Constants.CanvasView.maximumZoomScale
@@ -129,8 +137,8 @@ final class EditJotViewController: UIViewController {
     }()
 
     /// Renders only the PDF's authored content, without the app-provided white
-    /// paper fill. It sits above marker ink so PDF text remains crisp and above
-    /// highlighting, while normal ink remains the topmost document layer.
+    /// paper fill. Some PDFs paint their own opaque, page-sized background, so
+    /// this view must stay below marker ink or those documents hide highlights.
     private let pdfContentView: JotBackgroundView = {
         let view = JotBackgroundView(layerRole: .pdfContent)
         view.translatesAutoresizingMaskIntoConstraints = false
@@ -174,14 +182,14 @@ final class EditJotViewController: UIViewController {
     private var applicationBackgroundFlushTask: Task<Void, Never>?
     private var applicationBackgroundTaskIdentifier = UIBackgroundTaskIdentifier.invalid
     private var applicationBackgroundTaskGeneration: UUID?
-    private var isApplyingViewModelDrawing = false
     private var isEditingEnabled = false
-    private var activeDrawingLayer = DrawingLayer.foreground
-    private var highlighterStrokePageIndices: [Int] = []
-    private var foregroundStrokePageIndices: [Int] = []
+    private var drawingBeforeToolUse: EditJotViewModel.Drawing?
+    private var ownsToolUndoGrouping = false
+    private var toolUndoManager: UndoManager?
     private var shapeHoldState: ShapeHoldState?
     private var shapeHoldTask: Task<Void, Never>?
-    private var shapeHoldCleanupTask: Task<Void, Never>?
+    private var shapeCommitWatchdogTask: Task<Void, Never>?
+    private var toolUndoCleanupTask: Task<Void, Never>?
 
     private let pdfLoadService = PDFLoadService()
     private var cachedPDFData: Data?
@@ -189,6 +197,7 @@ final class EditJotViewController: UIViewController {
 
     #if !targetEnvironment(macCatalyst)
     private var didSelectInitialPenTool = false
+    private var selectedToolUpdateTask: Task<Void, Never>?
     #endif
 
     private lazy var swipeBackGesture: UIScreenEdgePanGestureRecognizer = {
@@ -290,7 +299,8 @@ final class EditJotViewController: UIViewController {
         }
         nativeInkZoomTask?.cancel()
         shapeHoldTask?.cancel()
-        shapeHoldCleanupTask?.cancel()
+        shapeCommitWatchdogTask?.cancel()
+        toolUndoCleanupTask?.cancel()
         isEditingTask?.cancel()
         drawingTask?.cancel()
         scribbleEraseTask?.cancel()
@@ -298,6 +308,7 @@ final class EditJotViewController: UIViewController {
         backgroundTask?.cancel()
         loadingProgressTask?.cancel()
         #if !targetEnvironment(macCatalyst)
+        selectedToolUpdateTask?.cancel()
         MainActor.assumeIsolated {
             if isViewLoaded {
                 toolPicker.removeObserver(canvasView)
@@ -320,6 +331,12 @@ final class EditJotViewController: UIViewController {
             name: UIApplication.didEnterBackgroundNotification,
             object: nil
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationDidBecomeActive),
+            name: UIApplication.didBecomeActiveNotification,
+            object: nil
+        )
         viewModel.didLoad()
     }
 
@@ -327,6 +344,7 @@ final class EditJotViewController: UIViewController {
         super.viewWillAppear(animated)
         (navigationController?.navigationBar as? JottreNavigationBar)?
             .passesThroughBackgroundTouches = true
+        updateCanvasTouchRouting()
     }
 
     override func viewWillDisappear(_ animated: Bool) {
@@ -348,6 +366,11 @@ final class EditJotViewController: UIViewController {
         super.traitCollectionDidChange(previousTraitCollection)
         guard traitCollection.hasDifferentColorAppearance(comparedTo: previousTraitCollection) else { return }
         backgroundView.sync(
+            scrollOffset: documentScrollView.contentOffset,
+            zoomScale: documentScrollView.zoomScale,
+            viewportSize: documentScrollView.bounds.size
+        )
+        pdfContentView.sync(
             scrollOffset: documentScrollView.contentOffset,
             zoomScale: documentScrollView.zoomScale,
             viewportSize: documentScrollView.bounds.size
@@ -393,13 +416,16 @@ final class EditJotViewController: UIViewController {
         view.addGestureRecognizer(swipeBackGesture)
         #if !targetEnvironment(macCatalyst)
         toolPicker.addObserver(canvasView)
+        toolPicker.addObserver(highlighterCanvasView)
+        toolPicker.addObserver(self)
         toolPicker.setVisible(true, forFirstResponder: canvasView)
+        toolPicker.setVisible(true, forFirstResponder: highlighterCanvasView)
         #endif
         view.addSubview(loadingProgressView)
         NSLayoutConstraint.activate([
             loadingProgressView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
             loadingProgressView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            loadingProgressView.trailingAnchor.constraint(equalTo: view.trailingAnchor)
+            loadingProgressView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
         ])
     }
 
@@ -411,9 +437,34 @@ final class EditJotViewController: UIViewController {
             let color = defaultsService.getValue(colorKey).flatMap { UIColor(hex: $0) } ?? .label
             let pen = PKInkingTool(.pen, color: color, width: CGFloat(width))
             canvasView.tool = pen
+            highlighterCanvasView.tool = pen
             toolPicker.selectedTool = pen
             didSelectInitialPenTool = true
         }
+        #endif
+    }
+
+    @discardableResult
+    private func updateCanvasTouchRouting() -> Bool {
+        #if !targetEnvironment(macCatalyst)
+        let configuration = CanvasTouchRouting.configuration(
+            isEditingEnabled: isEditingEnabled,
+            drawingPolicy: inkCanvasCoordinator.activeCanvas.drawingPolicy,
+            isToolPickerVisible: toolPicker.isVisible,
+            prefersPencilOnlyDrawing: UIPencilInteraction.prefersPencilOnlyDrawing
+        )
+        // PencilKit rebuilds parts of its scroll and selection interaction
+        // state while lasso content is moved. Reapply these idempotent
+        // invariants for every new direct-touch sequence, even when the policy
+        // itself did not change.
+        CanvasTouchRouting.apply(
+            configuration,
+            to: [canvasView, highlighterCanvasView],
+            documentScrollView: documentScrollView
+        )
+        return configuration.routesDirectTouchesToDocumentScroll
+        #else
+        return false
         #endif
     }
 
@@ -449,6 +500,13 @@ final class EditJotViewController: UIViewController {
                 applicationBackgroundFlushTask = nil
             }
         }
+    }
+
+    @objc
+    private func applicationDidBecomeActive() {
+        // The system Pencil-only preference can change while Jottre is
+        // suspended. Refresh document navigation before the next gesture.
+        updateCanvasTouchRouting()
     }
 
     @discardableResult
@@ -504,10 +562,13 @@ final class EditJotViewController: UIViewController {
         defer { isUpdatingCanvasGeometry = false }
 
         let drawingMaxY: CGFloat
-        if canvasView.drawing.bounds.isNull {
+        if inkCanvasCoordinator.committedDrawing.bounds.isNull {
             drawingMaxY = backgroundContentHeight + Constants.CanvasView.bottomFreespace
         } else {
-            let contentMaxY = max(canvasView.drawing.bounds.maxY, backgroundContentHeight)
+            let contentMaxY = max(
+                inkCanvasCoordinator.committedDrawing.bounds.maxY,
+                backgroundContentHeight
+            )
             drawingMaxY = contentMaxY + Constants.CanvasView.bottomFreespace
         }
 
@@ -526,6 +587,9 @@ final class EditJotViewController: UIViewController {
         }
         if backgroundView.frame != documentBounds {
             backgroundView.frame = documentBounds
+        }
+        if pdfContentView.frame != documentBounds {
+            pdfContentView.frame = documentBounds
         }
         if documentGeometryChanged {
             updateNativeInkGeometry(scale: nativeInkZoomScale)
@@ -550,7 +614,8 @@ final class EditJotViewController: UIViewController {
         )
         let topInset = statusBarHeight + Constants.CanvasView.topWritingFreespace
         let previousInsets = documentScrollView.contentInset
-        let wasAtTop = documentScrollView.contentOffset.y
+        let wasAtTop =
+            documentScrollView.contentOffset.y
             <= -previousInsets.top + 0.5
         let insets = UIEdgeInsets(
             top: topInset,
@@ -575,6 +640,11 @@ final class EditJotViewController: UIViewController {
             zoomScale: scale,
             viewportSize: documentScrollView.bounds.size
         )
+        pdfContentView.sync(
+            scrollOffset: documentScrollView.contentOffset,
+            zoomScale: scale,
+            viewportSize: documentScrollView.bounds.size
+        )
     }
 
     private func setUpCanvasView() {
@@ -583,28 +653,328 @@ final class EditJotViewController: UIViewController {
             // underneath navigation controls. It obscures both the PDF and ink.
             documentScrollView.topEdgeEffect.isHidden = true
             canvasView.topEdgeEffect.isHidden = true
+            highlighterCanvasView.topEdgeEffect.isHidden = true
         }
         view.addSubview(documentScrollView)
         NSLayoutConstraint.activate([
             documentScrollView.topAnchor.constraint(equalTo: view.topAnchor),
             documentScrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             documentScrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            documentScrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+            documentScrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
         ])
         documentScrollView.addSubview(documentContainerView)
         documentContainerView.addSubview(backgroundView)
+        documentContainerView.addSubview(pdfContentView)
+        documentContainerView.addSubview(highlighterInkContainerView)
+        highlighterInkContainerView.addSubview(highlighterCanvasView)
         documentContainerView.addSubview(inkContainerView)
         inkContainerView.addSubview(canvasView)
+        canvasView.drawingGestureRecognizer.addTarget(
+            self,
+            action: #selector(handleDrawingGesture(_:))
+        )
         let doubleTap = UITapGestureRecognizer(target: self, action: #selector(handleDoubleTap(_:)))
         doubleTap.numberOfTapsRequired = 2
-        canvasView.addGestureRecognizer(doubleTap)
+        doubleTap.cancelsTouchesInView = false
+        #if !targetEnvironment(macCatalyst)
+        doubleTap.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+        #endif
+        documentScrollView.addGestureRecognizer(doubleTap)
+        updateCanvasInteraction()
         view.bringSubviewToFront(loadingProgressView)
     }
 
-    private func applyViewModelDrawing(_ drawing: PKDrawing) {
-        isApplyingViewModelDrawing = true
-        canvasView.drawing = drawing
-        isApplyingViewModelDrawing = false
+    private func applyViewModelDrawing(_ drawing: EditJotViewModel.Drawing) {
+        inkCanvasCoordinator.load(
+            drawing: drawing.value,
+            strokePageIndices: drawing.strokePageIndices
+        )
+    }
+
+    private func combinedCanvasDrawing() -> PKDrawing {
+        inkCanvasCoordinator.liveCombinedDrawing()
+    }
+
+    private func commitCanvasDrawing(detectsScribbleErase: Bool = true) {
+        hasPendingDrawingChange = false
+        let previousExtent = contentExtent(for: inkCanvasCoordinator.committedDrawing)
+        let liveDrawing = combinedCanvasDrawing()
+        let indices = reconciledPageIndices(for: liveDrawing)
+        let combined = inkCanvasCoordinator.commitLiveDrawing(
+            liveDrawing,
+            strokePageIndices: indices
+        )
+        viewModel.didChangeDrawing(
+            combined,
+            strokePageIndices: inkCanvasCoordinator.committedStrokePageIndices,
+            detectsScribbleErase: detectsScribbleErase
+                && inkCanvasCoordinator.mode != .highlighter
+        )
+        finishToolUndoGrouping()
+        if contentExtent(for: combined) != previousExtent {
+            updateCanvasGeometry()
+        }
+    }
+
+    private func reconciledPageIndices(for drawing: PKDrawing) -> [Int] {
+        var oldIndicesBySeed: [UInt32: [Int]] = [:]
+        for (index, stroke) in inkCanvasCoordinator.committedDrawing.strokes.enumerated() {
+            let pageIndex =
+                inkCanvasCoordinator.committedStrokePageIndices.indices.contains(index)
+                ? inkCanvasCoordinator.committedStrokePageIndices[index]
+                : pageIndex(for: stroke)
+            oldIndicesBySeed[stroke.randomSeed, default: []].append(pageIndex)
+        }
+
+        return drawing.strokes.map { stroke in
+            if var matching = oldIndicesBySeed[stroke.randomSeed], !matching.isEmpty {
+                let pageIndex = matching.removeFirst()
+                oldIndicesBySeed[stroke.randomSeed] = matching
+                return pageIndex
+            }
+            return pageIndex(for: stroke)
+        }
+    }
+
+    private func contentExtent(for drawing: PKDrawing) -> CGFloat {
+        guard !drawing.bounds.isNull else { return backgroundContentHeight }
+        return max(backgroundContentHeight, drawing.bounds.maxY)
+    }
+
+    private func pageIndex(for stroke: PKStroke) -> Int {
+        let stride = currentPageSize.height + JotBackgroundView.pageSpacing
+        guard stride.isFinite, stride > 0 else { return 0 }
+        return max(0, Int(floor(max(0, stroke.renderBounds.midY) / stride)))
+    }
+
+    @objc
+    private func handleDrawingGesture(_ gestureRecognizer: UIGestureRecognizer) {
+        let timestamp = ProcessInfo.processInfo.systemUptime
+        let location = gestureRecognizer.location(in: view)
+
+        switch gestureRecognizer.state {
+        case .began:
+            guard isDrawAndHoldShapeConversionEnabled,
+                isEditingEnabled,
+                inkCanvasCoordinator.mode == .foreground,
+                let inkingTool = canvasView.tool as? PKInkingTool,
+                inkingTool.inkType != .marker
+            else {
+                cancelShapeHold()
+                return
+            }
+            var detector = EndpointHoldDetector(
+                configuration: .init(
+                    holdDuration: Constants.CanvasView.shapeHoldDuration,
+                    movementTolerance: Constants.CanvasView.shapeHoldMovementTolerance
+                )
+            )
+            detector.begin(at: location, timestamp: timestamp)
+            let before =
+                drawingBeforeToolUse
+                ?? EditJotViewModel.Drawing(
+                    value: inkCanvasCoordinator.committedDrawing,
+                    width: drawingWidth,
+                    strokePageIndices: inkCanvasCoordinator.committedStrokePageIndices
+                )
+            shapeHoldState = ShapeHoldState(
+                initialStrokeCount: canvasView.drawing.strokes.count,
+                beforeDrawing: before,
+                detector: detector
+            )
+            scheduleShapeHoldDeadline()
+
+        case .changed:
+            guard var state = shapeHoldState else { return }
+            let resetDeadline = state.detector.move(to: location, timestamp: timestamp)
+            shapeHoldState = state
+            if resetDeadline {
+                scheduleShapeHoldDeadline()
+            }
+
+        case .ended:
+            shapeHoldTask?.cancel()
+            guard var state = shapeHoldState else { return }
+            let shouldSnap = state.detector.end(at: timestamp)
+            shapeHoldState = state
+            guard shouldSnap else {
+                cancelShapeHold()
+                if !isUsingDrawingTool { flushPendingDrawingChange() }
+                return
+            }
+            if !attemptShapeSnapIfReady() {
+                scheduleShapeCommitWatchdog()
+            }
+
+        case .cancelled, .failed:
+            cancelShapeHold()
+            if !isUsingDrawingTool { flushPendingDrawingChange() }
+
+        default:
+            break
+        }
+    }
+
+    private func scheduleShapeHoldDeadline() {
+        shapeHoldTask?.cancel()
+        guard let state = shapeHoldState,
+            let deadline = state.detector.deadline
+        else { return }
+        let generation = state.detector.generation
+        let delay = max(0, deadline - ProcessInfo.processInfo.systemUptime)
+        shapeHoldTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard !Task.isCancelled, let self, var state = shapeHoldState else { return }
+            guard
+                state.detector.update(
+                    at: ProcessInfo.processInfo.systemUptime,
+                    generation: generation
+                )
+            else { return }
+            if !state.didProvideHoldFeedback {
+                state.didProvideHoldFeedback = true
+                UIImpactFeedbackGenerator(style: .light).impactOccurred(intensity: 0.7)
+            }
+            shapeHoldState = state
+        }
+    }
+
+    /// PencilKit may publish its final pressure samples after both the touch and
+    /// `canvasViewDidEndUsingTool`. Keep the qualified hold alive until exactly
+    /// one committed stroke is available, then replace only that stroke.
+    @discardableResult
+    private func attemptShapeSnapIfReady() -> Bool {
+        guard !isUsingDrawingTool,
+            let state = shapeHoldState,
+            state.detector.shouldSnapAfterStrokeCommit
+        else { return false }
+
+        let strokes = canvasView.drawing.strokes
+        guard strokes.count == state.initialStrokeCount + 1 else {
+            if strokes.count > state.initialStrokeCount + 1 {
+                cancelShapeHold()
+                hasPendingDrawingChange = true
+                flushPendingDrawingChange()
+                finishToolUndoGrouping()
+                return true
+            }
+            return false
+        }
+
+        guard let sourceStroke = strokes.last,
+            let snapped = PencilStrokeShapeSnapper.snap(sourceStroke)
+        else {
+            cancelShapeHold()
+            hasPendingDrawingChange = true
+            flushPendingDrawingChange()
+            return true
+        }
+
+        var snappedStrokes = strokes
+        snappedStrokes[snappedStrokes.count - 1] = snapped.stroke
+        let snappedCanvasDrawing = PKDrawing(strokes: snappedStrokes)
+
+        // Replacing the completed stroke directly avoids cross-fading every
+        // existing ink tile. The localized haptic below provides snap feedback.
+        inkCanvasCoordinator.replaceDrawing(snappedCanvasDrawing, on: canvasView)
+
+        let partition = JotDrawingLayerPartition(drawing: combinedCanvasDrawing())
+        let snappedCombined = partition.combined
+        let snappedIndices = reconciledPageIndices(for: snappedCombined)
+        let after = EditJotViewModel.Drawing(
+            value: snappedCombined,
+            width: drawingWidth,
+            strokePageIndices: snappedIndices
+        )
+        registerDrawingUndo(snapshot: state.beforeDrawing, inverse: after)
+        toolUndoManager?.setActionName("Snap to Shape")
+        shapeHoldState = nil
+        shapeHoldTask?.cancel()
+        shapeCommitWatchdogTask?.cancel()
+        hasPendingDrawingChange = false
+        commitCanvasDrawing(detectsScribbleErase: false)
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred(intensity: 0.85)
+        return true
+    }
+
+    private func scheduleShapeCommitWatchdog() {
+        shapeCommitWatchdogTask?.cancel()
+        shapeCommitWatchdogTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(1))
+            guard !Task.isCancelled, let self else { return }
+            if !attemptShapeSnapIfReady() {
+                cancelShapeHold()
+                if inkCanvasCoordinator.hasUncommittedChanges {
+                    commitCanvasDrawing()
+                } else {
+                    finishToolUndoGrouping()
+                }
+            }
+        }
+    }
+
+    private func cancelShapeHold() {
+        shapeHoldTask?.cancel()
+        shapeHoldTask = nil
+        shapeHoldState = nil
+    }
+
+    private func registerDrawingUndo(before: PKDrawing, after: PKDrawing) {
+        let beforeIndices =
+            before.strokes.count == inkCanvasCoordinator.committedStrokePageIndices.count
+            ? inkCanvasCoordinator.committedStrokePageIndices
+            : reconciledPageIndices(for: before)
+        let afterIndices =
+            viewModel.currentStrokePageIndices.count == after.strokes.count
+            ? viewModel.currentStrokePageIndices
+            : reconciledPageIndices(for: after)
+        let beforeSnapshot = EditJotViewModel.Drawing(
+            value: before,
+            width: drawingWidth,
+            strokePageIndices: beforeIndices
+        )
+        let afterSnapshot = EditJotViewModel.Drawing(
+            value: after,
+            width: drawingWidth,
+            strokePageIndices: afterIndices
+        )
+        registerDrawingUndo(snapshot: beforeSnapshot, inverse: afterSnapshot)
+    }
+
+    private func registerDrawingUndo(
+        snapshot: EditJotViewModel.Drawing,
+        inverse: EditJotViewModel.Drawing
+    ) {
+        inkUndoManager?.registerUndo(withTarget: self) { target in
+            target.applyDrawingUndo(snapshot, inverse: inverse)
+        }
+    }
+
+    private func applyDrawingUndo(
+        _ snapshot: EditJotViewModel.Drawing,
+        inverse: EditJotViewModel.Drawing
+    ) {
+        viewModel.prepareForUndoRedo(expectedDrawing: snapshot.value)
+        applyViewModelDrawing(snapshot)
+        viewModel.didChangeDrawing(
+            snapshot.value,
+            strokePageIndices: snapshot.strokePageIndices,
+            detectsScribbleErase: false
+        )
+        registerDrawingUndo(snapshot: inverse, inverse: snapshot)
+    }
+
+    private func finishToolUndoGrouping() {
+        if ownsToolUndoGrouping {
+            toolUndoManager?.endUndoGrouping()
+            ownsToolUndoGrouping = false
+        }
+        toolUndoManager = nil
+        drawingBeforeToolUse = nil
+    }
+
+    private var inkUndoManager: UndoManager? {
+        toolUndoManager ?? inkCanvasCoordinator.activeCanvas.undoManager ?? canvasView.undoManager
     }
 
     @objc
@@ -613,9 +983,11 @@ final class EditJotViewController: UIViewController {
 
         // `fillShortEdge` fills either the viewport width or height, whichever
         // requires more magnification. `fitLongEdge` keeps the entire page visible.
-        let isAtOrBeyondShortEdgeFill = documentScrollView.zoomScale
+        let isAtOrBeyondShortEdgeFill =
+            documentScrollView.zoomScale
             >= scales.fillShortEdge * (1 - 0.02)
-        let targetScale = isAtOrBeyondShortEdgeFill
+        let targetScale =
+            isAtOrBeyondShortEdgeFill
             ? scales.fitLongEdge
             : scales.fillShortEdge
 
@@ -667,23 +1039,31 @@ final class EditJotViewController: UIViewController {
             width: documentContentSize.width * nativeScale,
             height: documentContentSize.height * nativeScale
         )
-        let geometryMatches = canvasView.contentSize == scaledContentSize
-            && abs(canvasView.zoomScale - nativeScale) < 0.0001
-            && canvasView.transform == .identity
-            && abs(inkContainerView.transform.a - 1 / nativeScale) < 0.0001
+        let inkPlanes = [
+            (canvas: canvasView, container: inkContainerView),
+            (canvas: highlighterCanvasView, container: highlighterInkContainerView),
+        ]
+        let geometryMatches = inkPlanes.allSatisfy { plane in
+            plane.canvas.contentSize == scaledContentSize
+                && abs(plane.canvas.zoomScale - nativeScale) < 0.0001
+                && plane.canvas.transform == .identity
+                && abs(plane.container.transform.a - 1 / nativeScale) < 0.0001
+        }
         if !geometryMatches {
             CATransaction.begin()
             CATransaction.setDisableActions(true)
-            inkContainerView.transform = .identity
-            canvasView.transform = .identity
-            canvasView.minimumZoomScale = nativeScale
-            canvasView.maximumZoomScale = nativeScale
-            canvasView.zoomScale = nativeScale
-            canvasView.contentSize = scaledContentSize
-            inkContainerView.transform = CGAffineTransform(
-                scaleX: 1 / nativeScale,
-                y: 1 / nativeScale
-            )
+            for plane in inkPlanes {
+                plane.container.transform = .identity
+                plane.canvas.transform = .identity
+                plane.canvas.minimumZoomScale = nativeScale
+                plane.canvas.maximumZoomScale = nativeScale
+                plane.canvas.zoomScale = nativeScale
+                plane.canvas.contentSize = scaledContentSize
+                plane.container.transform = CGAffineTransform(
+                    scaleX: 1 / nativeScale,
+                    y: 1 / nativeScale
+                )
+            }
             CATransaction.commit()
         }
         updateVisibleInkRegion()
@@ -745,19 +1125,25 @@ final class EditJotViewController: UIViewController {
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        inkContainerView.transform = .identity
-        inkContainerView.bounds = wrapperBounds
-        inkContainerView.layer.position = visibleRect.origin
-        canvasView.transform = .identity
-        canvasView.bounds.size = nativeViewportSize
-        canvasView.layer.position = .zero
-        if canvasView.contentOffset != nativeContentOffset {
-            canvasView.contentOffset = nativeContentOffset
+        let inkPlanes = [
+            (canvas: canvasView, container: inkContainerView),
+            (canvas: highlighterCanvasView, container: highlighterInkContainerView),
+        ]
+        for plane in inkPlanes {
+            plane.container.transform = .identity
+            plane.container.bounds = wrapperBounds
+            plane.container.layer.position = visibleRect.origin
+            plane.canvas.transform = .identity
+            plane.canvas.bounds.size = nativeViewportSize
+            plane.canvas.layer.position = .zero
+            if plane.canvas.contentOffset != nativeContentOffset {
+                plane.canvas.contentOffset = nativeContentOffset
+            }
+            plane.container.transform = CGAffineTransform(
+                scaleX: 1 / nativeScale,
+                y: 1 / nativeScale
+            )
         }
-        inkContainerView.transform = CGAffineTransform(
-            scaleX: 1 / nativeScale,
-            y: 1 / nativeScale
-        )
         CATransaction.commit()
     }
 
@@ -772,6 +1158,11 @@ final class EditJotViewController: UIViewController {
 
     fileprivate func documentScrollViewDidScroll(_ scrollView: UIScrollView) {
         backgroundView.sync(
+            scrollOffset: scrollView.contentOffset,
+            zoomScale: scrollView.zoomScale,
+            viewportSize: scrollView.bounds.size
+        )
+        pdfContentView.sync(
             scrollOffset: scrollView.contentOffset,
             zoomScale: scrollView.zoomScale,
             viewportSize: scrollView.bounds.size
@@ -810,7 +1201,8 @@ final class EditJotViewController: UIViewController {
 
     private func saveScrollPosition() {
         guard drawingWidth > 0, documentScrollView.zoomScale > 0 else { return }
-        let pageFullHeight = (currentPageSize.height + JotBackgroundView.pageSpacing)
+        let pageFullHeight =
+            (currentPageSize.height + JotBackgroundView.pageSpacing)
             * documentScrollView.zoomScale
         guard pageFullHeight > 0 else { return }
         let visibleTop = documentScrollView.contentOffset.y + documentScrollView.contentInset.top
@@ -827,7 +1219,8 @@ final class EditJotViewController: UIViewController {
         )
         guard maxOffsetY > 0 else { return }
         pendingScrollPage = nil
-        let pageFullHeight = (currentPageSize.height + JotBackgroundView.pageSpacing)
+        let pageFullHeight =
+            (currentPageSize.height + JotBackgroundView.pageSpacing)
             * documentScrollView.zoomScale
         let targetOffsetY = CGFloat(page) * pageFullHeight - documentScrollView.contentInset.top
         documentScrollView.contentOffset = CGPoint(
@@ -838,15 +1231,70 @@ final class EditJotViewController: UIViewController {
 
 }
 
+#if !targetEnvironment(macCatalyst)
+// MARK: - PKToolPickerObserver
+
+extension EditJotViewController: PKToolPickerObserver {
+
+    func toolPickerSelectedToolDidChange(_ toolPicker: PKToolPicker) {
+        scheduleSelectedCanvasToolUpdate()
+    }
+
+    @available(iOS 18.0, *)
+    func toolPickerSelectedToolItemDidChange(_ toolPicker: PKToolPicker) {
+        scheduleSelectedCanvasToolUpdate()
+    }
+
+    func toolPickerVisibilityDidChange(_ toolPicker: PKToolPicker) {
+        updateCanvasTouchRouting()
+    }
+
+    private func scheduleSelectedCanvasToolUpdate() {
+        // PencilKit's observer callback can precede propagation of the selected
+        // tool to PKCanvasView. Inspect it on the next main-actor turn.
+        selectedToolUpdateTask?.cancel()
+        selectedToolUpdateTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard !Task.isCancelled else { return }
+            self?.selectedCanvasToolDidChange()
+        }
+    }
+
+    private func selectedCanvasToolDidChange() {
+        let selectedTool = toolPicker.selectedTool
+        canvasView.tool = selectedTool
+        highlighterCanvasView.tool = selectedTool
+
+        let nextMode: JotInkCanvasCoordinator.Mode
+        if let inkingTool = selectedTool as? PKInkingTool {
+            nextMode = inkingTool.inkType == .marker ? .highlighter : .foreground
+        } else if selectedTool is PKLassoTool || selectedTool is PKEraserTool {
+            nextMode = .combined
+        } else {
+            nextMode = .foreground
+        }
+
+        if inkCanvasCoordinator.mode != nextMode,
+            hasPendingDrawingChange || inkCanvasCoordinator.hasUncommittedChanges
+        {
+            commitCanvasDrawing()
+        }
+        inkCanvasCoordinator.transition(to: nextMode)
+        updateCanvasInteraction()
+        updateCanvasTouchRouting()
+    }
+}
+#endif
+
 // MARK: - Navigation
 
-private extension EditJotViewController {
+extension EditJotViewController {
 
-    func handleEditing(isEditing: Bool?) {
+    fileprivate func handleEditing(isEditing: Bool?) {
         let rightNavigationBarButtonItems = makeRightNavigationBarButtonItems(isEditing: isEditing)
+        isEditingEnabled = isEditing == true
 
         if let isEditing, isEditing {
-            canvasView.becomeFirstResponder()
             swipeBackGesture.isEnabled = false
 
             #if !targetEnvironment(macCatalyst)
@@ -855,26 +1303,15 @@ private extension EditJotViewController {
                 if !(canvasView.tool is PKInkingTool) {
                     let pen = PKInkingTool(.pen, color: .label, width: 5)
                     canvasView.tool = pen
+                    highlighterCanvasView.tool = pen
                     toolPicker.selectedTool = pen
                 }
             }
             #endif
-
-            if #available(iOS 18.0, *) {
-                canvasView.isDrawingEnabled = true
-            } else {
-                canvasView.isUserInteractionEnabled = true
-            }
         } else {
-            canvasView.resignFirstResponder()
             swipeBackGesture.isEnabled = true
-            if #available(iOS 18.0, *) {
-                canvasView.isDrawingEnabled = false
-            } else {
-                canvasView.isUserInteractionEnabled = false
-            }
             #if !targetEnvironment(macCatalyst)
-            if let inking = canvasView.tool as? PKInkingTool {
+            if let inking = inkCanvasCoordinator.activeCanvas.tool as? PKInkingTool {
                 let widthKey = DefaultsKey<Double>("editor.penWidth")
                 let colorKey = DefaultsKey<String>("editor.penColorHex")
                 defaultsService.set(widthKey, value: Double(inking.width))
@@ -883,38 +1320,122 @@ private extension EditJotViewController {
             #endif
         }
 
-        if let firstItem = rightNavigationBarButtonItems.first, rightNavigationBarButtonItems.count == 1 {
+        #if !targetEnvironment(macCatalyst)
+        selectedCanvasToolDidChange()
+        #else
+        updateCanvasInteraction()
+        updateCanvasTouchRouting()
+        #endif
+
+        if let firstItem = rightNavigationBarButtonItems.first,
+            rightNavigationBarButtonItems.count == 1
+        {
             navigationItem.setRightBarButton(firstItem, animated: false)
         } else {
             navigationItem.setRightBarButtonItems(rightNavigationBarButtonItems, animated: false)
         }
     }
 
-    func makeRightNavigationBarButtonItems(isEditing: Bool?) -> [UIBarButtonItem] {
+    private func updateCanvasInteraction() {
+        let activeCanvas = inkCanvasCoordinator.activeCanvas
+        let inkPlanes = [
+            (canvas: highlighterCanvasView, container: highlighterInkContainerView),
+            (canvas: canvasView, container: inkContainerView),
+        ]
+        for plane in inkPlanes {
+            let canvas = plane.canvas
+            let isActive = isEditingEnabled && canvas === activeCanvas
+            plane.container.isUserInteractionEnabled = isActive
+            canvas.isUserInteractionEnabled = isActive
+            if #available(iOS 18.0, *) {
+                canvas.isDrawingEnabled = isActive
+            }
+            if !isActive {
+                canvas.resignFirstResponder()
+            }
+        }
+
+        guard isEditingEnabled else { return }
+        #if !targetEnvironment(macCatalyst)
+        toolPicker.setVisible(true, forFirstResponder: activeCanvas)
+        #endif
+        activeCanvas.becomeFirstResponder()
+    }
+
+    private var isDrawAndHoldShapeConversionEnabled: Bool {
+        defaultsService.getValue(.drawAndHoldShapeConversionEnabled) ?? true
+    }
+
+    @discardableResult
+    private func toggleDrawAndHoldShapeConversion() -> Bool {
+        let isEnabled = !isDrawAndHoldShapeConversionEnabled
+        defaultsService.set(.drawAndHoldShapeConversionEnabled, value: isEnabled)
+
+        if !isEnabled {
+            cancelShapeHold()
+            shapeCommitWatchdogTask?.cancel()
+            shapeCommitWatchdogTask = nil
+            if !isUsingDrawingTool {
+                flushPendingDrawingChange()
+                finishToolUndoGrouping()
+            }
+        }
+
+        return isEnabled
+    }
+
+    private func makeDrawAndHoldShapeConversionMenuElement() -> UIDeferredMenuElement {
+        UIDeferredMenuElement.uncached { [weak self] completion in
+            guard let self else {
+                completion([])
+                return
+            }
+            let action = UIAction(
+                title: L10n.EditJot.ShapeSnap.title,
+                image: UIImage(systemName: "square.on.circle"),
+                state: isDrawAndHoldShapeConversionEnabled ? .on : .off
+            ) { [weak self] action in
+                guard let self else { return }
+                let isEnabled = toggleDrawAndHoldShapeConversion()
+                action.state = isEnabled ? .on : .off
+            }
+            completion([action])
+        }
+    }
+
+    fileprivate func makeRightNavigationBarButtonItems(isEditing: Bool?) -> [UIBarButtonItem] {
         var barButtonItems = [UIBarButtonItem]()
 
         weak var moreBarButtonItemRef: UIBarButtonItem?
+        viewModel.visiblePageProvider = { [weak self] in
+            guard let self else { return nil }
+            let offsetY =
+                documentScrollView.contentOffset.y
+                + documentScrollView.contentInset.top
+            let pageFullHeight =
+                (currentPageSize.height + JotBackgroundView.pageSpacing)
+                * documentScrollView.zoomScale
+            return Int(floor(max(0, offsetY) / pageFullHeight))
+        }
+        let menuConfigurations = viewModel.menuConfigurations.make(popoverAnchorProvider: {
+            guard let barButtonItem = moreBarButtonItemRef else { return nil }
+            return { $0.barButtonItem = barButtonItem }
+        })
+        let pagesIndex = menuConfigurations.firstIndex { configuration in
+            guard case let .group(group) = configuration else { return false }
+            return group.title == L10n.EditJot.Pages.title
+        }
+        let baseMenu = UIMenu.make(jotMenuConfigurations: menuConfigurations)
+        var menuChildren = baseMenu.children
+        let shapeConversionIndex = pagesIndex.map { $0 + 1 } ?? menuChildren.endIndex
+        menuChildren.insert(
+            makeDrawAndHoldShapeConversionMenuElement(),
+            at: shapeConversionIndex
+        )
+        let menu = baseMenu.replacingChildren(menuChildren)
         let moreBarButtonItem = symbolBarButtonItemFactory.make(
             symbolName: "ellipsis",
-            primaryAction: .menu(
-                .make(
-                    jotMenuConfigurations: {
-                        self.viewModel.visiblePageProvider = { [weak self] in
-                            guard let self else { return nil }
-                            let offsetY = self.documentScrollView.contentOffset.y
-                                + self.documentScrollView.contentInset.top
-                            let pageFullHeight = (self.currentPageSize.height + JotBackgroundView.pageSpacing)
-                                * self.documentScrollView.zoomScale
-                            let index = Int(floor(max(0, offsetY) / pageFullHeight))
-                            return index
-                        }
-                        return viewModel.menuConfigurations.make(popoverAnchorProvider: {
-                            guard let barButtonItem = moreBarButtonItemRef else { return nil }
-                            return { $0.barButtonItem = barButtonItem }
-                        })
-                    }()
-                )
-            )
+            primaryAction: .menu(menu)
         )
         moreBarButtonItemRef = moreBarButtonItem
         barButtonItems.append(moreBarButtonItem)
@@ -938,9 +1459,9 @@ private extension EditJotViewController {
 
 // MARK: - Background
 
-private extension EditJotViewController {
+extension EditJotViewController {
 
-    func applyBackground(_ background: EditJotViewModel.Background) async {
+    fileprivate func applyBackground(_ background: EditJotViewModel.Background) async {
         let pageSize = CGSize(width: Constants.Page.width, height: Constants.Page.height)
         currentPageSize = pageSize
         let spacing = JotBackgroundView.pageSpacing
@@ -951,9 +1472,16 @@ private extension EditJotViewController {
             cachedPDFLoadResult = nil
             applyDocumentAppearance(isPDFBacked: false)
             let totalPageCount = 1 + extraPages
-            backgroundContentHeight = CGFloat(totalPageCount) * pageSize.height
+            backgroundContentHeight =
+                CGFloat(totalPageCount) * pageSize.height
                 + max(0, CGFloat(totalPageCount - 1)) * spacing
             backgroundView.configureRuled(
+                pageCount: totalPageCount,
+                pageSize: pageSize,
+                scrollOffset: documentScrollView.contentOffset,
+                zoomScale: documentScrollView.zoomScale
+            )
+            pdfContentView.configureRuled(
                 pageCount: totalPageCount,
                 pageSize: pageSize,
                 scrollOffset: documentScrollView.contentOffset,
@@ -978,9 +1506,17 @@ private extension EditJotViewController {
                 let pdfPageSize = result.pageSize
                 currentPageSize = pdfPageSize
                 let totalPages = CGFloat(result.pageCount + insertedPageSlots.count)
-                backgroundContentHeight = totalPages * pdfPageSize.height
+                backgroundContentHeight =
+                    totalPages * pdfPageSize.height
                     + max(0, totalPages - 1) * spacing
                 backgroundView.configurePDF(
+                    document: result.document,
+                    pageSize: pdfPageSize,
+                    insertedPageSlots: insertedPageSlots,
+                    scrollOffset: documentScrollView.contentOffset,
+                    zoomScale: documentScrollView.zoomScale
+                )
+                pdfContentView.configurePDF(
                     document: result.document,
                     pageSize: pdfPageSize,
                     insertedPageSlots: insertedPageSlots,
@@ -999,6 +1535,12 @@ private extension EditJotViewController {
                     scrollOffset: documentScrollView.contentOffset,
                     zoomScale: documentScrollView.zoomScale
                 )
+                pdfContentView.configureRuled(
+                    pageCount: 1,
+                    pageSize: pageSize,
+                    scrollOffset: documentScrollView.contentOffset,
+                    zoomScale: documentScrollView.zoomScale
+                )
             }
         }
         layoutCanvasContent()
@@ -1008,10 +1550,12 @@ private extension EditJotViewController {
     /// appearance. PDF pages always use their authored (light) appearance, so
     /// the picker must create colors for a light canvas even when its own UI is
     /// dark. Plain notes keep PencilKit's normal adaptive appearance.
-    func applyDocumentAppearance(isPDFBacked: Bool) {
+    fileprivate func applyDocumentAppearance(isPDFBacked: Bool) {
         let canvasStyle: UIUserInterfaceStyle = isPDFBacked ? .light : .unspecified
         canvasView.overrideUserInterfaceStyle = canvasStyle
+        highlighterCanvasView.overrideUserInterfaceStyle = canvasStyle
         backgroundView.overrideUserInterfaceStyle = canvasStyle
+        pdfContentView.overrideUserInterfaceStyle = canvasStyle
         #if !targetEnvironment(macCatalyst)
         toolPicker.colorUserInterfaceStyle = canvasStyle
         #endif
@@ -1020,9 +1564,9 @@ private extension EditJotViewController {
 
 // MARK: - UIColor hex
 
-private extension UIColor {
+extension UIColor {
 
-    convenience init?(hex: String) {
+    fileprivate convenience init?(hex: String) {
         var str = hex.trimmingCharacters(in: .whitespacesAndNewlines)
         if str.hasPrefix("#") { str.removeFirst() }
         guard str.count == 6 || str.count == 8 else { return nil }
@@ -1034,15 +1578,15 @@ private extension UIColor {
             let blue = CGFloat(value & 0x0000FF) / 255.0
             self.init(red: red, green: green, blue: blue, alpha: 1)
         } else {
-            let alpha = CGFloat((value & 0xFF000000) >> 24) / 255.0
-            let red = CGFloat((value & 0x00FF0000) >> 16) / 255.0
-            let green = CGFloat((value & 0x0000FF00) >> 8) / 255.0
-            let blue = CGFloat(value & 0x000000FF) / 255.0
+            let alpha = CGFloat((value & 0xFF00_0000) >> 24) / 255.0
+            let red = CGFloat((value & 0x00FF_0000) >> 16) / 255.0
+            let green = CGFloat((value & 0x0000_FF00) >> 8) / 255.0
+            let blue = CGFloat(value & 0x0000_00FF) / 255.0
             self.init(red: red, green: green, blue: blue, alpha: alpha)
         }
     }
 
-    var hexString: String {
+    fileprivate var hexString: String {
         var red: CGFloat = 0
         var green: CGFloat = 0
         var blue: CGFloat = 0
@@ -1051,12 +1595,11 @@ private extension UIColor {
         let redByte = UInt8(round(red * 255))
         let greenByte = UInt8(round(green * 255))
         let blueByte = UInt8(round(blue * 255))
-        if alpha >= 1.0 {
-            return String(format: "%02X%02X%02X", redByte, greenByte, blueByte)
-        } else {
+        guard alpha >= 1.0 else {
             let alphaByte = UInt8(round(alpha * 255))
             return String(format: "%02X%02X%02X%02X", alphaByte, redByte, greenByte, blueByte)
         }
+        return String(format: "%02X%02X%02X", redByte, greenByte, blueByte)
     }
 }
 
@@ -1065,58 +1608,82 @@ private extension UIColor {
 extension EditJotViewController: PKCanvasViewDelegate {
 
     func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
-        guard !isApplyingViewModelDrawing else { return }
+        guard inkCanvasCoordinator.noteDrawingDidChange(from: canvasView) else { return }
         guard !isUsingDrawingTool else {
             hasPendingDrawingChange = true
             return
         }
-        viewModel.didChangeDrawing(canvasView.drawing)
+        updateCanvasTouchRouting()
+        if canvasView === self.canvasView, attemptShapeSnapIfReady() { return }
+        if canvasView === self.canvasView, shapeHoldState != nil {
+            hasPendingDrawingChange = true
+            scheduleShapeCommitWatchdog()
+            return
+        }
+        commitCanvasDrawing()
     }
 
     func canvasViewDidBeginUsingTool(_ canvasView: PKCanvasView) {
+        guard inkCanvasCoordinator.role(of: canvasView) != nil,
+            canvasView === inkCanvasCoordinator.activeCanvas
+        else { return }
         isUsingDrawingTool = true
         nativeInkZoomTask?.cancel()
+        shapeCommitWatchdogTask?.cancel()
+        toolUndoCleanupTask?.cancel()
+        if ownsToolUndoGrouping {
+            finishToolUndoGrouping()
+        }
+        drawingBeforeToolUse = EditJotViewModel.Drawing(
+            value: inkCanvasCoordinator.committedDrawing,
+            width: drawingWidth,
+            strokePageIndices: inkCanvasCoordinator.committedStrokePageIndices
+        )
+        if canvasView.tool is PKInkingTool, let undoManager = canvasView.undoManager {
+            undoManager.beginUndoGrouping()
+            toolUndoManager = undoManager
+            ownsToolUndoGrouping = true
+        }
     }
 
     func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) {
+        guard inkCanvasCoordinator.role(of: canvasView) != nil,
+            canvasView === inkCanvasCoordinator.activeCanvas
+        else { return }
         isUsingDrawingTool = false
+        updateCanvasTouchRouting()
+        if canvasView === self.canvasView, attemptShapeSnapIfReady() { return }
+        if canvasView === self.canvasView, shapeHoldState != nil {
+            hasPendingDrawingChange = true
+            scheduleShapeCommitWatchdog()
+            return
+        }
         flushPendingDrawingChange()
-        view.setNeedsLayout()
+        if ownsToolUndoGrouping {
+            toolUndoCleanupTask?.cancel()
+            toolUndoCleanupTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(1))
+                guard !Task.isCancelled, let self else { return }
+                if inkCanvasCoordinator.hasUncommittedChanges {
+                    commitCanvasDrawing()
+                } else {
+                    finishToolUndoGrouping()
+                }
+            }
+        }
     }
 
     private func flushPendingDrawingChange() {
-        guard hasPendingDrawingChange else { return }
-        hasPendingDrawingChange = false
-        viewModel.didChangeDrawing(canvasView.drawing)
+        guard hasPendingDrawingChange || inkCanvasCoordinator.hasUncommittedChanges else { return }
+        commitCanvasDrawing()
     }
 }
 
 // MARK: - JotCanvasView
 
 private final class JotCanvasView: PKCanvasView {
-    override var editingInteractionConfiguration: UIEditingInteractionConfiguration { .none }
-    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool { false }
-    override func buildMenu(with builder: UIMenuBuilder) { }
-
-    override func addInteraction(_ interaction: UIInteraction) {
-        guard !isSuppressedInteraction(interaction) else { return }
-        super.addInteraction(interaction)
-    }
-
-    override func didMoveToWindow() {
-        super.didMoveToWindow()
-        guard window != nil else { return }
-        subviews.forEach { sub in
-            sub.interactions.filter { isSuppressedInteraction($0) }.forEach { sub.removeInteraction($0) }
-        }
-    }
-
-    private func isSuppressedInteraction(_ interaction: UIInteraction) -> Bool {
-        if interaction is UITextInteraction { return true }
-        if interaction is UIContextMenuInteraction { return true }
-        if #available(iOS 16.0, *), interaction is UIEditMenuInteraction { return true }
-        return false
-    }
+    // Keep PencilKit's selection interaction lifecycle intact. In particular,
+    // do not remove the transient interactions installed by the lasso tool.
 }
 
 @MainActor

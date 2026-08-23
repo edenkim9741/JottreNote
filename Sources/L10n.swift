@@ -236,6 +236,13 @@ enum L10n {
         enum Pages {
             static let title = String(localized: "editJot.pages.title", defaultValue: "Pages")
         }
+
+        enum ShapeSnap {
+            static let title = String(
+                localized: "editJot.shapeSnap.title",
+                defaultValue: "Draw and Hold to Shape"
+            )
+        }
     }
 
     enum Share {

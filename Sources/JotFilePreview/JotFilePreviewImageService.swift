@@ -44,6 +44,7 @@ struct JotFilePreviewImageService: JotFilePreviewImageServiceProtocol {
     ) async throws -> Data {
         let jotFile = try jotFileService.readJotFile(jotFileInfo: jotFileInfo)
         let drawing = try PKDrawing(data: jotFile.jot.drawing)
+        let layers = JotDrawingLayerPartition(drawing: drawing)
         let pdfData = jotFile.jot.pdfData
 
         let aspectRatio = Constants.size.width / Constants.size.height
@@ -64,21 +65,23 @@ struct JotFilePreviewImageService: JotFilePreviewImageServiceProtocol {
                 )
             )
         }
-        let backgroundPageImage: UIImage? = if let result = pdfLoadResult {
-            await MainActor.run {
-                let service = PDFLoadService()
-                let previewPageSize = CGSize(
-                    width: Constants.size.width,
-                    height: Constants.size.width * result.pageSize.height / result.pageSize.width
-                )
-                return service.renderPage(
-                    from: result,
-                    at: 0,
-                    targetSize: previewPageSize,
-                    scale: displayScale
-                )
-            }
-        } else { nil }
+        let pdfContentImage: UIImage? =
+            if let result = pdfLoadResult {
+                await MainActor.run {
+                    let service = PDFLoadService()
+                    let previewPageSize = CGSize(
+                        width: Constants.size.width,
+                        height: Constants.size.width * result.pageSize.height / result.pageSize.width
+                    )
+                    return service.renderPage(
+                        from: result,
+                        at: 0,
+                        targetSize: previewPageSize,
+                        scale: displayScale,
+                        fillsBackground: false
+                    )
+                }
+            } else { nil }
 
         let traitCollection = UITraitCollection(userInterfaceStyle: userInterfaceStyle)
 
@@ -89,12 +92,19 @@ struct JotFilePreviewImageService: JotFilePreviewImageServiceProtocol {
                     UIColor.systemBackground.setFill()
                     context.fill(CGRect(origin: .zero, size: Constants.size))
 
-                    if let backgroundPageImage {
-                        backgroundPageImage.draw(in: CGRect(origin: .zero, size: backgroundPageImage.size))
+                    if let pdfContentImage {
+                        UIColor.white.setFill()
+                        context.fill(CGRect(origin: .zero, size: pdfContentImage.size))
+                        pdfContentImage.draw(in: CGRect(origin: .zero, size: pdfContentImage.size))
                     }
-
-                    let drawingImage = drawing.image(from: rect, scale: scale)
-                    drawingImage.draw(in: CGRect(origin: .zero, size: Constants.size))
+                    let highlighterImage = layers.highlighter.image(from: rect, scale: scale)
+                    highlighterImage.draw(
+                        in: CGRect(origin: .zero, size: Constants.size),
+                        blendMode: pdfContentImage == nil ? .normal : .multiply,
+                        alpha: 1
+                    )
+                    let foregroundImage = layers.foreground.image(from: rect, scale: scale)
+                    foregroundImage.draw(in: CGRect(origin: .zero, size: Constants.size))
                 }
             }
         }

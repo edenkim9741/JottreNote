@@ -27,7 +27,7 @@ actor CachedJotFilePreviewImageService: JotFilePreviewImageServiceProtocol {
         static let diskCacheSizeLimit = 100 * 1024 * 1024  // 100 MB
         static let diskCacheTrimTarget = 80 * 1024 * 1024  // 80 MB
         static let diskSweepInterval = 32
-        static let cacheSchemaVersion = 1
+        static let cacheSchemaVersion = 2
     }
 
     private struct CacheKey: CustomStringConvertible {
@@ -177,15 +177,18 @@ actor CachedJotFilePreviewImageService: JotFilePreviewImageServiceProtocol {
             .fileSizeKey,
             .contentModificationDateKey,
         ]
-        guard let urls = try? localFileService.listContents(
-            directory: temporaryDirectory,
-            properties: keys
-        ) else { return }
+        guard
+            let urls = try? localFileService.listContents(
+                directory: temporaryDirectory,
+                properties: keys
+            )
+        else { return }
 
         let resourceKeys = Set(keys)
         let entries = urls.compactMap { url -> (url: URL, size: Int, date: Date)? in
             guard let values = try? url.resourceValues(forKeys: resourceKeys),
-                  values.isRegularFile == true else { return nil }
+                values.isRegularFile == true
+            else { return nil }
             return (url, max(0, values.fileSize ?? 0), values.contentModificationDate ?? .distantPast)
         }
         var totalSize = entries.reduce(into: 0) { $0 += $1.size }

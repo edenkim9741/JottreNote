@@ -1927,6 +1927,24 @@
         }
       }
     },
+    "editJot.shapeSnap.title" : {
+      "comment" : "Toggle for converting a stroke into a geometric shape after holding at its endpoint",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Draw and Hold to Shape"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "그린 후 길게 눌러 도형 변환"
+          }
+        }
+      }
+    },
     "enableCloud.action.learnHowToEnable" : {
       "comment" : "Call-to-action button on the Enable iCloud screen",
       "extractionState" : "manual",

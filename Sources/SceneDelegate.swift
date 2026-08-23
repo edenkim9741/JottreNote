@@ -64,7 +64,9 @@ private struct SceneCoordinatorFactories {
 
 final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
 
-    private static let defaultsService = DefaultsService(userDefaults: .standard)
+    private static var defaultsService: DefaultsService {
+        WebDAVApplicationServices.shared.defaultsService
+    }
 
     #if targetEnvironment(macCatalyst)
     private lazy var appKitPluginService = MacCatalystAppKitPluginService(bundle: .main)
@@ -92,13 +94,17 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
             symbolBarButtonItemFactory: symbolFactory
         )
         let coordinators = makeCoordinatorFactories(services: services, fileService: fileService)
-        let webDAVBackupService = WebDAVBackupService(defaultsService: Self.defaultsService)
+        let webDAVBackupService = WebDAVApplicationServices.shared.backupService
         let editJotCoordinatorFactory = makeEditJotCoordinatorFactory(
-            services: services, uiFactories: uiFactories, coordinators: coordinators,
+            services: services,
+            uiFactories: uiFactories,
+            coordinators: coordinators,
             webDAVBackupService: webDAVBackupService
         )
         let jotsCoordinatorFactory = makeJotsCoordinatorFactory(
-            services: services, uiFactories: uiFactories, coordinators: coordinators,
+            services: services,
+            uiFactories: uiFactories,
+            coordinators: coordinators,
             editJotCoordinatorFactory: editJotCoordinatorFactory,
             webDAVBackupService: webDAVBackupService
         )
@@ -118,7 +124,8 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         )
         self.sceneCoordinator = sceneCoordinator
         navigationController.viewControllers = sceneCoordinator.handle(
-            session: session, connectionOptions: connectionOptions
+            session: session,
+            connectionOptions: connectionOptions
         )
         self.window?.makeKeyAndVisible()
         let incomingURLs = connectionOptions.urlContexts.map(\.url)
@@ -129,8 +136,23 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         }
     }
 
-    #if targetEnvironment(macCatalyst)
+    func sceneDidBecomeActive(_ scene: UIScene) {
+        WebDAVApplicationServices.shared.autoBackupScheduler.sceneDidBecomeActive(
+            identifier: scene.session.persistentIdentifier
+        )
+    }
+
+    func sceneWillResignActive(_ scene: UIScene) {
+        WebDAVApplicationServices.shared.autoBackupScheduler.sceneWillResignActive(
+            identifier: scene.session.persistentIdentifier
+        )
+    }
+
     func sceneDidDisconnect(_ scene: UIScene) {
+        WebDAVApplicationServices.shared.autoBackupScheduler.sceneDidDisconnect(
+            identifier: scene.session.persistentIdentifier
+        )
+        #if targetEnvironment(macCatalyst)
         guard
             UIApplication.shared.connectedScenes.isEmpty,
             let appKitPluginService
@@ -138,8 +160,8 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
             return
         }
         appKitPluginService.terminate()
+        #endif
     }
-    #endif
 
     func scene(
         _ scene: UIScene,
@@ -156,9 +178,9 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
 
 // MARK: - Private
 
-private extension SceneDelegate {
+extension SceneDelegate {
 
-    func redirectToExistingSceneIfNeeded(
+    fileprivate func redirectToExistingSceneIfNeeded(
         scene: UIScene,
         session: UISceneSession,
         connectionOptions: UIScene.ConnectionOptions
@@ -194,7 +216,10 @@ private extension SceneDelegate {
         // Providers revoke the URLs as soon as this source scene is released.
         let scopedURLs = pdfURLs.filter { $0.startAccessingSecurityScopedResource() }
         UIApplication.shared.requestSceneSessionActivation(
-            windowScene.session, userActivity: nil, options: nil, errorHandler: nil
+            windowScene.session,
+            userActivity: nil,
+            options: nil,
+            errorHandler: nil
         )
         Task { @MainActor in
             // Keep the source scene alive until File Provider URLs have been
@@ -209,7 +234,7 @@ private extension SceneDelegate {
         return true
     }
 
-    func isPreferredRedirectTarget(_ lhs: UIWindowScene, _ rhs: UIWindowScene) -> Bool {
+    fileprivate func isPreferredRedirectTarget(_ lhs: UIWindowScene, _ rhs: UIWindowScene) -> Bool {
         let lhsIsKey = lhs.windows.contains { $0.isKeyWindow }
         let rhsIsKey = rhs.windows.contains { $0.isKeyWindow }
         if lhsIsKey != rhsIsKey {
@@ -228,7 +253,7 @@ private extension SceneDelegate {
         return lhs.session.persistentIdentifier < rhs.session.persistentIdentifier
     }
 
-    func redirectTargetActivationRank(_ activationState: UIScene.ActivationState) -> Int {
+    fileprivate func redirectTargetActivationRank(_ activationState: UIScene.ActivationState) -> Int {
         switch activationState {
         case .foregroundActive:
             return 0
@@ -243,7 +268,7 @@ private extension SceneDelegate {
         }
     }
 
-    func makeServices(fileManager: FileManager, fileService: LocalFileService) -> SceneServices {
+    fileprivate func makeServices(fileManager: FileManager, fileService: LocalFileService) -> SceneServices {
         let jotFileService = JotFileService(fileService: fileService)
         let jotFilePreviewImageService = CachedJotFilePreviewImageService(
             localFileService: fileService,
@@ -263,7 +288,7 @@ private extension SceneDelegate {
         )
     }
 
-    func makeCoordinatorFactories(
+    fileprivate func makeCoordinatorFactories(
         services: SceneServices,
         fileService: FileServiceProtocol
     ) -> SceneCoordinatorFactories {
@@ -287,7 +312,7 @@ private extension SceneDelegate {
         )
     }
 
-    func makeSceneCoordinator(
+    fileprivate func makeSceneCoordinator(
         navigation: Navigation,
         services: SceneServices,
         rootCoordinatorFactory: RootCoordinatorFactoryProtocol,
@@ -318,22 +343,24 @@ private extension SceneDelegate {
                     let activity = NSUserActivity(activityType: SceneCoordinator.Constants.activityType)
                     activity.userInfo = [SceneCoordinator.Constants.urlKey: url.absoluteString]
                     UIApplication.shared.requestSceneSessionActivation(
-                        nil, userActivity: activity, options: nil, errorHandler: nil
+                        nil,
+                        userActivity: activity,
+                        options: nil,
+                        errorHandler: nil
                     )
                 }
             }
         )
     }
 
-    func makeBarButtonItemFactories() -> (TextBarButtonItemFactory, SymbolBarButtonItemFactory) {
-        if #available(iOS 26, *) {
-            return (IOS26TextBarButtonItemFactory(), IOS26SymbolBarButtonItemFactory())
-        } else {
+    fileprivate func makeBarButtonItemFactories() -> (TextBarButtonItemFactory, SymbolBarButtonItemFactory) {
+        guard #available(iOS 26, *) else {
             return (IOS18TextBarButtonItemFactory(), IOS18SymbolBarButtonItemFactory())
         }
+        return (IOS26TextBarButtonItemFactory(), IOS26SymbolBarButtonItemFactory())
     }
 
-    func makeEditJotCoordinatorFactory(
+    fileprivate func makeEditJotCoordinatorFactory(
         services: SceneServices,
         uiFactories: SceneUIFactories,
         coordinators: SceneCoordinatorFactories,
@@ -353,6 +380,8 @@ private extension SceneDelegate {
                 menuConfigurationFactory: uiFactories.menuConfigurationFactory,
                 symbolBarButtonItemFactory: uiFactories.symbolBarButtonItemFactory,
                 defaultsService: Self.defaultsService,
+                webDAVBackupService: webDAVBackupService,
+                webDAVEditorFlushRegistry: WebDAVApplicationServices.shared.editorFlushRegistry,
                 logger: OSLogLogger(category: "EditJotViewModel")
             ),
             jotConflictCoordinatorFactory: JotConflictCoordinatorFactory(
@@ -378,7 +407,7 @@ private extension SceneDelegate {
         )
     }
 
-    func makeJotsCoordinatorFactory(
+    fileprivate func makeJotsCoordinatorFactory(
         services: SceneServices,
         uiFactories: SceneUIFactories,
         coordinators: SceneCoordinatorFactories,
@@ -443,7 +472,7 @@ private extension SceneDelegate {
         )
     }
 
-    func makeNavigation(
+    fileprivate func makeNavigation(
         navigationController: UINavigationController,
         applicationService: ApplicationServiceProtocol
     ) -> Navigation {
@@ -483,7 +512,7 @@ private extension SceneDelegate {
         )
     }
 
-    func makeNavigationController() -> UINavigationController {
+    fileprivate func makeNavigationController() -> UINavigationController {
         let appearance = UINavigationBarAppearance()
         appearance.configureWithTransparentBackground()
 

@@ -9,6 +9,15 @@ final class JotBackgroundView: UIView {
     nonisolated static let pageSpacing: CGFloat = 32
     nonisolated static let ruledLineSpacing: CGFloat = 32
 
+    enum LayerRole: Equatable {
+        /// Opaque paper/page chrome below every ink layer.
+        case paper
+        /// Authored PDF operators only. This layer remains transparent so the
+        /// app-provided paper is not duplicated. It stays below marker ink
+        /// because a PDF may contain its own opaque, page-sized background.
+        case pdfContent
+    }
+
     private enum Content {
         case ruled(pageCount: Int)
         case pdf(document: PDFRenderDocument, insertedPageSlots: [Int])
@@ -30,6 +39,20 @@ final class JotBackgroundView: UIView {
     private var viewportSize = CGSize.zero
     private var visiblePageViews: [Int: PageView] = [:]
     private var lastVisiblePageRange: ClosedRange<Int>?
+    private let layerRole: LayerRole
+
+    init(layerRole: LayerRole = .paper) {
+        self.layerRole = layerRole
+        super.init(frame: .zero)
+        // Page views themselves are opaque, but this virtualized document view
+        // also contains transparent spacing between pages.
+        isOpaque = false
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        nil
+    }
 
     func configureRuled(
         pageCount: Int,
@@ -55,9 +78,11 @@ final class JotBackgroundView: UIView {
     }
 
     func sync(scrollOffset: CGPoint, zoomScale: CGFloat, viewportSize: CGSize) {
-        guard self.scrollOffset != scrollOffset
+        guard
+            self.scrollOffset != scrollOffset
                 || self.zoomScale != zoomScale
-                || self.viewportSize != viewportSize else {
+                || self.viewportSize != viewportSize
+        else {
             return
         }
         self.scrollOffset = scrollOffset
@@ -92,7 +117,9 @@ final class JotBackgroundView: UIView {
         // Page spacing and the free canvas below the final page should expose
         // the editor's surrounding margin color, including true black in dark mode.
         backgroundColor = .clear
-        visiblePageViews.values.forEach { $0.removeFromSuperview() }
+        for pageView in visiblePageViews.values {
+            pageView.removeFromSuperview()
+        }
         visiblePageViews.removeAll()
         lastVisiblePageRange = nil
         layoutVisiblePages()
@@ -109,7 +136,9 @@ final class JotBackgroundView: UIView {
         else { return }
 
         guard let visibleRange = visiblePageRange() else {
-            visiblePageViews.values.forEach { $0.removeFromSuperview() }
+            for pageView in visiblePageViews.values {
+                pageView.removeFromSuperview()
+            }
             visiblePageViews.removeAll()
             lastVisiblePageRange = nil
             return
@@ -141,18 +170,30 @@ final class JotBackgroundView: UIView {
         let pageView: PageView
         switch content {
         case .ruled:
-            pageView = PageView(content: .ruled(adaptsToAppearance: true))
+            pageView =
+                layerRole == .paper
+                ? PageView(content: .ruled(adaptsToAppearance: true))
+                : PageView(content: .transparent)
 
         case let .pdf(document, insertedPageSlots):
             if insertedPageSlots.contains(logicalIndex) {
-                pageView = PageView(content: .ruled(adaptsToAppearance: false))
+                pageView =
+                    layerRole == .paper
+                    ? PageView(content: .ruled(adaptsToAppearance: false))
+                    : PageView(content: .transparent)
             } else {
                 let precedingInsertions = insertedPageSlots.partitioningIndex { $0 >= logicalIndex }
                 let pdfIndex = logicalIndex - precedingInsertions
                 if pdfIndex >= 0, pdfIndex < document.pageCount {
-                    pageView = PageView(content: .pdf(document, pageIndex: pdfIndex))
+                    pageView =
+                        layerRole == .paper
+                        ? PageView(content: .pdfPaper)
+                        : PageView(content: .pdfContent(document, pageIndex: pdfIndex))
                 } else {
-                    pageView = PageView(content: .blank)
+                    pageView =
+                        layerRole == .paper
+                        ? PageView(content: .blankPaper)
+                        : PageView(content: .transparent)
                 }
             }
         }
@@ -197,10 +238,10 @@ final class JotBackgroundView: UIView {
     }
 }
 
-private extension Array where Element == Int {
+extension Array where Element == Int {
 
     /// Index of the first element matching `predicate` in an already sorted array.
-    func partitioningIndex(where predicate: (Int) -> Bool) -> Int {
+    fileprivate func partitioningIndex(where predicate: (Int) -> Bool) -> Int {
         var lower = 0
         var upper = count
         while lower < upper {
@@ -218,9 +259,11 @@ private extension Array where Element == Int {
 private final class PageView: UIView {
 
     enum Content {
-        case pdf(PDFRenderDocument, pageIndex: Int)
+        case pdfPaper
+        case pdfContent(PDFRenderDocument, pageIndex: Int)
         case ruled(adaptsToAppearance: Bool)
-        case blank
+        case blankPaper
+        case transparent
     }
 
     private let pageContent: Content
@@ -230,7 +273,15 @@ private final class PageView: UIView {
     init(content: Content) {
         pageContent = content
         super.init(frame: .zero)
-        isOpaque = true
+        let drawsPaper: Bool
+        switch content {
+        case .pdfPaper, .ruled, .blankPaper:
+            drawsPaper = true
+        case .pdfContent, .transparent:
+            drawsPaper = false
+        }
+        isOpaque = drawsPaper
+        backgroundColor = .clear
         contentMode = .redraw
         if case let .ruled(adaptsToAppearance) = content, adaptsToAppearance {
             overrideUserInterfaceStyle = .unspecified
@@ -245,8 +296,10 @@ private final class PageView: UIView {
             tiledLayer.needsDisplayOnBoundsChange = true
         }
         updatePageContent()
-        layer.borderWidth = 0.5
-        layer.borderColor = UIColor(white: 0.55, alpha: 0.5).cgColor
+        if drawsPaper {
+            layer.borderWidth = 0.5
+            layer.borderColor = UIColor(white: 0.55, alpha: 0.5).cgColor
+        }
     }
 
     @available(*, unavailable)
@@ -268,14 +321,18 @@ private final class PageView: UIView {
     private func updatePageContent() {
         guard let tiledLayer = layer as? PageTiledLayer else { return }
         switch pageContent {
-        case let .pdf(document, pageIndex):
-            tiledLayer.pageContent = .pdf(document, pageIndex: pageIndex)
+        case .pdfPaper:
+            tiledLayer.pageContent = .paper
+        case let .pdfContent(document, pageIndex):
+            tiledLayer.pageContent = .pdfContent(document, pageIndex: pageIndex)
         case let .ruled(adaptsToAppearance):
             tiledLayer.pageContent = .ruled(
                 isDark: adaptsToAppearance && traitCollection.userInterfaceStyle == .dark
             )
-        case .blank:
-            tiledLayer.pageContent = .blank
+        case .blankPaper:
+            tiledLayer.pageContent = .paper
+        case .transparent:
+            tiledLayer.pageContent = .transparent
         }
         tiledLayer.setNeedsDisplay()
     }
@@ -288,12 +345,13 @@ private final class PageView: UIView {
 private final class PageTiledLayer: CATiledLayer {
 
     enum Content {
-        case pdf(PDFRenderDocument, pageIndex: Int)
+        case paper
+        case pdfContent(PDFRenderDocument, pageIndex: Int)
         case ruled(isDark: Bool)
-        case blank
+        case transparent
     }
 
-    var pageContent: Content = .blank
+    var pageContent: Content = .transparent
 
     override class func fadeDuration() -> CFTimeInterval { 0 }
 
@@ -316,13 +374,21 @@ private final class PageTiledLayer: CATiledLayer {
     override func draw(in context: CGContext) {
         let drawingBounds = bounds
         switch pageContent {
-        case let .pdf(document, pageIndex):
-            document.drawPage(at: pageIndex, in: drawingBounds, context: context)
-        case let .ruled(isDark):
-            drawRuled(in: drawingBounds, context: context, isDark: isDark)
-        case .blank:
+        case .paper:
             context.setFillColor(gray: 1, alpha: 1)
             context.fill(drawingBounds)
+        case let .pdfContent(document, pageIndex):
+            context.clear(drawingBounds)
+            document.drawPage(
+                at: pageIndex,
+                in: drawingBounds,
+                context: context,
+                fillsBackground: false
+            )
+        case let .ruled(isDark):
+            drawRuled(in: drawingBounds, context: context, isDark: isDark)
+        case .transparent:
+            context.clear(drawingBounds)
         }
     }
 

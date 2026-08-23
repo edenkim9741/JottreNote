@@ -121,7 +121,7 @@ final class SettingsViewModel: PageViewModel {
                     name: L10n.Settings.Version.title,
                     value: appVersion
                 )
-            )
+            ),
         ])
 
         return items
@@ -149,7 +149,8 @@ final class SettingsViewModel: PageViewModel {
         let initial = WebDAVSettingsViewController.Configuration(
             url: repository.getWebDAVURL() ?? "",
             username: repository.getWebDAVUsername() ?? "",
-            password: repository.getWebDAVPassword() ?? ""
+            password: repository.getWebDAVPassword() ?? "",
+            backupIntervalMinutes: repository.getWebDAVBackupIntervalMinutes()
         )
         coordinator?.showWebDAVSettings(
             initial: initial,
@@ -157,6 +158,7 @@ final class SettingsViewModel: PageViewModel {
                 self?.repository.setWebDAVURL(config.url)
                 self?.repository.setWebDAVUsername(config.username)
                 self?.repository.setWebDAVPassword(config.password)
+                self?.repository.setWebDAVBackupIntervalMinutes(config.backupIntervalMinutes)
                 self?.refreshItems()
             },
             onTest: { [weak self] config in

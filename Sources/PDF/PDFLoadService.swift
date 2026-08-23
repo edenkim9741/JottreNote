@@ -61,8 +61,7 @@ enum PDFCompatibilitySanitizer {
 
         var sanitized = data
         let replacementPrefix = Data("/SMask /None".utf8)
-        for range in redundantRanges {
-            guard range.count >= replacementPrefix.count else { continue }
+        for range in redundantRanges where range.count >= replacementPrefix.count {
             var replacement = Data(repeating: UInt8(ascii: " "), count: range.count)
             replacement.replaceSubrange(0..<replacementPrefix.count, with: replacementPrefix)
             sanitized.replaceSubrange(range, with: replacement)
@@ -77,10 +76,11 @@ enum PDFCompatibilitySanitizer {
         var searchStart = data.startIndex
 
         while searchStart < data.endIndex,
-              let markerRange = data.range(
+            let markerRange = data.range(
                 of: softMaskMarker,
                 in: searchStart..<data.endIndex
-              ) {
+            )
+        {
             searchStart = markerRange.upperBound
             let dictionaryStart = skipWhitespace(in: data, from: markerRange.upperBound)
             guard dictionaryStart + 1 < data.endIndex else { continue }
@@ -88,7 +88,8 @@ enum PDFCompatibilitySanitizer {
             // Image masks commonly use `/SMask 12 0 R`; only direct soft-mask
             // dictionaries are candidates for this compatibility repair.
             guard data[dictionaryStart] == UInt8(ascii: "<"),
-                  data[dictionaryStart + 1] == UInt8(ascii: "<") else {
+                data[dictionaryStart + 1] == UInt8(ascii: "<")
+            else {
                 continue
             }
             guard let dictionaryEnd = matchingDictionaryEnd(in: data, from: dictionaryStart) else {
@@ -100,10 +101,12 @@ enum PDFCompatibilitySanitizer {
                 decoding: data[dictionaryStart..<dictionaryEnd],
                 as: UTF8.self
             )
-            guard dictionary.range(
-                of: #"/S\s*/Luminosity(?:\s|/|>|$)"#,
-                options: .regularExpression
-            ) != nil else { continue }
+            guard
+                dictionary.range(
+                    of: #"/S\s*/Luminosity(?:\s|/|>|$)"#,
+                    options: .regularExpression
+                ) != nil
+            else { continue }
             guard let reference = objectReference(after: "/G", in: dictionary) else {
                 continue
             }
@@ -150,10 +153,11 @@ enum PDFCompatibilitySanitizer {
         guard let expression = try? NSRegularExpression(pattern: pattern) else { return nil }
         let fullRange = NSRange(dictionary.startIndex..<dictionary.endIndex, in: dictionary)
         guard let match = expression.firstMatch(in: dictionary, range: fullRange),
-              let objectRange = Range(match.range(at: 1), in: dictionary),
-              let generationRange = Range(match.range(at: 2), in: dictionary),
-              let objectNumber = Int(dictionary[objectRange]),
-              let generation = Int(dictionary[generationRange]) else {
+            let objectRange = Range(match.range(at: 1), in: dictionary),
+            let generationRange = Range(match.range(at: 2), in: dictionary),
+            let objectNumber = Int(dictionary[objectRange]),
+            let generation = Int(dictionary[generationRange])
+        else {
             return nil
         }
         return (objectNumber, generation)
@@ -168,32 +172,37 @@ enum PDFCompatibilitySanitizer {
         var searchStart = data.startIndex
 
         while searchStart < data.endIndex,
-              let objectRange = data.range(
+            let objectRange = data.range(
                 of: objectMarker,
                 in: searchStart..<data.endIndex
-              ) {
+            )
+        {
             searchStart = objectRange.upperBound
             guard isTokenBoundary(in: data, before: objectRange.lowerBound),
-                  isTokenBoundary(in: data, after: objectRange.upperBound) else {
+                isTokenBoundary(in: data, after: objectRange.upperBound)
+            else {
                 continue
             }
 
             let headerLimit = min(data.endIndex, objectRange.upperBound + maximumObjectHeaderLength)
-            guard let streamRange = data.range(
-                of: streamMarker,
-                in: objectRange.upperBound..<headerLimit
-            ) else { continue }
+            guard
+                let streamRange = data.range(
+                    of: streamMarker,
+                    in: objectRange.upperBound..<headerLimit
+                )
+            else { continue }
 
             let header = String(
                 decoding: data[objectRange.upperBound..<streamRange.lowerBound],
                 as: UTF8.self
             )
             guard header.contains("/Subtype /Form"),
-                  header.contains("/Filter /FlateDecode"),
-                  header.contains("/S /Transparency"),
-                  let length = firstInteger(after: "/Length", in: header),
-                  length > 0,
-                  let bounds = boundingBox(in: header) else {
+                header.contains("/Filter /FlateDecode"),
+                header.contains("/S /Transparency"),
+                let length = firstInteger(after: "/Length", in: header),
+                length > 0,
+                let bounds = boundingBox(in: header)
+            else {
                 continue
             }
 
@@ -201,7 +210,8 @@ enum PDFCompatibilitySanitizer {
             guard encodedStart + length <= data.endIndex else { continue }
             let encoded = Data(data[encodedStart..<(encodedStart + length)])
             guard let decoded = inflate(encoded),
-                  isFullBoundsOpaqueWhiteFill(decoded, bounds: bounds) else {
+                isFullBoundsOpaqueWhiteFill(decoded, bounds: bounds)
+            else {
                 continue
             }
             return true
@@ -215,7 +225,8 @@ enum PDFCompatibilitySanitizer {
         guard let expression = try? NSRegularExpression(pattern: pattern) else { return nil }
         let fullRange = NSRange(text.startIndex..<text.endIndex, in: text)
         guard let match = expression.firstMatch(in: text, range: fullRange),
-              let valueRange = Range(match.range(at: 1), in: text) else {
+            let valueRange = Range(match.range(at: 1), in: text)
+        else {
             return nil
         }
         return Int(text[valueRange])
@@ -223,14 +234,16 @@ enum PDFCompatibilitySanitizer {
 
     private static func boundingBox(in header: String) -> CGRect? {
         let number = #"[-+]?(?:\d+(?:\.\d*)?|\.\d+)"#
-        let pattern = #"/BBox\s*\[\s*("# + number + #")\s+("# + number
+        let pattern =
+            #"/BBox\s*\[\s*("# + number + #")\s+("# + number
             + #")\s+("# + number + #")\s+("# + number + #")\s*\]"#
         guard let expression = try? NSRegularExpression(pattern: pattern) else { return nil }
         let fullRange = NSRange(header.startIndex..<header.endIndex, in: header)
         guard let match = expression.firstMatch(in: header, range: fullRange) else { return nil }
         let values: [CGFloat] = (1...4).compactMap { index in
             guard let range = Range(match.range(at: index), in: header),
-                  let value = Double(header[range]) else { return nil }
+                let value = Double(header[range])
+            else { return nil }
             return CGFloat(value)
         }
         guard values.count == 4 else { return nil }
@@ -252,8 +265,9 @@ enum PDFCompatibilitySanitizer {
         let flags = encoded[encoded.startIndex + 1]
         let header = (UInt16(compressionMethod) << 8) | UInt16(flags)
         guard compressionMethod & 0x0F == 8,
-              header % 31 == 0,
-              flags & 0x20 == 0 else {
+            header % 31 == 0,
+            flags & 0x20 == 0
+        else {
             return nil
         }
         let payloadStart = encoded.startIndex + 2
@@ -264,7 +278,8 @@ enum PDFCompatibilitySanitizer {
         let decodedCount = decoded.withUnsafeMutableBytes { destination in
             payload.withUnsafeBytes { source in
                 guard let destinationAddress = destination.bindMemory(to: UInt8.self).baseAddress,
-                      let sourceAddress = source.bindMemory(to: UInt8.self).baseAddress else {
+                    let sourceAddress = source.bindMemory(to: UInt8.self).baseAddress
+                else {
                     return 0
                 }
                 return compression_decode_buffer(
@@ -297,13 +312,14 @@ enum PDFCompatibilitySanitizer {
             0: "q", 1: "q", 2: "1", 3: "0", 4: "0", 5: "1", 6: "0", 7: "0", 8: "cm",
             9: "0", 10: "0", 11: "m", 12: "0", 14: "l", 17: "l", 19: "0", 20: "l", 21: "h",
             22: "/OV1", 23: "gs", 24: "/DeviceRGB", 25: "cs", 26: "1", 27: "1", 28: "1", 29: "scn",
-            30: "/Gs1", 31: "gs", 32: "f", 33: "Q", 34: "Q"
+            30: "/Gs1", 31: "gs", 32: "f", 33: "Q", 34: "Q",
         ]
         guard fixed.allSatisfy({ tokens[$0.key] == $0.value }),
-              let height1 = Double(tokens[13]),
-              let width1 = Double(tokens[15]),
-              let height2 = Double(tokens[16]),
-              let width2 = Double(tokens[18]) else {
+            let height1 = Double(tokens[13]),
+            let width1 = Double(tokens[15]),
+            let height2 = Double(tokens[16]),
+            let width2 = Double(tokens[18])
+        else {
             return false
         }
 
@@ -381,9 +397,19 @@ final class PDFRenderDocument: @unchecked Sendable {
         } ?? .zero
     }
 
-    func drawPage(at index: Int, in rect: CGRect, context: CGContext) {
+    func drawPage(
+        at index: Int,
+        in rect: CGRect,
+        context: CGContext,
+        fillsBackground: Bool = true
+    ) {
         withPage(at: index) { page in
-            PDFPageRenderer.draw(page: page, in: rect, context: context)
+            PDFPageRenderer.draw(
+                page: page,
+                in: rect,
+                context: context,
+                fillsBackground: fillsBackground
+            )
         }
     }
 
@@ -440,7 +466,8 @@ struct PDFLoadService: Sendable {
         from result: Result,
         at index: Int,
         targetSize: CGSize,
-        scale: CGFloat
+        scale: CGFloat,
+        fillsBackground: Bool = true
     ) -> UIImage? {
         guard
             targetSize.width.isFinite,
@@ -453,12 +480,13 @@ struct PDFLoadService: Sendable {
 
         let format = UIGraphicsImageRendererFormat.default()
         format.scale = max(1, scale)
-        format.opaque = true
+        format.opaque = fillsBackground
         return UIGraphicsImageRenderer(size: targetSize, format: format).image { rendererContext in
             result.document.drawPage(
                 at: index,
                 in: CGRect(origin: .zero, size: targetSize),
-                context: rendererContext.cgContext
+                context: rendererContext.cgContext,
+                fillsBackground: fillsBackground
             )
         }
     }
@@ -488,7 +516,8 @@ enum PDFPageRenderer {
     static func validBounds(for page: CGPDFPage) -> CGRect {
         let cropBounds = page.getBoxRect(.cropBox)
         if cropBounds.width.isFinite, cropBounds.height.isFinite,
-           cropBounds.width > 0, cropBounds.height > 0 {
+            cropBounds.width > 0, cropBounds.height > 0
+        {
             return cropBounds
         }
         let mediaBounds = page.getBoxRect(.mediaBox)
@@ -516,7 +545,12 @@ enum PDFPageRenderer {
         return CGRect(origin: .zero, size: bounds.size)
     }
 
-    static func draw(page: CGPDFPage, in rect: CGRect, context: CGContext) {
+    static func draw(
+        page: CGPDFPage,
+        in rect: CGRect,
+        context: CGContext,
+        fillsBackground: Bool = true
+    ) {
         guard
             rect.width.isFinite,
             rect.height.isFinite,
@@ -525,8 +559,10 @@ enum PDFPageRenderer {
         else { return }
 
         context.saveGState()
-        context.setFillColor(gray: 1, alpha: 1)
-        context.fill(rect)
+        if fillsBackground {
+            context.setFillColor(gray: 1, alpha: 1)
+            context.fill(rect)
+        }
 
         // UIKit contexts are Y-down while PDF contexts are Y-up. Reflect only the
         // destination page rectangle, then let Core Graphics account for crop-box
@@ -535,19 +571,22 @@ enum PDFPageRenderer {
         context.scaleBy(x: 1, y: -1)
         let cropBounds = page.getBoxRect(.cropBox)
         let mediaBounds = page.getBoxRect(.mediaBox)
-        let box: CGPDFBox? = if cropBounds.width.isFinite,
-                                cropBounds.height.isFinite,
-                                cropBounds.width > 0,
-                                cropBounds.height > 0 {
-            .cropBox
-        } else if mediaBounds.width.isFinite,
-                  mediaBounds.height.isFinite,
-                  mediaBounds.width > 0,
-                  mediaBounds.height > 0 {
-            .mediaBox
-        } else {
-            nil
-        }
+        let box: CGPDFBox? =
+            if cropBounds.width.isFinite,
+                cropBounds.height.isFinite,
+                cropBounds.width > 0,
+                cropBounds.height > 0
+            {
+                .cropBox
+            } else if mediaBounds.width.isFinite,
+                mediaBounds.height.isFinite,
+                mediaBounds.width > 0,
+                mediaBounds.height > 0
+            {
+                .mediaBox
+            } else {
+                nil
+            }
         guard let box else {
             context.restoreGState()
             return

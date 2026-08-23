@@ -35,6 +35,9 @@ protocol SettingsRepositoryProtocol: Sendable {
     func getWebDAVPassword() -> String?
     func setWebDAVPassword(_ value: String)
 
+    func getWebDAVBackupIntervalMinutes() -> Int
+    func setWebDAVBackupIntervalMinutes(_ value: Int)
+
     func testWebDAVConnection(url: String, username: String, password: String) async -> Bool
 
     func backupAllJots() -> AsyncStream<Double>
@@ -82,6 +85,19 @@ struct SettingsRepository: SettingsRepositoryProtocol {
 
     func getWebDAVPassword() -> String? { defaultsService.getValue(.webDAVPassword) }
     func setWebDAVPassword(_ value: String) { defaultsService.set(.webDAVPassword, value: value) }
+
+    func getWebDAVBackupIntervalMinutes() -> Int {
+        WebDAVAutoBackupPolicy.normalizedIntervalMinutes(
+            defaultsService.getValue(.webDAVBackupIntervalMinutes)
+        )
+    }
+
+    func setWebDAVBackupIntervalMinutes(_ value: Int) {
+        defaultsService.set(
+            .webDAVBackupIntervalMinutes,
+            value: WebDAVAutoBackupPolicy.normalizedIntervalMinutes(value)
+        )
+    }
 
     func testWebDAVConnection(url: String, username: String, password: String) async -> Bool {
         guard !url.isEmpty, let baseURL = URL(string: url) else { return false }

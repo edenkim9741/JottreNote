@@ -190,11 +190,44 @@ struct LocalFileService: FileServiceProtocol {
     }
 
     func removeFile(fileURL: URL) throws {
-        try fileManager.removeItem(at: fileURL)
+        let coordinator = NSFileCoordinator()
+        var error: NSError?
+        var result: Result<Void, Error>?
+        coordinator.coordinate(
+            writingItemAt: fileURL,
+            options: .forDeleting,
+            error: &error
+        ) { coordinatedURL in
+            result = Result(catching: {
+                try fileManager.removeItem(at: coordinatedURL)
+            })
+        }
+        if let error { throw error }
+        guard let result else { throw Failure.couldNotWriteFileContents }
+        try result.get()
     }
 
     func moveFile(fileURL: URL, newFileURL: URL) throws {
-        try fileManager.moveItem(at: fileURL, to: newFileURL)
+        let coordinator = NSFileCoordinator()
+        var error: NSError?
+        var result: Result<Void, Error>?
+        coordinator.coordinate(
+            writingItemAt: fileURL,
+            options: .forMoving,
+            writingItemAt: newFileURL,
+            options: [],
+            error: &error
+        ) { coordinatedSourceURL, coordinatedDestinationURL in
+            result = Result(catching: {
+                try fileManager.moveItem(
+                    at: coordinatedSourceURL,
+                    to: coordinatedDestinationURL
+                )
+            })
+        }
+        if let error { throw error }
+        guard let result else { throw Failure.couldNotWriteFileContents }
+        try result.get()
     }
 
     func duplicateFile(fileURL: URL) throws -> URL {

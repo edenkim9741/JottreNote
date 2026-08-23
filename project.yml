@@ -83,6 +83,10 @@ targets:
         NSQuitAlwaysKeepsWindows: true
         NSUserActivityTypes:
           - com.edenkim.jottre.openJot
+        BGTaskSchedulerPermittedIdentifiers:
+          - com.edenkim.jottre.webdav-auto-backup
+        UIBackgroundModes:
+          - processing
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: true
           UISceneConfigurations:

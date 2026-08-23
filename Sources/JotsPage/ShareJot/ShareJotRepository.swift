@@ -68,7 +68,8 @@ struct ShareJotRepository: ShareJotRepositoryProtocol {
             drawing: drawing,
             background: background,
             format: format,
-            url: temporaryDirectory
+            url:
+                temporaryDirectory
                 .appendingPathComponent(jotFileInfo.name)
                 .appendingPathExtension(format.fileExtension)
         )
@@ -111,6 +112,7 @@ struct ShareJotRepository: ShareJotRepositoryProtocol {
     ) throws -> URL {
         let pageBounds = CGRect(origin: .zero, size: background.pageSize)
         let renderer = UIGraphicsPDFRenderer(bounds: pageBounds)
+        let layers = JotDrawingLayerPartition(drawing: drawing)
 
         // Stream pages straight to disk. `pdfData` retained the whole output plus
         // every autoreleased page bitmap and could terminate the app on long notes.
@@ -118,7 +120,7 @@ struct ShareJotRepository: ShareJotRepositoryProtocol {
             for pageIndex in 0..<background.totalPages {
                 autoreleasepool {
                     rendererContext.beginPage()
-                    renderPageBackground(
+                    renderPageFoundation(
                         background,
                         logicalPageIndex: pageIndex,
                         in: pageBounds,
@@ -132,8 +134,20 @@ struct ShareJotRepository: ShareJotRepositoryProtocol {
                         width: background.pageSize.width,
                         height: background.pageSize.height
                     )
+                    renderPDFContent(
+                        background,
+                        logicalPageIndex: pageIndex,
+                        in: pageBounds,
+                        context: rendererContext.cgContext
+                    )
                     renderVectorInk(
-                        drawing: drawing,
+                        drawing: layers.highlighter,
+                        canvasRect: canvasRect,
+                        pageBounds: pageBounds,
+                        context: rendererContext.cgContext
+                    )
+                    renderVectorInk(
+                        drawing: layers.foreground,
                         canvasRect: canvasRect,
                         pageBounds: pageBounds,
                         context: rendererContext.cgContext
@@ -153,6 +167,7 @@ struct ShareJotRepository: ShareJotRepositoryProtocol {
         format: ShareFormat,
         url: URL
     ) throws -> URL {
+        let layers = JotDrawingLayerPartition(drawing: drawing)
         let rect = CGRect(
             x: 0,
             y: 0,
@@ -176,18 +191,34 @@ struct ShareJotRepository: ShareJotRepositoryProtocol {
                         width: background.pageSize.width,
                         height: background.pageSize.height
                     )
-                    renderPageBackground(
+                    renderPageFoundation(
                         background,
                         logicalPageIndex: pageIndex,
                         in: pageRect,
                         context: rendererContext.cgContext
                     )
-                    let drawingImage = renderDrawingImage(
-                        drawing: drawing,
+                    renderPDFContent(
+                        background,
+                        logicalPageIndex: pageIndex,
+                        in: pageRect,
+                        context: rendererContext.cgContext
+                    )
+                    let highlighterImage = renderDrawingImage(
+                        drawing: layers.highlighter,
                         rect: pageRect,
                         scale: rendererFormat.scale
                     )
-                    drawingImage.draw(in: pageRect)
+                    highlighterImage.draw(
+                        in: pageRect,
+                        blendMode: .multiply,
+                        alpha: 1
+                    )
+                    let foregroundImage = renderDrawingImage(
+                        drawing: layers.foreground,
+                        rect: pageRect,
+                        scale: rendererFormat.scale
+                    )
+                    foregroundImage.draw(in: pageRect)
                 }
             }
         }
@@ -271,20 +302,37 @@ struct ShareJotRepository: ShareJotRepositoryProtocol {
     }
 
     @MainActor
-    private func renderPageBackground(
+    private func renderPageFoundation(
         _ background: Background,
         logicalPageIndex: Int,
         in rect: CGRect,
         context: CGContext
     ) {
-        if
-            let document = background.document,
-            let pageIndex = background.pdfPageIndex(at: logicalPageIndex)
-        {
-            document.drawPage(at: pageIndex, in: rect, context: context)
+        if background.pdfPageIndex(at: logicalPageIndex) != nil {
+            context.setFillColor(gray: 1, alpha: 1)
+            context.fill(rect)
         } else {
             drawRuledPage(in: rect, context: context)
         }
+    }
+
+    @MainActor
+    private func renderPDFContent(
+        _ background: Background,
+        logicalPageIndex: Int,
+        in rect: CGRect,
+        context: CGContext
+    ) {
+        guard
+            let document = background.document,
+            let pageIndex = background.pdfPageIndex(at: logicalPageIndex)
+        else { return }
+        document.drawPage(
+            at: pageIndex,
+            in: rect,
+            context: context,
+            fillsBackground: false
+        )
     }
 
     @MainActor
@@ -396,7 +444,8 @@ struct ShareJotRepository: ShareJotRepositoryProtocol {
         }
 
         guard !path.isEmpty else { return nil }
-        let opacity = opacitySampleCount > 0
+        let opacity =
+            opacitySampleCount > 0
             ? max(0, min(1, opacityTotal / CGFloat(opacitySampleCount)))
             : 1
         return VectorInkPath(path: path, opacity: opacity)
@@ -411,10 +460,12 @@ struct ShareJotRepository: ShareJotRepositoryProtocol {
     ) {
         let samples = points.compactMap { point -> (location: CGPoint, radius: CGFloat)? in
             guard point.location.x.isFinite, point.location.y.isFinite else { return nil }
-            let radius = CGFloat(max(
-                Double(Constants.minimumVectorInkRadius),
-                max(abs(point.size.width), abs(point.size.height)) * 0.5
-            ))
+            let radius = CGFloat(
+                max(
+                    Double(Constants.minimumVectorInkRadius),
+                    max(abs(point.size.width), abs(point.size.height)) * 0.5
+                )
+            )
             opacityTotal += max(0, min(1, point.opacity))
             opacitySampleCount += 1
             return (point.location, radius)
@@ -422,12 +473,14 @@ struct ShareJotRepository: ShareJotRepositoryProtocol {
         guard let first = samples.first else { return }
 
         if samples.count == 1 {
-            path.addEllipse(in: CGRect(
-                x: first.location.x - first.radius,
-                y: first.location.y - first.radius,
-                width: first.radius * 2,
-                height: first.radius * 2
-            ))
+            path.addEllipse(
+                in: CGRect(
+                    x: first.location.x - first.radius,
+                    y: first.location.y - first.radius,
+                    width: first.radius * 2,
+                    height: first.radius * 2
+                )
+            )
             return
         }
 
@@ -438,23 +491,30 @@ struct ShareJotRepository: ShareJotRepositoryProtocol {
 
         for index in samples.indices {
             let previous = samples[index > samples.startIndex ? samples.index(before: index) : index].location
-            let next = samples[index < samples.index(before: samples.endIndex)
-                ? samples.index(after: index)
-                : index].location
+            let next = samples[
+                index < samples.index(before: samples.endIndex)
+                    ? samples.index(after: index)
+                    : index
+            ].location
             let tangent = CGPoint(x: next.x - previous.x, y: next.y - previous.y)
             let length = hypot(tangent.x, tangent.y)
-            let normal = length > 0.0001
+            let normal =
+                length > 0.0001
                 ? CGPoint(x: -tangent.y / length, y: tangent.x / length)
                 : CGPoint(x: 0, y: 1)
             let sample = samples[index]
-            leftEdge.append(CGPoint(
-                x: sample.location.x + normal.x * sample.radius,
-                y: sample.location.y + normal.y * sample.radius
-            ))
-            rightEdge.append(CGPoint(
-                x: sample.location.x - normal.x * sample.radius,
-                y: sample.location.y - normal.y * sample.radius
-            ))
+            leftEdge.append(
+                CGPoint(
+                    x: sample.location.x + normal.x * sample.radius,
+                    y: sample.location.y + normal.y * sample.radius
+                )
+            )
+            rightEdge.append(
+                CGPoint(
+                    x: sample.location.x - normal.x * sample.radius,
+                    y: sample.location.y - normal.y * sample.radius
+                )
+            )
         }
 
         path.move(to: leftEdge[0])
@@ -467,12 +527,14 @@ struct ShareJotRepository: ShareJotRepositoryProtocol {
         path.closeSubpath()
 
         for sample in [first, samples[samples.index(before: samples.endIndex)]] {
-            path.addEllipse(in: CGRect(
-                x: sample.location.x - sample.radius,
-                y: sample.location.y - sample.radius,
-                width: sample.radius * 2,
-                height: sample.radius * 2
-            ))
+            path.addEllipse(
+                in: CGRect(
+                    x: sample.location.x - sample.radius,
+                    y: sample.location.y - sample.radius,
+                    width: sample.radius * 2,
+                    height: sample.radius * 2
+                )
+            )
         }
     }
 
@@ -483,9 +545,9 @@ struct ShareJotRepository: ShareJotRepositoryProtocol {
     }
 }
 
-private extension ShareFormat {
+extension ShareFormat {
 
-    var fileExtension: String {
+    fileprivate var fileExtension: String {
         switch self {
         case .pdf: "pdf"
         case .jpg: "jpg"

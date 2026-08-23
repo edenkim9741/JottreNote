@@ -7,6 +7,7 @@ final class WebDAVSettingsViewController: UIViewController {
         var url: String
         var username: String
         var password: String
+        var backupIntervalMinutes: Int
     }
 
     var onSave: (Configuration) -> Void = { _ in }
@@ -37,6 +38,19 @@ final class WebDAVSettingsViewController: UIViewController {
         field.placeholder = "password"
         field.isSecureTextEntry = true
         field.clearButtonMode = .whileEditing
+        return field
+    }()
+
+    private let backupIntervalField: UITextField = {
+        let field = UITextField()
+        field.placeholder = "0"
+        field.keyboardType = .numberPad
+        field.clearButtonMode = .whileEditing
+        field.textAlignment = .natural
+        field.accessibilityLabel = String(
+            localized: "webdav.backup.interval.accessibilityLabel",
+            defaultValue: "Automatic backup interval in minutes"
+        )
         return field
     }()
 
@@ -88,6 +102,7 @@ final class WebDAVSettingsViewController: UIViewController {
         urlField.text = initial.url
         usernameField.text = initial.username
         passwordField.text = initial.password
+        backupIntervalField.text = String(initial.backupIntervalMinutes)
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -106,7 +121,10 @@ final class WebDAVSettingsViewController: UIViewController {
 
     private func setupNavigationBar() {
         navigationItem.rightBarButtonItem = UIBarButtonItem(
-            title: L10n.Action.done, style: .done, target: self, action: #selector(didTapSave)
+            title: L10n.Action.done,
+            style: .done,
+            target: self,
+            action: #selector(didTapSave)
         )
     }
 
@@ -118,12 +136,13 @@ final class WebDAVSettingsViewController: UIViewController {
         let sections = UIStackView(arrangedSubviews: [
             makeFieldCard(label: "Server URL", field: urlField),
             makeCredentialsCard(),
+            makeBackupIntervalCard(),
             testButton,
             statusLabel,
             makeSectionSeparator(),
             backupAllButton,
             backupProgressView,
-            backupStatusLabel
+            backupStatusLabel,
         ])
         sections.axis = .vertical
         sections.spacing = 16
@@ -138,7 +157,7 @@ final class WebDAVSettingsViewController: UIViewController {
             sections.topAnchor.constraint(equalTo: scrollView.topAnchor, constant: 20),
             sections.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
             sections.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
-            sections.bottomAnchor.constraint(lessThanOrEqualTo: scrollView.bottomAnchor, constant: -20)
+            sections.bottomAnchor.constraint(lessThanOrEqualTo: scrollView.bottomAnchor, constant: -20),
         ])
 
         testButton.addTarget(self, action: #selector(didTapTest), for: .touchUpInside)
@@ -156,7 +175,7 @@ final class WebDAVSettingsViewController: UIViewController {
             separator.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -4),
             separator.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             separator.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            separator.heightAnchor.constraint(equalToConstant: 0.5)
+            separator.heightAnchor.constraint(equalToConstant: 0.5),
         ])
         return container
     }
@@ -174,12 +193,36 @@ final class WebDAVSettingsViewController: UIViewController {
         let passwordTitle = makeLabel(text: "Password")
         let separator = makeSeparator()
         let stack = UIStackView(arrangedSubviews: [
-            usernameTitle, usernameField, separator, passwordTitle, passwordField
+            usernameTitle, usernameField, separator, passwordTitle, passwordField,
         ])
         stack.axis = .vertical
         stack.spacing = 6
         stack.setCustomSpacing(12, after: usernameField)
         stack.setCustomSpacing(12, after: separator)
+        return wrapInCard(stack)
+    }
+
+    private func makeBackupIntervalCard() -> UIView {
+        let title = makeLabel(
+            text: String(
+                localized: "webdav.backup.interval.title",
+                defaultValue: "Automatic Backup Interval (Minutes)"
+            )
+        )
+        let explanation = UILabel()
+        explanation.text = String(
+            localized: "webdav.backup.interval.explanation",
+            defaultValue:
+                "Enter 0 to disable. Backups run at this interval while the app is active; iOS schedules background runs opportunistically."
+        )
+        explanation.font = .systemFont(ofSize: 12)
+        explanation.textColor = .secondaryLabel
+        explanation.numberOfLines = 0
+
+        let stack = UIStackView(arrangedSubviews: [title, backupIntervalField, explanation])
+        stack.axis = .vertical
+        stack.spacing = 6
+        stack.setCustomSpacing(10, after: backupIntervalField)
         return wrapInCard(stack)
     }
 
@@ -209,7 +252,7 @@ final class WebDAVSettingsViewController: UIViewController {
             content.topAnchor.constraint(equalTo: card.topAnchor, constant: 12),
             content.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 16),
             content.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -16),
-            content.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -12)
+            content.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -12),
         ])
         return card
     }
@@ -245,6 +288,10 @@ final class WebDAVSettingsViewController: UIViewController {
         backupStatusLabel.textColor = .secondaryLabel
 
         let configuration = currentConfiguration()
+        // Manual backup uses persisted service configuration. Saving the fields
+        // here keeps Test Connection and Backup All pointed at the same server,
+        // even before the navigation Done button is tapped.
+        onSave(configuration)
         let onTest = onTest
         let onBackupAll = onBackupAll
         backupTask = Task { @MainActor [weak self, configuration, onTest, onBackupAll] in
@@ -291,10 +338,16 @@ final class WebDAVSettingsViewController: UIViewController {
     }
 
     private func currentConfiguration() -> Configuration {
-        Configuration(
+        let intervalText = backupIntervalField.text?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let interval = WebDAVAutoBackupPolicy.normalizedIntervalMinutes(
+            intervalText.flatMap(Int.init)
+        )
+        return Configuration(
             url: urlField.text ?? "",
             username: usernameField.text ?? "",
-            password: passwordField.text ?? ""
+            password: passwordField.text ?? "",
+            backupIntervalMinutes: interval
         )
     }
 }
