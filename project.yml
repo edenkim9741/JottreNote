@@ -119,6 +119,9 @@ targets:
       - target: AppKitPlugin
         embed: true
         codeSign: true
+        # The AppKit bridge is loaded only by the Mac Catalyst code path. Without
+        # this filter Xcode also attempts to compile it for iPhone/iPad simulators.
+        platformFilter: macOS
     packages: []
 
   JottreTests:
