@@ -201,6 +201,35 @@ final class EditJotViewController: UIViewController {
         return gesture
     }()
 
+    /// Prevents PencilKit's internal blank-canvas tap recognizer from creating
+    /// Select All / Insert Space outside lasso mode. Continuous drawing and
+    /// document-navigation gestures always retain priority.
+    private lazy var blankCanvasEditMenuTapGesture: CanvasEditMenuBlockingTapGestureRecognizer = {
+        let gesture = CanvasEditMenuBlockingTapGestureRecognizer(
+            target: self,
+            action: #selector(handleBlankCanvasEditMenuTap(_:))
+        )
+        gesture.name = "Jottre.BlankCanvasEditMenuTapBlocker"
+        gesture.numberOfTapsRequired = 1
+        gesture.numberOfTouchesRequired = 1
+        gesture.cancelsTouchesInView = true
+        gesture.delaysTouchesBegan = false
+        gesture.delaysTouchesEnded = false
+        gesture.requiresExclusiveTouchType = true
+        gesture.delegate = self
+        gesture.canvasRootViews = [canvasView]
+        gesture.pencilKitDrawingGestureRecognizers = [
+            canvasView.drawingGestureRecognizer,
+            highlighterCanvasView.drawingGestureRecognizer,
+        ]
+        #if !targetEnvironment(macCatalyst)
+        gesture.allowedTouchTypes = [
+            NSNumber(value: UITouch.TouchType.direct.rawValue)
+        ]
+        #endif
+        return gesture
+    }()
+
     private lazy var loadingProgressView: UIProgressView = {
         let bar = UIProgressView(progressViewStyle: .bar)
         bar.translatesAutoresizingMaskIntoConstraints = false
@@ -462,6 +491,38 @@ final class EditJotViewController: UIViewController {
     }
 
     @objc
+    private func handleBlankCanvasEditMenuTap(_ gesture: UITapGestureRecognizer) {
+        guard gesture.state == .ended else { return }
+
+        blankEditMenuDismissTask?.cancel()
+        dismissPencilKitEditMenus()
+        blankEditMenuDismissTask = Task { @MainActor [weak self] in
+            // Prevention is the primary path. These passes also close a menu
+            // that an older PencilKit implementation may schedule after the
+            // gesture arbitration callback has returned.
+            // Incremental delays put the third pass just after PencilKit's
+            // deferred single-tap callback on systems that schedule it.
+            for delay in [0, 80, 300, 120, 200] {
+                if delay == 0 {
+                    await Task.yield()
+                } else {
+                    try? await Task.sleep(for: .milliseconds(delay))
+                }
+                guard !Task.isCancelled, let self else { return }
+                dismissPencilKitEditMenus()
+            }
+        }
+    }
+
+    private func dismissPencilKitEditMenus() {
+        inkCanvasCoordinator.activeCanvas.forEachViewInHierarchy { view in
+            for case let interaction as UIEditMenuInteraction in view.interactions {
+                interaction.dismissMenu()
+            }
+        }
+    }
+
+    @objc
     private func applicationDidEnterBackground() {
         guard viewIfLoaded?.window != nil else { return }
         flushPendingDrawingChange()
@@ -667,6 +728,7 @@ final class EditJotViewController: UIViewController {
         doubleTap.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
         #endif
         documentScrollView.addGestureRecognizer(doubleTap)
+        documentScrollView.addGestureRecognizer(blankCanvasEditMenuTapGesture)
         updateCanvasInteraction()
         view.bringSubviewToFront(loadingProgressView)
     }
@@ -1206,6 +1268,45 @@ final class EditJotViewController: UIViewController {
 
 }
 
+// MARK: - Blank Canvas Menu Suppression
+
+extension EditJotViewController: UIGestureRecognizerDelegate {
+
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldReceive touch: UITouch
+    ) -> Bool {
+        guard gestureRecognizer === blankCanvasEditMenuTapGesture else { return true }
+        let activeCanvas = inkCanvasCoordinator.activeCanvas
+        guard let touchedView = touch.view,
+            touchedView === activeCanvas || touchedView.isDescendant(of: activeCanvas)
+        else { return false }
+
+        blankCanvasEditMenuTapGesture.canvasRootViews = [activeCanvas]
+        return CanvasEditMenuSuppressionPolicy.blocksDirectTouch(
+            isEditingEnabled: isEditingEnabled,
+            isLassoTool: activeCanvas.tool is PKLassoTool,
+            routesDirectTouchesToDocumentScroll: updateCanvasTouchRouting()
+        )
+    }
+
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+        guard
+            gestureRecognizer === blankCanvasEditMenuTapGesture
+                || otherGestureRecognizer === blankCanvasEditMenuTapGesture
+        else { return false }
+
+        let companion =
+            gestureRecognizer === blankCanvasEditMenuTapGesture
+            ? otherGestureRecognizer : gestureRecognizer
+        guard let tapGesture = companion as? UITapGestureRecognizer else { return false }
+        return tapGesture.numberOfTapsRequired > 1
+    }
+}
+
 #if !targetEnvironment(macCatalyst)
 // MARK: - PKToolPickerObserver
 
@@ -1236,9 +1337,15 @@ extension EditJotViewController: PKToolPickerObserver {
     }
 
     private func selectedCanvasToolDidChange() {
+        let wasLassoTool = inkCanvasCoordinator.activeCanvas.tool is PKLassoTool
         let selectedTool = toolPicker.selectedTool
         canvasView.tool = selectedTool
         highlighterCanvasView.tool = selectedTool
+
+        blankEditMenuDismissTask?.cancel()
+        if !isEditingEnabled || !wasLassoTool || !(selectedTool is PKLassoTool) {
+            dismissPencilKitEditMenus()
+        }
 
         let nextMode: JotInkCanvasCoordinator.Mode
         if let inkingTool = selectedTool as? PKInkingTool {
@@ -1255,6 +1362,7 @@ extension EditJotViewController: PKToolPickerObserver {
             commitCanvasDrawing()
         }
         inkCanvasCoordinator.transition(to: nextMode)
+        blankCanvasEditMenuTapGesture.canvasRootViews = [inkCanvasCoordinator.activeCanvas]
         updateCanvasInteraction()
         updateCanvasTouchRouting()
     }
@@ -1517,6 +1625,16 @@ extension EditJotViewController {
     }
 }
 
+extension UIView {
+
+    fileprivate func forEachViewInHierarchy(_ operation: (UIView) -> Void) {
+        operation(self)
+        for subview in subviews {
+            subview.forEachViewInHierarchy(operation)
+        }
+    }
+}
+
 // MARK: - UIColor hex
 
 extension UIColor {
@@ -1636,6 +1754,91 @@ extension EditJotViewController: PKCanvasViewDelegate {
 }
 
 // MARK: - JotCanvasView
+
+/// Wins only against PencilKit's transient single-tap recognizers. Continuous
+/// drawing, lasso, scroll, and zoom gestures retain priority and can make this
+/// recognizer fail as soon as a touch starts moving.
+@MainActor
+private final class CanvasEditMenuBlockingTapGestureRecognizer: UITapGestureRecognizer {
+
+    var canvasRootViews: [UIView] = []
+    var pencilKitDrawingGestureRecognizers: [UIGestureRecognizer] = []
+
+    override func canPrevent(_ preventedGestureRecognizer: UIGestureRecognizer) -> Bool {
+        if isContinuousGesture(preventedGestureRecognizer) {
+            return false
+        }
+        if isSingleTap(preventedGestureRecognizer)
+            && belongsToCanvasHierarchy(preventedGestureRecognizer)
+        {
+            return true
+        }
+        return super.canPrevent(preventedGestureRecognizer)
+    }
+
+    override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool {
+        if isContinuousGesture(preventingGestureRecognizer) {
+            return true
+        }
+        if isSingleTap(preventingGestureRecognizer)
+            && belongsToCanvasHierarchy(preventingGestureRecognizer)
+        {
+            return false
+        }
+        return super.canBePrevented(by: preventingGestureRecognizer)
+    }
+
+    override func shouldBeRequiredToFail(
+        by otherGestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+        super.shouldBeRequiredToFail(by: otherGestureRecognizer)
+            || (isSingleTap(otherGestureRecognizer)
+                && belongsToCanvasHierarchy(otherGestureRecognizer))
+    }
+
+    private func isContinuousGesture(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        CanvasEditMenuGestureArbitration.isContinuous(
+            gestureRecognizer,
+            drawingGestureRecognizers: pencilKitDrawingGestureRecognizers
+        )
+    }
+
+    private func isSingleTap(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        guard let tapGesture = gestureRecognizer as? UITapGestureRecognizer else { return false }
+        return tapGesture.numberOfTapsRequired == 1
+            && tapGesture.numberOfTouchesRequired == 1
+    }
+
+    private func belongsToCanvasHierarchy(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        CanvasEditMenuGestureArbitration.belongsToCanvasHierarchy(
+            gestureRecognizer,
+            roots: canvasRootViews
+        )
+    }
+}
+
+@MainActor
+private enum CanvasEditMenuGestureArbitration {
+
+    static func isContinuous(
+        _ gestureRecognizer: UIGestureRecognizer,
+        drawingGestureRecognizers: [UIGestureRecognizer]
+    ) -> Bool {
+        drawingGestureRecognizers.contains { $0 === gestureRecognizer }
+            || gestureRecognizer is UIPanGestureRecognizer
+            || gestureRecognizer is UIPinchGestureRecognizer
+    }
+
+    static func belongsToCanvasHierarchy(
+        _ gestureRecognizer: UIGestureRecognizer,
+        roots: [UIView]
+    ) -> Bool {
+        guard let gestureView = gestureRecognizer.view else { return false }
+        return roots.contains { rootView in
+            gestureView === rootView || gestureView.isDescendant(of: rootView)
+        }
+    }
+}
 
 private final class JotCanvasView: PKCanvasView {
     // Keep PencilKit's selection interaction lifecycle intact. In particular,

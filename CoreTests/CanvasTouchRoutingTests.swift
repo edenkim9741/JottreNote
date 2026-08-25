@@ -24,6 +24,46 @@ import XCTest
 
 final class CanvasTouchRoutingTests: XCTestCase {
 
+    func testNonLassoDirectTouchIsBlockedFromPencilKitMenu() {
+        XCTAssertTrue(
+            CanvasEditMenuSuppressionPolicy.blocksDirectTouch(
+                isEditingEnabled: true,
+                isLassoTool: false,
+                routesDirectTouchesToDocumentScroll: true
+            )
+        )
+    }
+
+    func testLassoDirectTouchRemainsNative() {
+        XCTAssertFalse(
+            CanvasEditMenuSuppressionPolicy.blocksDirectTouch(
+                isEditingEnabled: true,
+                isLassoTool: true,
+                routesDirectTouchesToDocumentScroll: true
+            )
+        )
+    }
+
+    func testViewOnlyDirectTouchDoesNotNeedMenuBlocker() {
+        XCTAssertFalse(
+            CanvasEditMenuSuppressionPolicy.blocksDirectTouch(
+                isEditingEnabled: false,
+                isLassoTool: false,
+                routesDirectTouchesToDocumentScroll: true
+            )
+        )
+    }
+
+    func testFingerDrawingDirectTouchDoesNotUseMenuBlocker() {
+        XCTAssertFalse(
+            CanvasEditMenuSuppressionPolicy.blocksDirectTouch(
+                isEditingEnabled: true,
+                isLassoTool: false,
+                routesDirectTouchesToDocumentScroll: false
+            )
+        )
+    }
+
     @MainActor
     func testPencilOnlyEditingRoutesOneFingerToDocumentPan() {
         let configuration = CanvasTouchRouting.configuration(

@@ -121,6 +121,20 @@ enum CanvasTouchRouting {
     }
 }
 
+/// Decides whether a direct single tap should be kept away from PencilKit's
+/// blank-canvas edit-menu recognizer. Lasso and finger-drawing modes remain
+/// entirely native so selection, manipulation, and dot input are unaffected.
+enum CanvasEditMenuSuppressionPolicy {
+
+    static func blocksDirectTouch(
+        isEditingEnabled: Bool,
+        isLassoTool: Bool,
+        routesDirectTouchesToDocumentScroll: Bool
+    ) -> Bool {
+        isEditingEnabled && !isLassoTool && routesDirectTouchesToDocumentScroll
+    }
+}
+
 /// Keeps a direct-touch navigation pan from being preempted by transient
 /// PencilKit selection recognizers.
 ///
