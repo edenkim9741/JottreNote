@@ -362,32 +362,52 @@ enum PDFCompatibilitySanitizer {
     }
 }
 
-/// Immutable Core Graphics PDF storage used by both the main thread and
-/// `CATiledLayer`'s background rendering threads. Core Graphics can ask a tiled
-/// layer to draw several tiles concurrently, so access to a document is
-/// serialized here rather than leaking a queue-bound PDFKit object into those
-/// callbacks.
+/// Immutable Core Graphics PDF storage used by metadata readers, exporters and
+/// background page rasterization. Each render slot owns an independent
+/// `CGPDFDocument`, allowing a small amount of safe parallelism without sharing
+/// one Core Graphics document across drawing threads.
 final class PDFRenderDocument: @unchecked Sendable {
 
-    private let document: CGPDFDocument
-    private let lock = NSLock()
+    private final class RenderSlot {
+        let document: CGPDFDocument
+        let lock = NSLock()
+
+        init(document: CGPDFDocument) {
+            self.document = document
+        }
+    }
+
+    private let renderSlots: [RenderSlot]
+    private let renderSlotSelectionLock = NSLock()
+    private var nextRenderSlotIndex = 0
+    private let storedPageCount: Int
 
     var pageCount: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return document.numberOfPages
+        storedPageCount
     }
 
     init?(data: Data) {
         let compatibleData = PDFCompatibilitySanitizer.removingRedundantOpaqueSoftMasks(from: data)
-        guard
-            !compatibleData.isEmpty,
-            let provider = CGDataProvider(data: compatibleData as CFData),
-            let document = CGPDFDocument(provider),
-            document.numberOfPages > 0,
-            document.isUnlocked
-        else { return nil }
-        self.document = document
+        guard !compatibleData.isEmpty else { return nil }
+
+        // Core Graphics does not guarantee that one CGPDFDocument can render
+        // multiple pages concurrently. Keep a small pool of independent
+        // documents instead: nearby page bitmaps can be prepared in parallel
+        // without serializing every draw behind a single document lock.
+        let renderSlotCount = min(3, max(2, ProcessInfo.processInfo.activeProcessorCount / 2))
+        var slots: [RenderSlot] = []
+        for _ in 0..<renderSlotCount {
+            guard
+                let provider = CGDataProvider(data: compatibleData as CFData),
+                let document = CGPDFDocument(provider),
+                document.numberOfPages > 0,
+                document.isUnlocked
+            else { continue }
+            slots.append(RenderSlot(document: document))
+        }
+        guard let firstDocument = slots.first?.document else { return nil }
+        renderSlots = slots
+        storedPageCount = firstDocument.numberOfPages
     }
 
     /// Jottre uses zero-based page indices; Core Graphics PDF pages are one-based.
@@ -415,11 +435,29 @@ final class PDFRenderDocument: @unchecked Sendable {
 
     @discardableResult
     private func withPage<T>(at index: Int, _ operation: (CGPDFPage) -> T) -> T? {
-        guard index >= 0 else { return nil }
-        lock.lock()
-        defer { lock.unlock() }
-        guard index < document.numberOfPages else { return nil }
-        guard let page = document.page(at: index + 1) else { return nil }
+        guard index >= 0, index < storedPageCount else { return nil }
+
+        renderSlotSelectionLock.lock()
+        let startingIndex = nextRenderSlotIndex
+        nextRenderSlotIndex = (nextRenderSlotIndex + 1) % renderSlots.count
+        renderSlotSelectionLock.unlock()
+
+        // Prefer an idle renderer. If every slot is busy, wait on the next
+        // round-robin slot so work remains bounded and fairly distributed.
+        for offset in 0..<renderSlots.count {
+            let slot = renderSlots[(startingIndex + offset) % renderSlots.count]
+            guard slot.lock.try() else { continue }
+            defer { slot.lock.unlock() }
+            guard !Task.isCancelled else { return nil }
+            guard let page = slot.document.page(at: index + 1) else { return nil }
+            return operation(page)
+        }
+
+        let slot = renderSlots[startingIndex]
+        slot.lock.lock()
+        defer { slot.lock.unlock() }
+        guard !Task.isCancelled else { return nil }
+        guard let page = slot.document.page(at: index + 1) else { return nil }
         return operation(page)
     }
 }
