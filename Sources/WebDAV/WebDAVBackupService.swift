@@ -332,8 +332,9 @@ struct WebDAVBackupService: Sendable {
         return "\(folder)/\(fileName)"
     }
 
-    // Runs in background — UIGraphicsPDFRenderer and PKDrawing.image(from:scale:) are safe
-    // to call from background contexts because they operate on thread-local graphics contexts.
+    // Runs in background — UIGraphicsPDFRenderer and the Core Graphics drawing
+    // it wraps are safe off the main thread because they operate on
+    // thread-local graphics contexts.
     private func makePDF(
         drawing: PKDrawing,
         pdfData: Data?,
@@ -387,17 +388,20 @@ struct WebDAVBackupService: Sendable {
                                 fillsBackground: false
                             )
                         }
-                        if let cgImage = layers.highlighter.image(from: canvasRect, scale: 2).cgImage {
-                            embedCGImage(
-                                cgImage,
-                                in: pageBounds,
-                                blendMode: .multiply,
-                                cgContext: context.cgContext
-                            )
-                        }
-                        if let cgImage = layers.foreground.image(from: canvasRect, scale: 2).cgImage {
-                            embedCGImage(cgImage, in: pageBounds, cgContext: context.cgContext)
-                        }
+                        // Ink is written as vector paths so a backup reopened at
+                        // any zoom stays as sharp as the editor.
+                        VectorInkRenderer.draw(
+                            drawing: layers.highlighter,
+                            canvasRect: canvasRect,
+                            pageBounds: pageBounds,
+                            context: context.cgContext
+                        )
+                        VectorInkRenderer.draw(
+                            drawing: layers.foreground,
+                            canvasRect: canvasRect,
+                            pageBounds: pageBounds,
+                            context: context.cgContext
+                        )
                     }
                 }
             }
@@ -453,23 +457,6 @@ struct WebDAVBackupService: Sendable {
             logicalToPDFPage: logicalToPDFPage,
             totalPages: max(1, totalPages)
         )
-    }
-
-    // UIImage.draw(in:) in a PDF context downsizes to 1× (context scale = 1.0).
-    // Drawing the CGImage directly bypasses UIKit's scale reduction and embeds
-    // the full-resolution pixels. The Y-flip corrects for UIKit's Y-down CTM.
-    private func embedCGImage(
-        _ cgImage: CGImage,
-        in rect: CGRect,
-        blendMode: CGBlendMode = .normal,
-        cgContext: CGContext
-    ) {
-        cgContext.saveGState()
-        cgContext.setBlendMode(blendMode)
-        cgContext.translateBy(x: 0, y: rect.height)
-        cgContext.scaleBy(x: 1, y: -1)
-        cgContext.draw(cgImage, in: CGRect(x: 0, y: 0, width: rect.width, height: rect.height))
-        cgContext.restoreGState()
     }
 
     private func drawRuledPage(in pageRect: CGRect, cgContext: CGContext) {

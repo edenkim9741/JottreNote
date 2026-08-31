@@ -88,4 +88,102 @@ final class PageRasterizationPolicyTests: XCTestCase {
 
         XCTAssertEqual(range, 0...3)
     }
+
+    // MARK: - Detail requests
+
+    func testNoDetailRequestWhenWholePageBitmapAlreadyResolvesEveryPixel() {
+        let pageSize = CGSize(width: 1_200, height: 1_600)
+
+        XCTAssertNil(
+            PageRasterizationPolicy.detailRequest(
+                visiblePageRect: CGRect(x: 0, y: 0, width: 1_200, height: 900),
+                pageSize: pageSize,
+                zoomScale: 1,
+                displayScale: 2,
+                baseScale: 2
+            )
+        )
+    }
+
+    func testDetailRequestRaisesResolutionForZoomedViewport() throws {
+        let pageSize = CGSize(width: 1_200, height: 1_600)
+        let visibleRect = CGRect(x: 400, y: 400, width: 300, height: 400)
+
+        let request = try XCTUnwrap(
+            PageRasterizationPolicy.detailRequest(
+                visiblePageRect: visibleRect,
+                pageSize: pageSize,
+                zoomScale: 4,
+                displayScale: 2,
+                baseScale: 2
+            )
+        )
+
+        XCTAssertEqual(request.scale, 8)
+        // The rendered region is padded so small scrolls reuse the same bitmap.
+        XCTAssertTrue(request.sourceRect.contains(visibleRect))
+    }
+
+    func testDetailRequestStaysInsidePageBounds() throws {
+        let pageSize = CGSize(width: 1_200, height: 1_600)
+
+        let request = try XCTUnwrap(
+            PageRasterizationPolicy.detailRequest(
+                visiblePageRect: CGRect(x: -200, y: -200, width: 600, height: 600),
+                pageSize: pageSize,
+                zoomScale: 4,
+                displayScale: 2,
+                baseScale: 2
+            )
+        )
+
+        XCTAssertTrue(CGRect(origin: .zero, size: pageSize).contains(request.sourceRect))
+    }
+
+    func testDetailRequestBoundsPixelBudgetForLargeViewport() throws {
+        let pageSize = CGSize(width: 1_200, height: 1_600)
+
+        let request = try XCTUnwrap(
+            PageRasterizationPolicy.detailRequest(
+                visiblePageRect: CGRect(origin: .zero, size: pageSize),
+                pageSize: pageSize,
+                zoomScale: 8,
+                displayScale: 2,
+                baseScale: 2
+            )
+        )
+
+        XCTAssertGreaterThan(request.scale, 2)
+        let pixels =
+            request.sourceRect.width * request.scale
+            * request.sourceRect.height * request.scale
+        XCTAssertLessThanOrEqual(pixels, PageRasterizationPolicy.maximumDetailPixels + 1)
+    }
+
+    // MARK: - Ink density
+
+    func testInkContentScaleFollowsZoomAndIsCapped() {
+        XCTAssertEqual(
+            PageRasterizationPolicy.inkContentScale(zoomScale: 0.5, displayScale: 2),
+            2
+        )
+        XCTAssertEqual(
+            PageRasterizationPolicy.inkContentScale(zoomScale: 3, displayScale: 2),
+            6
+        )
+        XCTAssertEqual(
+            PageRasterizationPolicy.inkContentScale(zoomScale: 8, displayScale: 3),
+            PageRasterizationPolicy.maximumInkContentScale
+        )
+    }
+
+    func testInkViewportOverscanShrinksAsZoomGrows() {
+        let atFit = PageRasterizationPolicy.inkViewportOverscan(zoomScale: 1)
+        let midZoom = PageRasterizationPolicy.inkViewportOverscan(zoomScale: 3)
+        let deepZoom = PageRasterizationPolicy.inkViewportOverscan(zoomScale: 8)
+
+        XCTAssertGreaterThan(atFit, midZoom)
+        XCTAssertGreaterThan(midZoom, deepZoom)
+        XCTAssertGreaterThan(deepZoom, 0)
+    }
 }

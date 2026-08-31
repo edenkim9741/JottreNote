@@ -32,9 +32,6 @@ final class EditJotViewController: UIViewController {
         enum CanvasView {
             static let maximumZoomScale = CGFloat(8)
             static let bottomFreespace = CGFloat(500)
-            /// Keeps PencilKit's live viewport larger than the screen so a
-            /// normal scroll does not relayout both ink canvases every frame.
-            static let inkViewportOverscan = CGFloat(1)
             /// Viewport-only breathing room above the first page. This is a
             /// scroll inset, so it never changes document or export coordinates.
             static let topWritingFreespace = CGFloat(64)
@@ -168,6 +165,11 @@ final class EditJotViewController: UIViewController {
     private var hasPendingDrawingChange = false
     private var documentContentSize = CGSize.zero
     private var allocatedInkDocumentRect = CGRect.null
+    private var isZoomInteractionActive = false
+    /// Backing-store density currently applied to both ink canvases. Raising it
+    /// forces PencilKit to re-tessellate its vector strokes, which is too costly
+    /// to do on every frame of a pinch, so it only follows a settled zoom.
+    private var appliedInkContentScale = CGFloat.zero
     private var zoomSettleTask: Task<Void, Never>?
     private var blankEditMenuDismissTask: Task<Void, Never>?
     private var applicationBackgroundFlushTask: Task<Void, Never>?
@@ -1040,6 +1042,7 @@ final class EditJotViewController: UIViewController {
             ? scales.fitLongEdge
             : scales.fillShortEdge
 
+        isZoomInteractionActive = true
         backgroundView.setZoomInteractionActive(true)
         documentScrollView.setZoomScale(targetScale, animated: true)
         scheduleZoomSettling()
@@ -1070,7 +1073,13 @@ final class EditJotViewController: UIViewController {
 
     /// Keeps a buffered PencilKit viewport in the same document coordinates as
     /// the PDF. `documentScrollView` is the sole zoom owner; the nested canvases
-    /// always stay at 1x and are only cropped to this allocation for performance.
+    /// always stay at `zoomScale` 1 and are only cropped to this allocation for
+    /// performance.
+    ///
+    /// The canvases do, however, follow the zoom through `contentScaleFactor`.
+    /// PencilKit stores ink as vector strokes and re-tessellates them for the
+    /// backing store it is given, so raising that density is what keeps strokes
+    /// smooth instead of letting Core Animation magnify a 1x rasterization.
     private func updateVisibleInkRegion(force: Bool = false) {
         guard
             canvasView.superview != nil,
@@ -1087,11 +1096,25 @@ final class EditJotViewController: UIViewController {
             documentScrollView.bounds,
             to: documentContainerView
         )
+        // Re-tessellating strokes mid-pinch would stall the gesture. Hold the
+        // previous density until the zoom settles; Core Animation covers the
+        // intermediate frames by scaling the existing backing store.
+        let inkContentScale: CGFloat
+        if isZoomInteractionActive, appliedInkContentScale > 0 {
+            inkContentScale = appliedInkContentScale
+        } else {
+            inkContentScale = PageRasterizationPolicy.inkContentScale(
+                zoomScale: documentScrollView.zoomScale,
+                displayScale: max(1, traitCollection.displayScale)
+            )
+        }
         guard
             let proposedLayout = InkViewportLayout.make(
                 visibleDocumentRect: requestedVisibleRect,
                 documentSize: documentContentSize,
-                overscan: Constants.CanvasView.inkViewportOverscan
+                overscan: PageRasterizationPolicy.inkViewportOverscan(
+                    zoomScale: documentScrollView.zoomScale
+                )
             )
         else { return }
 
@@ -1117,7 +1140,8 @@ final class EditJotViewController: UIViewController {
                     inkGeometryMatches(
                         canvas: plane.canvas,
                         container: plane.container,
-                        layout: layout
+                        layout: layout,
+                        contentScale: inkContentScale
                     )
                 })
         else {
@@ -1147,15 +1171,31 @@ final class EditJotViewController: UIViewController {
             if plane.canvas.contentOffset != layout.canvasContentOffset {
                 plane.canvas.contentOffset = layout.canvasContentOffset
             }
+            applyInkContentScale(inkContentScale, to: plane.canvas)
         }
         CATransaction.commit()
+        appliedInkContentScale = inkContentScale
         allocatedInkDocumentRect = layout.allocatedDocumentRect
+    }
+
+    /// PencilKit renders ink into subviews of the canvas, so the density has to
+    /// be pushed through the whole subtree rather than set on the canvas alone.
+    private func applyInkContentScale(_ scale: CGFloat, to canvas: PKCanvasView) {
+        canvas.forEachViewInHierarchy { view in
+            if abs(view.contentScaleFactor - scale) > 0.0001 {
+                view.contentScaleFactor = scale
+            }
+            if abs(view.layer.contentsScale - scale) > 0.0001 {
+                view.layer.contentsScale = scale
+            }
+        }
     }
 
     private func inkGeometryMatches(
         canvas: PKCanvasView,
         container: UIView,
-        layout: InkViewportLayout
+        layout: InkViewportLayout,
+        contentScale: CGFloat
     ) -> Bool {
         container.transform == .identity
             && container.bounds == layout.viewportBounds
@@ -1172,6 +1212,7 @@ final class EditJotViewController: UIViewController {
             && canvas.bounds.size == layout.viewportBounds.size
             && approximatelyEqual(canvas.layer.position, .zero)
             && approximatelyEqual(canvas.contentOffset, layout.canvasContentOffset)
+            && abs(canvas.contentScaleFactor - contentScale) < 0.0001
     }
 
     private func approximatelyEqual(_ lhs: CGPoint, _ rhs: CGPoint) -> Bool {
@@ -1183,6 +1224,7 @@ final class EditJotViewController: UIViewController {
         zoomSettleTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .milliseconds(400))
             guard !Task.isCancelled, let self else { return }
+            isZoomInteractionActive = false
             updateVisibleInkRegion(force: true)
             backgroundView.setZoomInteractionActive(false)
         }
@@ -1207,11 +1249,13 @@ final class EditJotViewController: UIViewController {
 
     fileprivate func documentScrollViewWillBeginZooming() {
         zoomSettleTask?.cancel()
+        isZoomInteractionActive = true
         backgroundView.setZoomInteractionActive(true)
     }
 
     fileprivate func documentScrollViewDidEndZooming() {
         zoomSettleTask?.cancel()
+        isZoomInteractionActive = false
         updateVisibleInkRegion(force: true)
         backgroundView.setZoomInteractionActive(false)
     }
@@ -1702,6 +1746,7 @@ extension EditJotViewController: PKCanvasViewDelegate {
         else { return }
         isUsingDrawingTool = true
         zoomSettleTask?.cancel()
+        isZoomInteractionActive = false
         backgroundView.setZoomInteractionActive(false)
         shapeCommitWatchdogTask?.cancel()
         toolUndoCleanupTask?.cancel()

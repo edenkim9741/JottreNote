@@ -35,8 +35,6 @@ struct ShareJotRepository: ShareJotRepositoryProtocol {
         static let drawingScale = CGFloat(2)
         static let maximumRasterPixels = CGFloat(32_000_000)
         static let jpegCompressionQuality = CGFloat(0.9)
-        static let vectorInkSampleDistance = CGFloat(1.5)
-        static let minimumVectorInkRadius = CGFloat(0.1)
         static let maximumPageCount = 10_000
     }
 
@@ -140,13 +138,13 @@ struct ShareJotRepository: ShareJotRepositoryProtocol {
                         in: pageBounds,
                         context: rendererContext.cgContext
                     )
-                    renderVectorInk(
+                    VectorInkRenderer.draw(
                         drawing: layers.highlighter,
                         canvasRect: canvasRect,
                         pageBounds: pageBounds,
                         context: rendererContext.cgContext
                     )
-                    renderVectorInk(
+                    VectorInkRenderer.draw(
                         drawing: layers.foreground,
                         canvasRect: canvasRect,
                         pageBounds: pageBounds,
@@ -357,185 +355,6 @@ struct ShareJotRepository: ShareJotRepositoryProtocol {
             image = drawing.image(from: rect, scale: max(0.1, scale))
         }
         return image
-    }
-
-    /// Writes PencilKit ink as filled PDF paths. `PKDrawing.image` must not be
-    /// used here because it embeds a fixed-resolution bitmap in the PDF.
-    @MainActor
-    private func renderVectorInk(
-        drawing: PKDrawing,
-        canvasRect: CGRect,
-        pageBounds: CGRect,
-        context: CGContext
-    ) {
-        context.saveGState()
-        defer { context.restoreGState() }
-
-        context.clip(to: pageBounds)
-        context.translateBy(x: -canvasRect.minX, y: -canvasRect.minY)
-
-        let lightTraits = UITraitCollection(userInterfaceStyle: .light)
-        for stroke in drawing.strokes where stroke.renderBounds.intersects(canvasRect) {
-            guard let vectorPath = makeVectorPath(for: stroke) else { continue }
-            let color = stroke.ink.color.resolvedColor(with: lightTraits)
-
-            context.saveGState()
-            context.concatenate(stroke.transform)
-            if let mask = stroke.mask {
-                context.addPath(mask.cgPath)
-                context.clip()
-            }
-            context.setFillColor(color.cgColor)
-            context.setAlpha(vectorPath.opacity)
-            if stroke.ink.inkType == .marker {
-                context.setBlendMode(.multiply)
-            }
-            context.addPath(vectorPath.path)
-            context.fillPath()
-            context.restoreGState()
-        }
-    }
-
-    private struct VectorInkPath {
-        let path: CGPath
-        let opacity: CGFloat
-    }
-
-    @MainActor
-    private func makeVectorPath(for stroke: PKStroke) -> VectorInkPath? {
-        let path = CGMutablePath()
-        var opacityTotal = CGFloat.zero
-        var opacitySampleCount = 0
-
-        let ranges = stroke.maskedPathRanges
-        if ranges.isEmpty {
-            let points: [PKStrokePoint]
-            if stroke.path.count > 1 {
-                points = Array(
-                    stroke.path.interpolatedPoints(
-                        in: 0...CGFloat(stroke.path.count - 1),
-                        by: .distance(Constants.vectorInkSampleDistance)
-                    )
-                )
-            } else {
-                points = Array(stroke.path)
-            }
-            appendVectorOutline(
-                points: points,
-                to: path,
-                opacityTotal: &opacityTotal,
-                opacitySampleCount: &opacitySampleCount
-            )
-        } else {
-            for range in ranges {
-                let points = Array(
-                    stroke.path.interpolatedPoints(
-                        in: range,
-                        by: .distance(Constants.vectorInkSampleDistance)
-                    )
-                )
-                appendVectorOutline(
-                    points: points,
-                    to: path,
-                    opacityTotal: &opacityTotal,
-                    opacitySampleCount: &opacitySampleCount
-                )
-            }
-        }
-
-        guard !path.isEmpty else { return nil }
-        let opacity =
-            opacitySampleCount > 0
-            ? max(0, min(1, opacityTotal / CGFloat(opacitySampleCount)))
-            : 1
-        return VectorInkPath(path: path, opacity: opacity)
-    }
-
-    @MainActor
-    private func appendVectorOutline(
-        points: [PKStrokePoint],
-        to path: CGMutablePath,
-        opacityTotal: inout CGFloat,
-        opacitySampleCount: inout Int
-    ) {
-        let samples = points.compactMap { point -> (location: CGPoint, radius: CGFloat)? in
-            guard point.location.x.isFinite, point.location.y.isFinite else { return nil }
-            let radius = CGFloat(
-                max(
-                    Double(Constants.minimumVectorInkRadius),
-                    max(abs(point.size.width), abs(point.size.height)) * 0.5
-                )
-            )
-            opacityTotal += max(0, min(1, point.opacity))
-            opacitySampleCount += 1
-            return (point.location, radius)
-        }
-        guard let first = samples.first else { return }
-
-        if samples.count == 1 {
-            path.addEllipse(
-                in: CGRect(
-                    x: first.location.x - first.radius,
-                    y: first.location.y - first.radius,
-                    width: first.radius * 2,
-                    height: first.radius * 2
-                )
-            )
-            return
-        }
-
-        var leftEdge: [CGPoint] = []
-        var rightEdge: [CGPoint] = []
-        leftEdge.reserveCapacity(samples.count)
-        rightEdge.reserveCapacity(samples.count)
-
-        for index in samples.indices {
-            let previous = samples[index > samples.startIndex ? samples.index(before: index) : index].location
-            let next = samples[
-                index < samples.index(before: samples.endIndex)
-                    ? samples.index(after: index)
-                    : index
-            ].location
-            let tangent = CGPoint(x: next.x - previous.x, y: next.y - previous.y)
-            let length = hypot(tangent.x, tangent.y)
-            let normal =
-                length > 0.0001
-                ? CGPoint(x: -tangent.y / length, y: tangent.x / length)
-                : CGPoint(x: 0, y: 1)
-            let sample = samples[index]
-            leftEdge.append(
-                CGPoint(
-                    x: sample.location.x + normal.x * sample.radius,
-                    y: sample.location.y + normal.y * sample.radius
-                )
-            )
-            rightEdge.append(
-                CGPoint(
-                    x: sample.location.x - normal.x * sample.radius,
-                    y: sample.location.y - normal.y * sample.radius
-                )
-            )
-        }
-
-        path.move(to: leftEdge[0])
-        for point in leftEdge.dropFirst() {
-            path.addLine(to: point)
-        }
-        for point in rightEdge.reversed() {
-            path.addLine(to: point)
-        }
-        path.closeSubpath()
-
-        for sample in [first, samples[samples.index(before: samples.endIndex)]] {
-            path.addEllipse(
-                in: CGRect(
-                    x: sample.location.x - sample.radius,
-                    y: sample.location.y - sample.radius,
-                    width: sample.radius * 2,
-                    height: sample.radius * 2
-                )
-            )
-        }
     }
 
     private func rasterScale(for rect: CGRect) -> CGFloat {
