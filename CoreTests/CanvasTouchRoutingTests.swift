@@ -142,37 +142,26 @@ final class CanvasTouchRoutingTests: XCTestCase {
         #if targetEnvironment(macCatalyst)
         throw XCTSkip("Direct-touch and Apple Pencil routing is unavailable on Mac Catalyst")
         #else
-        let foregroundCanvas = PKCanvasView()
-        let highlighterCanvas = PKCanvasView()
-        let documentScrollView = UIScrollView()
-        documentScrollView.maximumZoomScale = 8
+        let documentCanvas = PKCanvasView()
         let directTouch = NSNumber(value: UITouch.TouchType.direct.rawValue)
         let pencilTouch = NSNumber(value: UITouch.TouchType.pencil.rawValue)
-        foregroundCanvas.tool = PKLassoTool()
+        documentCanvas.tool = PKLassoTool()
 
         // PencilKit owns this recognizer and may reconfigure it while lasso is active.
-        foregroundCanvas.drawingGestureRecognizer.allowedTouchTypes = [directTouch, pencilTouch]
+        documentCanvas.drawingGestureRecognizer.allowedTouchTypes = [directTouch, pencilTouch]
         let configuration = CanvasTouchRouting.Configuration(isFingerDrawingEnabled: false)
 
-        CanvasTouchRouting.apply(
-            configuration,
-            to: [foregroundCanvas, highlighterCanvas],
-            documentScrollView: documentScrollView
-        )
+        CanvasTouchRouting.apply(configuration, to: documentCanvas)
 
-        XCTAssertEqual(documentScrollView.panGestureRecognizer.allowedTouchTypes, [directTouch])
-        XCTAssertEqual(documentScrollView.panGestureRecognizer.minimumNumberOfTouches, 1)
-        XCTAssertEqual(documentScrollView.panGestureRecognizer.maximumNumberOfTouches, 2)
-        XCTAssertEqual(documentScrollView.pinchGestureRecognizer?.allowedTouchTypes, [directTouch])
-        XCTAssertEqual(documentScrollView.pinchGestureRecognizer?.isEnabled, true)
-        XCTAssertFalse(foregroundCanvas.isScrollEnabled)
-        XCTAssertFalse(foregroundCanvas.panGestureRecognizer.isEnabled)
-        XCTAssertFalse(highlighterCanvas.isScrollEnabled)
+        // The canvas owns document navigation, so a single finger pans.
+        XCTAssertTrue(documentCanvas.isScrollEnabled)
+        XCTAssertTrue(documentCanvas.panGestureRecognizer.isEnabled)
+        XCTAssertEqual(documentCanvas.panGestureRecognizer.minimumNumberOfTouches, 1)
+        XCTAssertEqual(documentCanvas.panGestureRecognizer.maximumNumberOfTouches, 2)
         XCTAssertEqual(
-            foregroundCanvas.drawingGestureRecognizer.allowedTouchTypes,
+            documentCanvas.drawingGestureRecognizer.allowedTouchTypes,
             [directTouch, pencilTouch]
         )
-        XCTAssertTrue(highlighterCanvas.drawingGestureRecognizer.allowedTouchTypes.isEmpty)
         #endif
     }
 
@@ -181,26 +170,21 @@ final class CanvasTouchRoutingTests: XCTestCase {
         #if targetEnvironment(macCatalyst)
         throw XCTSkip("Direct-touch and Apple Pencil routing is unavailable on Mac Catalyst")
         #else
-        let canvasView = PKCanvasView()
-        let documentScrollView = UIScrollView()
+        let documentCanvas = PKCanvasView()
         let directTouch = NSNumber(value: UITouch.TouchType.direct.rawValue)
         let pencilTouch = NSNumber(value: UITouch.TouchType.pencil.rawValue)
-        canvasView.tool = PKLassoTool()
+        documentCanvas.tool = PKLassoTool()
+        documentCanvas.drawingGestureRecognizer.allowedTouchTypes = [directTouch, pencilTouch]
         let configuration = CanvasTouchRouting.Configuration(isFingerDrawingEnabled: true)
 
-        CanvasTouchRouting.apply(
-            configuration,
-            to: [canvasView],
-            documentScrollView: documentScrollView
-        )
+        CanvasTouchRouting.apply(configuration, to: documentCanvas)
 
-        XCTAssertEqual(documentScrollView.panGestureRecognizer.allowedTouchTypes, [directTouch])
-        XCTAssertEqual(documentScrollView.panGestureRecognizer.minimumNumberOfTouches, 2)
-        XCTAssertEqual(documentScrollView.panGestureRecognizer.maximumNumberOfTouches, 2)
-        XCTAssertFalse(canvasView.isScrollEnabled)
-        XCTAssertFalse(canvasView.panGestureRecognizer.isEnabled)
+        // A finger draws, so navigation needs two touches to stay unambiguous.
+        XCTAssertTrue(documentCanvas.isScrollEnabled)
+        XCTAssertEqual(documentCanvas.panGestureRecognizer.minimumNumberOfTouches, 2)
+        XCTAssertEqual(documentCanvas.panGestureRecognizer.maximumNumberOfTouches, 2)
         XCTAssertEqual(
-            canvasView.drawingGestureRecognizer.allowedTouchTypes,
+            documentCanvas.drawingGestureRecognizer.allowedTouchTypes,
             [directTouch, pencilTouch]
         )
         #endif

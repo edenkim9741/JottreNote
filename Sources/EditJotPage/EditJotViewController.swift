@@ -56,38 +56,40 @@ final class EditJotViewController: UIViewController {
     private lazy var toolPicker = PKToolPicker()
     #endif
 
+    /// The foreground canvas owns pan and zoom for the whole document.
+    ///
+    /// PencilKit re-tessellates its vector strokes for the resolution its own
+    /// `zoomScale` implies, so letting the canvas scale its content is the only
+    /// way to keep ink sharp when zoomed. Pushing `contentScaleFactor` from the
+    /// outside does not work: PencilKit renders through a viewport-sized tiled
+    /// layer that only re-renders when its own zoom changes.
     private lazy var canvasView: JotCanvasView = {
         let canvasView = JotCanvasView()
         canvasView.delegate = self
-        canvasView.isScrollEnabled = false
         canvasView.drawingPolicy = .default
-        canvasView.minimumZoomScale = 1
-        canvasView.maximumZoomScale = 1
         canvasView.bounces = false
+        canvasView.bouncesZoom = true
         canvasView.contentInsetAdjustmentBehavior = .never
+        canvasView.automaticallyAdjustsScrollIndicatorInsets = false
         canvasView.backgroundColor = .clear
         canvasView.isOpaque = false
         canvasView.layer.shouldRasterize = false
-        canvasView.layer.anchorPoint = .zero
-        canvasView.layer.position = .zero
         return canvasView
     }()
 
+    /// Marker ink lives on its own canvas so it composites below the pen plane.
+    /// It mirrors the foreground canvas's zoom and offset instead of scrolling.
     private lazy var highlighterCanvasView: JotCanvasView = {
         let canvasView = JotCanvasView()
         canvasView.delegate = self
         canvasView.isUserInteractionEnabled = false
         canvasView.isScrollEnabled = false
         canvasView.drawingPolicy = .default
-        canvasView.minimumZoomScale = 1
-        canvasView.maximumZoomScale = 1
         canvasView.bounces = false
         canvasView.contentInsetAdjustmentBehavior = .never
         canvasView.backgroundColor = .clear
         canvasView.isOpaque = false
         canvasView.layer.shouldRasterize = false
-        canvasView.layer.anchorPoint = .zero
-        canvasView.layer.position = .zero
         return canvasView
     }()
 
@@ -96,59 +98,25 @@ final class EditJotViewController: UIViewController {
         foregroundCanvas: canvasView
     )
 
-    private lazy var documentScrollView: JotDocumentScrollView = {
-        let scrollView = JotDocumentScrollView()
-        scrollView.delegate = documentScrollDelegate
-        scrollView.shouldRouteDirectTouch = { [weak self] in
-            self?.updateCanvasTouchRouting() ?? false
-        }
-        scrollView.translatesAutoresizingMaskIntoConstraints = false
-        scrollView.minimumZoomScale = 1
-        scrollView.maximumZoomScale = Constants.CanvasView.maximumZoomScale
-        scrollView.bounces = false
-        scrollView.bouncesZoom = true
-        scrollView.contentInsetAdjustmentBehavior = .never
-        scrollView.automaticallyAdjustsScrollIndicatorInsets = false
-        scrollView.backgroundColor = .clear
-        #if !targetEnvironment(macCatalyst)
-        let fingerTouch = NSNumber(value: UITouch.TouchType.direct.rawValue)
-        scrollView.panGestureRecognizer.allowedTouchTypes = [fingerTouch]
-        scrollView.pinchGestureRecognizer?.allowedTouchTypes = [fingerTouch]
-        #endif
-        return scrollView
-    }()
-
-    private lazy var documentScrollDelegate = DocumentScrollViewDelegate(viewController: self)
-
-    private let documentContainerView: UIView = {
-        let view = UIView(frame: .zero)
-        view.backgroundColor = .clear
-        view.layer.anchorPoint = .zero
-        view.layer.position = .zero
-        return view
-    }()
+    /// The foreground canvas is the document's scroll and zoom owner. Keeping
+    /// the old name as an alias lets the geometry code below stay expressed in
+    /// document terms.
+    private var documentScrollView: JotCanvasView { canvasView }
 
     private let backgroundView: JotBackgroundView = {
         let view = JotBackgroundView()
-        view.translatesAutoresizingMaskIntoConstraints = false
         view.backgroundColor = .clear
         view.isUserInteractionEnabled = false
         return view
     }()
 
-    /// Crops the foreground canvas to a buffered document-space viewport.
-    /// Neither this container nor the canvas applies an independent zoom.
-    private let inkContainerView: UIView = {
+    /// Mirrors the canvas's zoom and content offset so the PDF stays locked to
+    /// the ink. PencilKit only transforms its own internal content view, so a
+    /// background nested inside the canvas would not follow the zoom at all.
+    private let backgroundContainerView: UIView = {
         let view = UIView(frame: .zero)
         view.backgroundColor = .clear
-        view.layer.anchorPoint = .zero
-        view.layer.position = .zero
-        return view
-    }()
-
-    private let highlighterInkContainerView: UIView = {
-        let view = UIView(frame: .zero)
-        view.backgroundColor = .clear
+        view.isUserInteractionEnabled = false
         view.layer.anchorPoint = .zero
         view.layer.position = .zero
         return view
@@ -164,12 +132,9 @@ final class EditJotViewController: UIViewController {
     private var isUsingDrawingTool = false
     private var hasPendingDrawingChange = false
     private var documentContentSize = CGSize.zero
-    private var allocatedInkDocumentRect = CGRect.null
+    /// Last unscaled size written to the canvas's `contentSize`.
+    private var appliedCanvasContentSize = CGSize.zero
     private var isZoomInteractionActive = false
-    /// Backing-store density currently applied to both ink canvases. Raising it
-    /// forces PencilKit to re-tessellate its vector strokes, which is too costly
-    /// to do on every frame of a pinch, so it only follows a settled zoom.
-    private var appliedInkContentScale = CGFloat.zero
     private var zoomSettleTask: Task<Void, Never>?
     private var blankEditMenuDismissTask: Task<Void, Never>?
     private var applicationBackgroundFlushTask: Task<Void, Never>?
@@ -475,11 +440,7 @@ final class EditJotViewController: UIViewController {
         // state while lasso content is moved. Reapply these idempotent
         // invariants for every new direct-touch sequence, even when the policy
         // itself did not change.
-        CanvasTouchRouting.apply(
-            configuration,
-            to: [canvasView, highlighterCanvasView],
-            documentScrollView: documentScrollView
-        )
+        CanvasTouchRouting.apply(configuration, to: canvasView)
         return configuration.routesDirectTouchesToDocumentScroll
         #else
         return false
@@ -589,7 +550,10 @@ final class EditJotViewController: UIViewController {
         let pageSizeChanged = currentPageSize != fittedPageSize
         let viewportSizeChanged = boundsSize != previousCanvasBoundsSize
         documentScrollView.minimumZoomScale = pageFitScale
-        documentScrollView.maximumZoomScale = max(Constants.CanvasView.maximumZoomScale, pageFitScale)
+        // The zoom ceiling is expressed relative to page-fit so the reachable
+        // magnification is the same regardless of viewport size or page format.
+        documentScrollView.maximumZoomScale =
+            pageFitScale * Constants.CanvasView.maximumZoomScale
 
         if !hasInitializedZoomScale || pageSizeChanged || (viewportSizeChanged && wasAtMinimum) {
             hasInitializedZoomScale = true
@@ -628,26 +592,27 @@ final class EditJotViewController: UIViewController {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         let documentBounds = CGRect(origin: .zero, size: documentContentSize)
-        if documentContainerView.bounds != documentBounds {
-            documentContainerView.bounds = documentBounds
-            documentContainerView.layer.position = .zero
+        if backgroundContainerView.bounds != documentBounds {
+            backgroundContainerView.bounds = documentBounds
         }
         if backgroundView.frame != documentBounds {
             backgroundView.frame = documentBounds
         }
+        // The highlighter canvas is not the zoom owner, so it holds the document
+        // at 1:1 and is scaled by the mirroring transform instead.
+        if highlighterCanvasView.bounds.size != documentContentSize {
+            highlighterCanvasView.bounds = documentBounds
+            highlighterCanvasView.contentSize = documentContentSize
+        }
         CATransaction.commit()
 
-        // UIScrollView owns zoomed content sizing. Only seed or update it when
-        // the underlying document geometry changes; never feed a transformed
-        // UIView.frame back into UIScrollView during a zoom callback.
-        if documentGeometryChanged || documentScrollView.contentSize == .zero {
-            let scrollContentSize = CGSize(
-                width: documentContentSize.width * scale,
-                height: documentContentSize.height * scale
-            )
-            if documentScrollView.contentSize != scrollContentSize {
-                documentScrollView.contentSize = scrollContentSize
-            }
+        // `contentSize` must be written in unscaled document units, but the
+        // getter reports the zoomed size. Track what was applied instead of
+        // comparing against the live value, or a zoomed read would be fed back
+        // in and compound the scale.
+        if documentGeometryChanged || appliedCanvasContentSize == .zero {
+            appliedCanvasContentSize = documentContentSize
+            documentScrollView.contentSize = documentContentSize
         }
 
         let horizontalInset = max(0, (documentScrollView.bounds.width - scaledWidth) / 2)
@@ -690,12 +655,7 @@ final class EditJotViewController: UIViewController {
         {
             documentScrollView.contentOffset.x = -horizontalInset
         }
-        backgroundView.sync(
-            scrollOffset: documentScrollView.contentOffset,
-            zoomScale: scale,
-            viewportSize: documentScrollView.bounds.size
-        )
-        updateVisibleInkRegion(force: documentGeometryChanged)
+        syncDocumentPlanes()
     }
 
     private func setUpCanvasView() {
@@ -706,19 +666,19 @@ final class EditJotViewController: UIViewController {
             canvasView.topEdgeEffect.isHidden = true
             highlighterCanvasView.topEdgeEffect.isHidden = true
         }
-        view.addSubview(documentScrollView)
+        // The background and the highlighter plane sit behind the scrolling
+        // canvas and are driven from its scroll callbacks.
+        backgroundContainerView.addSubview(backgroundView)
+        view.addSubview(backgroundContainerView)
+        view.addSubview(highlighterCanvasView)
+        view.addSubview(canvasView)
+        canvasView.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
-            documentScrollView.topAnchor.constraint(equalTo: view.topAnchor),
-            documentScrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            documentScrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            documentScrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            canvasView.topAnchor.constraint(equalTo: view.topAnchor),
+            canvasView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            canvasView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            canvasView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
         ])
-        documentScrollView.addSubview(documentContainerView)
-        documentContainerView.addSubview(backgroundView)
-        documentContainerView.addSubview(highlighterInkContainerView)
-        highlighterInkContainerView.addSubview(highlighterCanvasView)
-        documentContainerView.addSubview(inkContainerView)
-        inkContainerView.addSubview(canvasView)
         canvasView.drawingGestureRecognizer.addTarget(
             self,
             action: #selector(handleDrawingGesture(_:))
@@ -729,8 +689,8 @@ final class EditJotViewController: UIViewController {
         #if !targetEnvironment(macCatalyst)
         doubleTap.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
         #endif
-        documentScrollView.addGestureRecognizer(doubleTap)
-        documentScrollView.addGestureRecognizer(blankCanvasEditMenuTapGesture)
+        canvasView.addGestureRecognizer(doubleTap)
+        canvasView.addGestureRecognizer(blankCanvasEditMenuTapGesture)
         updateCanvasInteraction()
         view.bringSubviewToFront(loadingProgressView)
     }
@@ -1071,152 +1031,42 @@ final class EditJotViewController: UIViewController {
         return (fitLongEdge, max(fitLongEdge, fillShortEdge))
     }
 
-    /// Keeps a buffered PencilKit viewport in the same document coordinates as
-    /// the PDF. `documentScrollView` is the sole zoom owner; the nested canvases
-    /// always stay at `zoomScale` 1 and are only cropped to this allocation for
-    /// performance.
+    /// Projects the canvas's scroll and zoom state onto the background and the
+    /// highlighter plane.
     ///
-    /// The canvases do, however, follow the zoom through `contentScaleFactor`.
-    /// PencilKit stores ink as vector strokes and re-tessellates them for the
-    /// backing store it is given, so raising that density is what keeps strokes
-    /// smooth instead of letting Core Animation magnify a 1x rasterization.
-    private func updateVisibleInkRegion(force: Bool = false) {
-        guard
-            canvasView.superview != nil,
-            documentScrollView.bounds.width > 0,
-            documentScrollView.bounds.height > 0,
-            documentContentSize.width > 0,
-            documentContentSize.height > 0
-        else { return }
+    /// PencilKit applies the zoom as a transform on its own internal content
+    /// view, so sibling views have to be scaled explicitly. Doing it with a
+    /// layer transform keeps the PDF's vector re-render and the ink perfectly
+    /// registered without re-laying out the page views on every frame.
+    private func syncDocumentPlanes() {
+        guard documentContentSize.width > 0, documentContentSize.height > 0 else { return }
 
-        // View conversion is the authoritative mapping. It includes the zoom
-        // transform, content offset, centering insets, and zoom bounce without
-        // duplicating UIScrollView's private coordinate calculations.
-        let requestedVisibleRect = documentScrollView.convert(
-            documentScrollView.bounds,
-            to: documentContainerView
-        )
-        // Re-tessellating strokes mid-pinch would stall the gesture. Hold the
-        // previous density until the zoom settles; Core Animation covers the
-        // intermediate frames by scaling the existing backing store.
-        let inkContentScale: CGFloat
-        if isZoomInteractionActive, appliedInkContentScale > 0 {
-            inkContentScale = appliedInkContentScale
-        } else {
-            inkContentScale = PageRasterizationPolicy.inkContentScale(
-                zoomScale: documentScrollView.zoomScale,
-                displayScale: max(1, traitCollection.displayScale)
-            )
-        }
-        guard
-            let proposedLayout = InkViewportLayout.make(
-                visibleDocumentRect: requestedVisibleRect,
-                documentSize: documentContentSize,
-                overscan: PageRasterizationPolicy.inkViewportOverscan(
-                    zoomScale: documentScrollView.zoomScale
-                )
-            )
-        else { return }
-
-        let layout: InkViewportLayout
-        if !force,
-            !allocatedInkDocumentRect.isNull,
-            let reused = proposedLayout.reusingAllocatedDocumentRect(
-                allocatedInkDocumentRect
-            )
-        {
-            layout = reused
-        } else {
-            layout = proposedLayout
-        }
-
-        let inkPlanes = [
-            (canvas: canvasView, container: inkContainerView),
-            (canvas: highlighterCanvasView, container: highlighterInkContainerView),
-        ]
-        guard
-            force
-                || !inkPlanes.allSatisfy({ plane in
-                    inkGeometryMatches(
-                        canvas: plane.canvas,
-                        container: plane.container,
-                        layout: layout,
-                        contentScale: inkContentScale
-                    )
-                })
-        else {
-            allocatedInkDocumentRect = layout.allocatedDocumentRect
-            return
-        }
+        let scale = canvasView.zoomScale
+        let offset = canvasView.contentOffset
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        for plane in inkPlanes {
-            plane.container.transform = .identity
-            plane.container.bounds = layout.viewportBounds
-            plane.container.layer.position = layout.allocatedDocumentRect.origin
-            plane.canvas.transform = .identity
-
-            // Expand the current range to include 1x before collapsing it. This
-            // also safely normalizes a canvas created by an older editor state.
-            plane.canvas.minimumZoomScale = min(1, plane.canvas.minimumZoomScale)
-            plane.canvas.maximumZoomScale = max(1, plane.canvas.maximumZoomScale)
-            plane.canvas.zoomScale = 1
-            plane.canvas.minimumZoomScale = 1
-            plane.canvas.maximumZoomScale = 1
-            plane.canvas.contentInset = .zero
-            plane.canvas.contentSize = layout.documentSize
-            plane.canvas.bounds.size = layout.viewportBounds.size
-            plane.canvas.layer.position = .zero
-            if plane.canvas.contentOffset != layout.canvasContentOffset {
-                plane.canvas.contentOffset = layout.canvasContentOffset
-            }
-            applyInkContentScale(inkContentScale, to: plane.canvas)
+        // A scroll view shows content point p at p * zoomScale - contentOffset,
+        // so anchoring at the layer origin reproduces exactly that mapping.
+        for plane in [backgroundContainerView, highlighterCanvasView] {
+            plane.layer.anchorPoint = .zero
+            plane.layer.position = CGPoint(x: -offset.x, y: -offset.y)
+            plane.layer.transform = CATransform3DMakeScale(scale, scale, 1)
         }
         CATransaction.commit()
-        appliedInkContentScale = inkContentScale
-        allocatedInkDocumentRect = layout.allocatedDocumentRect
+
+        backgroundView.sync(
+            scrollOffset: offset,
+            zoomScale: scale,
+            viewportSize: canvasView.bounds.size
+        )
     }
 
-    /// PencilKit renders ink into subviews of the canvas, so the density has to
-    /// be pushed through the whole subtree rather than set on the canvas alone.
-    private func applyInkContentScale(_ scale: CGFloat, to canvas: PKCanvasView) {
-        canvas.forEachViewInHierarchy { view in
-            if abs(view.contentScaleFactor - scale) > 0.0001 {
-                view.contentScaleFactor = scale
-            }
-            if abs(view.layer.contentsScale - scale) > 0.0001 {
-                view.layer.contentsScale = scale
-            }
-        }
-    }
-
-    private func inkGeometryMatches(
-        canvas: PKCanvasView,
-        container: UIView,
-        layout: InkViewportLayout,
-        contentScale: CGFloat
-    ) -> Bool {
-        container.transform == .identity
-            && container.bounds == layout.viewportBounds
-            && approximatelyEqual(
-                container.layer.position,
-                layout.allocatedDocumentRect.origin
-            )
-            && canvas.transform == .identity
-            && abs(canvas.minimumZoomScale - 1) < 0.0001
-            && abs(canvas.maximumZoomScale - 1) < 0.0001
-            && abs(canvas.zoomScale - 1) < 0.0001
-            && canvas.contentInset == .zero
-            && canvas.contentSize == layout.documentSize
-            && canvas.bounds.size == layout.viewportBounds.size
-            && approximatelyEqual(canvas.layer.position, .zero)
-            && approximatelyEqual(canvas.contentOffset, layout.canvasContentOffset)
-            && abs(canvas.contentScaleFactor - contentScale) < 0.0001
-    }
-
-    private func approximatelyEqual(_ lhs: CGPoint, _ rhs: CGPoint) -> Bool {
-        abs(lhs.x - rhs.x) < 0.001 && abs(lhs.y - rhs.y) < 0.001
+    private func finishZoomInteraction() {
+        zoomSettleTask?.cancel()
+        isZoomInteractionActive = false
+        syncDocumentPlanes()
+        backgroundView.setZoomInteractionActive(false)
     }
 
     private func scheduleZoomSettling() {
@@ -1224,48 +1074,8 @@ final class EditJotViewController: UIViewController {
         zoomSettleTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .milliseconds(400))
             guard !Task.isCancelled, let self else { return }
-            isZoomInteractionActive = false
-            updateVisibleInkRegion(force: true)
-            backgroundView.setZoomInteractionActive(false)
+            finishZoomInteraction()
         }
-    }
-
-    fileprivate func documentScrollViewDidScroll(_ scrollView: UIScrollView) {
-        backgroundView.sync(
-            scrollOffset: scrollView.contentOffset,
-            zoomScale: scrollView.zoomScale,
-            viewportSize: scrollView.bounds.size
-        )
-        updateVisibleInkRegion()
-    }
-
-    fileprivate func documentViewForZooming() -> UIView {
-        documentContainerView
-    }
-
-    fileprivate func documentScrollViewDidZoom(_ scrollView: UIScrollView) {
-        updateCanvasGeometry()
-    }
-
-    fileprivate func documentScrollViewWillBeginZooming() {
-        zoomSettleTask?.cancel()
-        isZoomInteractionActive = true
-        backgroundView.setZoomInteractionActive(true)
-    }
-
-    fileprivate func documentScrollViewDidEndZooming() {
-        zoomSettleTask?.cancel()
-        isZoomInteractionActive = false
-        updateVisibleInkRegion(force: true)
-        backgroundView.setZoomInteractionActive(false)
-    }
-
-    fileprivate func documentScrollViewWillEndDragging(targetContentOffset: CGPoint) {
-        backgroundView.prefetch(toward: targetContentOffset)
-    }
-
-    fileprivate func documentScrollViewDidFinishDecelerating() {
-        backgroundView.finishScrollPrefetch()
     }
 
     private func handleLoadingProgress(_ progress: Double?) {
@@ -1293,16 +1103,15 @@ final class EditJotViewController: UIViewController {
 
     private func restoreScrollPositionIfNeeded() {
         guard let page = pendingScrollPage, page > 0, drawingWidth > 0 else { return }
+        let zoomScale = documentScrollView.zoomScale
         let maxOffsetY = max(
             0,
-            documentContentSize.height * documentScrollView.zoomScale
-                - documentScrollView.bounds.height
+            documentContentSize.height * zoomScale - documentScrollView.bounds.height
         )
         guard maxOffsetY > 0 else { return }
         pendingScrollPage = nil
         let pageFullHeight =
-            (currentPageSize.height + JotBackgroundView.pageSpacing)
-            * documentScrollView.zoomScale
+            (currentPageSize.height + JotBackgroundView.pageSpacing) * zoomScale
         let targetOffsetY = CGFloat(page) * pageFullHeight - documentScrollView.contentInset.top
         documentScrollView.contentOffset = CGPoint(
             x: -documentScrollView.contentInset.left,
@@ -1465,17 +1274,15 @@ extension EditJotViewController {
 
     private func updateCanvasInteraction() {
         let activeCanvas = inkCanvasCoordinator.activeCanvas
-        let inkPlanes = [
-            (canvas: highlighterCanvasView, container: highlighterInkContainerView),
-            (canvas: canvasView, container: inkContainerView),
-        ]
-        for plane in inkPlanes {
-            let canvas = plane.canvas
+        for canvas in [highlighterCanvasView, canvasView] {
             let isActive = isEditingEnabled && canvas === activeCanvas
-            plane.container.isUserInteractionEnabled = isActive
-            canvas.isUserInteractionEnabled = isActive
+            // The foreground canvas owns document scrolling, so it always stays
+            // interactive; only its drawing input follows the editing state.
+            canvas.isUserInteractionEnabled = isActive || canvas === canvasView
             if #available(iOS 18.0, *) {
                 canvas.isDrawingEnabled = isActive
+            } else if canvas.drawingGestureRecognizer.isEnabled != isActive {
+                canvas.drawingGestureRecognizer.isEnabled = isActive
             }
             if !isActive {
                 canvas.resignFirstResponder()
@@ -1671,6 +1478,8 @@ extension EditJotViewController {
 
 extension UIView {
 
+    /// PencilKit installs edit-menu interactions on internal subviews, so the
+    /// editor has to walk the subtree to dismiss them.
     fileprivate func forEachViewInHierarchy(_ operation: (UIView) -> Void) {
         operation(self)
         for subview in subviews {
@@ -1796,6 +1605,56 @@ extension EditJotViewController: PKCanvasViewDelegate {
         guard hasPendingDrawingChange || inkCanvasCoordinator.hasUncommittedChanges else { return }
         commitCanvasDrawing()
     }
+
+    // MARK: Document scrolling
+
+    // `PKCanvasViewDelegate` refines `UIScrollViewDelegate`, so the canvas that
+    // owns the document zoom reports its scrolling here directly.
+
+    func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        guard scrollView === canvasView else { return }
+        syncDocumentPlanes()
+    }
+
+    func scrollViewDidZoom(_ scrollView: UIScrollView) {
+        guard scrollView === canvasView else { return }
+        updateCanvasGeometry()
+    }
+
+    func scrollViewWillBeginZooming(_ scrollView: UIScrollView, with view: UIView?) {
+        guard scrollView === canvasView else { return }
+        zoomSettleTask?.cancel()
+        isZoomInteractionActive = true
+        backgroundView.setZoomInteractionActive(true)
+    }
+
+    func scrollViewDidEndZooming(
+        _ scrollView: UIScrollView,
+        with view: UIView?,
+        atScale scale: CGFloat
+    ) {
+        guard scrollView === canvasView else { return }
+        finishZoomInteraction()
+    }
+
+    func scrollViewWillEndDragging(
+        _ scrollView: UIScrollView,
+        withVelocity velocity: CGPoint,
+        targetContentOffset: UnsafeMutablePointer<CGPoint>
+    ) {
+        guard scrollView === canvasView else { return }
+        backgroundView.prefetch(toward: targetContentOffset.pointee)
+    }
+
+    func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
+        guard scrollView === canvasView, !decelerate else { return }
+        backgroundView.finishScrollPrefetch()
+    }
+
+    func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+        guard scrollView === canvasView else { return }
+        backgroundView.finishScrollPrefetch()
+    }
 }
 
 // MARK: - JotCanvasView
@@ -1890,56 +1749,4 @@ private final class JotCanvasView: PKCanvasView {
     // do not remove the transient interactions installed by the lasso tool.
 }
 
-@MainActor
-private final class DocumentScrollViewDelegate: NSObject, UIScrollViewDelegate {
 
-    private weak var viewController: EditJotViewController?
-
-    init(viewController: EditJotViewController) {
-        self.viewController = viewController
-    }
-
-    func viewForZooming(in scrollView: UIScrollView) -> UIView? {
-        viewController?.documentViewForZooming()
-    }
-
-    func scrollViewDidScroll(_ scrollView: UIScrollView) {
-        viewController?.documentScrollViewDidScroll(scrollView)
-    }
-
-    func scrollViewDidZoom(_ scrollView: UIScrollView) {
-        viewController?.documentScrollViewDidZoom(scrollView)
-    }
-
-    func scrollViewWillBeginZooming(_ scrollView: UIScrollView, with view: UIView?) {
-        viewController?.documentScrollViewWillBeginZooming()
-    }
-
-    func scrollViewDidEndZooming(
-        _ scrollView: UIScrollView,
-        with view: UIView?,
-        atScale scale: CGFloat
-    ) {
-        viewController?.documentScrollViewDidEndZooming()
-    }
-
-    func scrollViewWillEndDragging(
-        _ scrollView: UIScrollView,
-        withVelocity velocity: CGPoint,
-        targetContentOffset: UnsafeMutablePointer<CGPoint>
-    ) {
-        viewController?.documentScrollViewWillEndDragging(
-            targetContentOffset: targetContentOffset.pointee
-        )
-    }
-
-    func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
-        if !decelerate {
-            viewController?.documentScrollViewDidFinishDecelerating()
-        }
-    }
-
-    func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
-        viewController?.documentScrollViewDidFinishDecelerating()
-    }
-}

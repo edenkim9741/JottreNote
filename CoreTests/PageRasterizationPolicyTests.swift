@@ -107,7 +107,9 @@ final class PageRasterizationPolicyTests: XCTestCase {
 
     func testDetailRequestRaisesResolutionForZoomedViewport() throws {
         let pageSize = CGSize(width: 1_200, height: 1_600)
-        let visibleRect = CGRect(x: 400, y: 400, width: 300, height: 400)
+        // At zoom 4 a viewport only ever exposes a page slice this small, so the
+        // request reaches the full zoom * displayScale resolution.
+        let visibleRect = CGRect(x: 400, y: 400, width: 209, height: 303)
 
         let request = try XCTUnwrap(
             PageRasterizationPolicy.detailRequest(
@@ -122,6 +124,30 @@ final class PageRasterizationPolicyTests: XCTestCase {
         XCTAssertEqual(request.scale, 8)
         // The rendered region is padded so small scrolls reuse the same bitmap.
         XCTAssertTrue(request.sourceRect.contains(visibleRect))
+    }
+
+    /// A visible rect far larger than any real viewport is bounded by the pixel
+    /// budget rather than reaching the requested scale. This keeps one page's
+    /// detail bitmap affordable no matter what geometry is asked for.
+    func testDetailRequestClampsOversizedRegionToPixelBudget() throws {
+        let pageSize = CGSize(width: 1_200, height: 1_600)
+
+        let request = try XCTUnwrap(
+            PageRasterizationPolicy.detailRequest(
+                visiblePageRect: CGRect(x: 400, y: 400, width: 300, height: 400),
+                pageSize: pageSize,
+                zoomScale: 4,
+                displayScale: 2,
+                baseScale: 2
+            )
+        )
+
+        XCTAssertLessThan(request.scale, 8)
+        XCTAssertGreaterThan(request.scale, 2)
+        let pixels =
+            request.sourceRect.width * request.scale
+            * request.sourceRect.height * request.scale
+        XCTAssertLessThanOrEqual(pixels, PageRasterizationPolicy.maximumDetailPixels + 1)
     }
 
     func testDetailRequestStaysInsidePageBounds() throws {
@@ -160,30 +186,40 @@ final class PageRasterizationPolicyTests: XCTestCase {
         XCTAssertLessThanOrEqual(pixels, PageRasterizationPolicy.maximumDetailPixels + 1)
     }
 
-    // MARK: - Ink density
+    // MARK: - Vector layer density
 
-    func testInkContentScaleFollowsZoomAndIsCapped() {
+    func testVectorLayerContentsScaleFollowsZoomAndIsCapped() {
+        // Below 1x the display scale still sets the floor.
         XCTAssertEqual(
-            PageRasterizationPolicy.inkContentScale(zoomScale: 0.5, displayScale: 2),
+            PageRasterizationPolicy.vectorLayerContentsScale(zoomScale: 0.5, displayScale: 2),
             2
         )
         XCTAssertEqual(
-            PageRasterizationPolicy.inkContentScale(zoomScale: 3, displayScale: 2),
+            PageRasterizationPolicy.vectorLayerContentsScale(zoomScale: 3, displayScale: 2),
             6
         )
+        // 8x zoom on a 3x display needs 24, which the ceiling now admits.
         XCTAssertEqual(
-            PageRasterizationPolicy.inkContentScale(zoomScale: 8, displayScale: 3),
-            PageRasterizationPolicy.maximumInkContentScale
+            PageRasterizationPolicy.vectorLayerContentsScale(zoomScale: 8, displayScale: 3),
+            24
+        )
+        XCTAssertEqual(
+            PageRasterizationPolicy.vectorLayerContentsScale(zoomScale: 40, displayScale: 3),
+            PageRasterizationPolicy.maximumVectorLayerContentsScale
         )
     }
 
-    func testInkViewportOverscanShrinksAsZoomGrows() {
-        let atFit = PageRasterizationPolicy.inkViewportOverscan(zoomScale: 1)
-        let midZoom = PageRasterizationPolicy.inkViewportOverscan(zoomScale: 3)
-        let deepZoom = PageRasterizationPolicy.inkViewportOverscan(zoomScale: 8)
-
-        XCTAssertGreaterThan(atFit, midZoom)
-        XCTAssertGreaterThan(midZoom, deepZoom)
-        XCTAssertGreaterThan(deepZoom, 0)
+    func testVectorLayerContentsScaleRejectsInvalidZoom() {
+        XCTAssertEqual(
+            PageRasterizationPolicy.vectorLayerContentsScale(zoomScale: 0, displayScale: 2),
+            2
+        )
+        XCTAssertEqual(
+            PageRasterizationPolicy.vectorLayerContentsScale(
+                zoomScale: .nan,
+                displayScale: 2
+            ),
+            2
+        )
     }
 }

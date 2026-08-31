@@ -14,6 +14,9 @@ import UIKit
 ///
 /// Ruled paper needs none of this. Its lines are a `CAShapeLayer`, so following
 /// the zoom with `contentsScale` keeps them genuinely vector-drawn.
+///
+/// Ink is not handled here at all. `PKCanvasView` owns the document zoom, so
+/// PencilKit re-tessellates its own vector strokes for the current scale.
 enum PageRasterizationPolicy {
 
     static let prefetchedPageCount = 3
@@ -22,10 +25,6 @@ enum PageRasterizationPolicy {
     /// slice of a page, so this bound is viewport-shaped rather than
     /// zoom-shaped.
     static let maximumDetailPixels = CGFloat(8_000_000)
-
-    /// Highest backing-store density PencilKit is asked to use. Reached at the
-    /// editor's maximum zoom on a 2x display.
-    static let maximumInkContentScale = CGFloat(16)
 
     /// Keeps small scroll adjustments inside the bitmap that is already on
     /// screen instead of re-rendering on every frame.
@@ -116,30 +115,21 @@ enum PageRasterizationPolicy {
         return DetailRequest(sourceRect: sourceRect, scale: scale)
     }
 
-    /// Backing-store density for the PencilKit canvases. PencilKit keeps ink as
-    /// vector strokes, so raising this makes it re-tessellate the strokes at the
-    /// zoomed resolution instead of magnifying a 1x rasterization.
-    static func inkContentScale(zoomScale: CGFloat, displayScale: CGFloat) -> CGFloat {
+    /// Density for vector layers that follow the zoom directly, such as the
+    /// ruled-paper `CAShapeLayer`.
+    static func vectorLayerContentsScale(
+        zoomScale: CGFloat,
+        displayScale: CGFloat
+    ) -> CGFloat {
         let baseScale = max(1, displayScale.isFinite ? displayScale : 1)
         guard zoomScale.isFinite, zoomScale > 0 else { return baseScale }
         let requiredScale = (zoomScale * baseScale).rounded(.up)
-        return min(max(baseScale, requiredScale), maximumInkContentScale)
+        return min(max(baseScale, requiredScale), maximumVectorLayerContentsScale)
     }
 
-    /// Document-space breathing room around the PencilKit viewport.
-    ///
-    /// The allocation is measured in document points, so a fixed overscan grows
-    /// the backing store quadratically once `inkContentScale` follows the zoom.
-    /// Trading buffer for density keeps the zoomed-in canvas both sharp and
-    /// bounded, and matters less at high zoom where a screenful of document is
-    /// small anyway.
-    static func inkViewportOverscan(zoomScale: CGFloat) -> CGFloat {
-        guard zoomScale.isFinite, zoomScale > 0 else { return 1 }
-        if zoomScale <= 1.01 { return 1 }
-        if zoomScale <= 2 { return 0.5 }
-        if zoomScale <= 4 { return 0.25 }
-        return 0.15
-    }
+    /// Ceiling for vector layer density. Reached at the editor's maximum zoom on
+    /// a 3x display.
+    static let maximumVectorLayerContentsScale = CGFloat(24)
 
     static func pageRange(
         pageCount: Int,
@@ -981,7 +971,7 @@ private final class BackgroundPageView: UIView {
     /// Animation still rasterizes at `contentsScale`. Without accounting for the
     /// document zoom, those hairlines alias exactly like a bitmap would.
     private var ruledLineContentsScale: CGFloat {
-        PageRasterizationPolicy.inkContentScale(
+        PageRasterizationPolicy.vectorLayerContentsScale(
             zoomScale: documentZoomScale,
             displayScale: max(1, traitCollection.displayScale)
         )

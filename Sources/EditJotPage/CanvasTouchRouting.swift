@@ -19,14 +19,13 @@
 @preconcurrency import PencilKit
 import UIKit
 
-/// Routes direct touches between PencilKit and the document scroll view.
+/// Decides how many fingers document navigation needs on the drawing canvas.
 ///
-/// `PKCanvasView` is itself a scroll view and owns additional selection gesture
-/// recognizers that can appear while the lasso remains active. This editor uses
-/// a separate document scroll view. When finger drawing is disabled, an
-/// app-owned navigation recognizer prevents PencilKit's transient selection
-/// gestures from preempting document scrolling. PencilKit continues to own
-/// Apple Pencil input and its drawing policy remains the source of truth.
+/// `PKCanvasView` is itself a scroll view, and this editor lets it own document
+/// pan and zoom so PencilKit re-renders ink at the zoomed resolution. PencilKit
+/// arbitrates its drawing recognizer against its own navigation gestures, so
+/// the app only supplies the finger count and leaves `drawingPolicy` as the
+/// source of truth for what may draw.
 @MainActor
 enum CanvasTouchRouting {
 
@@ -72,50 +71,34 @@ enum CanvasTouchRouting {
         return Configuration(isFingerDrawingEnabled: isFingerDrawingEnabled)
     }
 
-    /// Applies navigation settings without modifying PencilKit's drawing
-    /// recognizer. Apple recommends using `drawingPolicy`, rather than changing
-    /// `drawingGestureRecognizer.allowedTouchTypes`, to control drawing input.
+    /// Configures navigation on the canvas that owns document scrolling.
+    ///
+    /// PencilKit arbitrates its own drawing recognizer against its scroll and
+    /// zoom gestures, so the only thing left to decide is how many fingers a
+    /// pan needs: one when the pencil draws, two when a finger also draws.
+    /// Apple recommends expressing drawing input through `drawingPolicy` rather
+    /// than by editing `drawingGestureRecognizer.allowedTouchTypes`.
     static func apply(
         _ configuration: Configuration,
-        to canvasViews: [PKCanvasView],
-        documentScrollView: UIScrollView
+        to documentCanvasView: PKCanvasView
     ) {
         #if !targetEnvironment(macCatalyst)
-        let directTouch = NSNumber(value: UITouch.TouchType.direct.rawValue)
-        let directTouches = [directTouch]
-
-        if documentScrollView.panGestureRecognizer.allowedTouchTypes != directTouches {
-            documentScrollView.panGestureRecognizer.allowedTouchTypes = directTouches
+        if !documentCanvasView.isScrollEnabled {
+            documentCanvasView.isScrollEnabled = true
         }
-        // Set the upper bound first so transitioning from a custom one-touch
-        // configuration can never temporarily create an invalid range.
-        if documentScrollView.panGestureRecognizer.maximumNumberOfTouches != 2 {
-            documentScrollView.panGestureRecognizer.maximumNumberOfTouches = 2
+        if !documentCanvasView.panGestureRecognizer.isEnabled {
+            documentCanvasView.panGestureRecognizer.isEnabled = true
         }
-        if documentScrollView.panGestureRecognizer.minimumNumberOfTouches
+        // Raise the upper bound first so moving away from a one-touch
+        // configuration can never briefly describe an invalid range.
+        if documentCanvasView.panGestureRecognizer.maximumNumberOfTouches != 2 {
+            documentCanvasView.panGestureRecognizer.maximumNumberOfTouches = 2
+        }
+        if documentCanvasView.panGestureRecognizer.minimumNumberOfTouches
             != configuration.documentPanMinimumNumberOfTouches
         {
-            documentScrollView.panGestureRecognizer.minimumNumberOfTouches =
+            documentCanvasView.panGestureRecognizer.minimumNumberOfTouches =
                 configuration.documentPanMinimumNumberOfTouches
-        }
-        if documentScrollView.pinchGestureRecognizer?.allowedTouchTypes != directTouches {
-            documentScrollView.pinchGestureRecognizer?.allowedTouchTypes = directTouches
-        }
-
-        for canvasView in canvasViews {
-            // The outer document scroll view is the sole owner of pan and zoom.
-            if canvasView.isScrollEnabled {
-                canvasView.isScrollEnabled = false
-            }
-            if canvasView.panGestureRecognizer.isEnabled {
-                canvasView.panGestureRecognizer.isEnabled = false
-            }
-        }
-
-        if let documentScrollView = documentScrollView as? JotDocumentScrollView {
-            documentScrollView.protectNavigation(
-                from: canvasViews.map(\.drawingGestureRecognizer)
-            )
         }
         #endif
     }
@@ -135,127 +118,4 @@ enum CanvasEditMenuSuppressionPolicy {
     }
 }
 
-/// Keeps a direct-touch navigation pan from being preempted by transient
-/// PencilKit selection recognizers.
-///
-/// It never receives Apple Pencil touches. The native document pan and pinch
-/// recognizers remain simultaneous partners, while recognizers installed on
-/// descendant selection views cannot permanently take ownership of the next
-/// finger pan.
-@MainActor
-private final class DirectTouchNavigationPanGestureRecognizer: UIPanGestureRecognizer {
 
-    weak var documentPanGestureRecognizer: UIGestureRecognizer?
-    weak var documentPinchGestureRecognizer: UIGestureRecognizer?
-    var pencilKitDrawingGestureRecognizers: [UIGestureRecognizer] = []
-
-    override func canPrevent(_ preventedGestureRecognizer: UIGestureRecognizer) -> Bool {
-        if isNavigationRecognizer(preventedGestureRecognizer)
-            || isPencilKitDrawingRecognizer(preventedGestureRecognizer)
-        {
-            return false
-        }
-        return belongsToDocumentDescendant(preventedGestureRecognizer)
-    }
-
-    override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool {
-        if isNavigationRecognizer(preventingGestureRecognizer) {
-            return false
-        }
-        if isPencilKitDrawingRecognizer(preventingGestureRecognizer) {
-            return true
-        }
-        if belongsToDocumentDescendant(preventingGestureRecognizer) {
-            return false
-        }
-        // Keep system and ancestor gestures, such as the screen-edge back
-        // gesture, outside the document's arbitration policy.
-        return true
-    }
-
-    private func isNavigationRecognizer(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
-        gestureRecognizer === documentPanGestureRecognizer
-            || gestureRecognizer === documentPinchGestureRecognizer
-    }
-
-    private func isPencilKitDrawingRecognizer(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
-        pencilKitDrawingGestureRecognizers.contains {
-            $0 === gestureRecognizer
-        }
-    }
-
-    private func belongsToDocumentDescendant(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
-        guard let documentView = view,
-            let gestureView = gestureRecognizer.view,
-            gestureView !== documentView
-        else { return false }
-        return gestureView.isDescendant(of: documentView)
-    }
-}
-
-/// The outer scroll view owns finger navigation. A lightweight pan gate uses
-/// the real `UITouch.type` supplied by the gesture delegate, avoiding the
-/// unreliable touch inference previously performed from `UIEvent` in hit-test.
-@MainActor
-final class JotDocumentScrollView: UIScrollView, UIGestureRecognizerDelegate {
-
-    var shouldRouteDirectTouch: (() -> Bool)?
-
-    private lazy var directTouchNavigationGestureRecognizer: DirectTouchNavigationPanGestureRecognizer = {
-        let gestureRecognizer = DirectTouchNavigationPanGestureRecognizer(target: nil, action: nil)
-        gestureRecognizer.name = "Jottre.DirectTouchNavigation"
-        gestureRecognizer.allowedTouchTypes = [
-            NSNumber(value: UITouch.TouchType.direct.rawValue)
-        ]
-        gestureRecognizer.minimumNumberOfTouches = 1
-        gestureRecognizer.maximumNumberOfTouches = 2
-        gestureRecognizer.requiresExclusiveTouchType = true
-        gestureRecognizer.cancelsTouchesInView = true
-        gestureRecognizer.documentPanGestureRecognizer = panGestureRecognizer
-        gestureRecognizer.documentPinchGestureRecognizer = pinchGestureRecognizer
-        gestureRecognizer.addTarget(
-            self,
-            action: #selector(handleDirectTouchNavigation(_:))
-        )
-        gestureRecognizer.delegate = self
-        return gestureRecognizer
-    }()
-
-    override init(frame: CGRect) {
-        super.init(frame: frame)
-        addGestureRecognizer(directTouchNavigationGestureRecognizer)
-    }
-
-    required init?(coder: NSCoder) {
-        super.init(coder: coder)
-        addGestureRecognizer(directTouchNavigationGestureRecognizer)
-    }
-
-    func protectNavigation(from drawingGestureRecognizers: [UIGestureRecognizer]) {
-        directTouchNavigationGestureRecognizer.pencilKitDrawingGestureRecognizers =
-            drawingGestureRecognizers
-    }
-
-    @objc
-    private func handleDirectTouchNavigation(_ gestureRecognizer: UIPanGestureRecognizer) {
-        // Recognition itself is the signal. The native scroll-view pan applies
-        // translation and deceleration while recognizing simultaneously.
-    }
-
-    func gestureRecognizer(
-        _ gestureRecognizer: UIGestureRecognizer,
-        shouldReceive touch: UITouch
-    ) -> Bool {
-        guard gestureRecognizer === directTouchNavigationGestureRecognizer else { return true }
-        return touch.type == .direct && shouldRouteDirectTouch?() == true
-    }
-
-    func gestureRecognizer(
-        _ gestureRecognizer: UIGestureRecognizer,
-        shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
-    ) -> Bool {
-        guard gestureRecognizer === directTouchNavigationGestureRecognizer else { return false }
-        return otherGestureRecognizer === panGestureRecognizer
-            || otherGestureRecognizer === pinchGestureRecognizer
-    }
-}
