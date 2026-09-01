@@ -77,8 +77,15 @@ final class EditJotViewController: UIViewController {
         return canvasView
     }()
 
-    /// Marker ink lives on its own canvas so it composites below the pen plane.
-    /// It mirrors the foreground canvas's zoom and offset instead of scrolling.
+    /// Display-only plane retained so existing marker drawings keep rendering
+    /// beneath the pen plane for callers that still split the two layers.
+    ///
+    /// It never receives input: PencilKit's gesture view spans the whole
+    /// viewport of the scrolling canvas, and a gesture recognizer only sees
+    /// touches whose hit-test view is itself or one of its descendants, so a
+    /// nested sibling canvas is unreachable. All drawing therefore happens on
+    /// `canvasView`, and `JotDrawingLayerPartition` keeps marker strokes first
+    /// so ink still composites in the right order.
     private lazy var highlighterCanvasView: JotCanvasView = {
         let canvasView = JotCanvasView()
         canvasView.delegate = self
@@ -603,21 +610,24 @@ final class EditJotViewController: UIViewController {
         if backgroundView.frame != documentBounds {
             backgroundView.frame = documentBounds
         }
-        // The highlighter canvas is not the zoom owner, so it holds the document
-        // at 1:1 and is scaled by the mirroring transform instead.
-        if highlighterCanvasView.bounds.size != documentContentSize {
-            highlighterCanvasView.bounds = documentBounds
-            highlighterCanvasView.contentSize = documentContentSize
-        }
         CATransaction.commit()
 
-        // `contentSize` must be written in unscaled document units, but the
-        // getter reports the zoomed size. Track what was applied instead of
-        // comparing against the live value, or a zoomed read would be fed back
-        // in and compound the scale.
-        if documentGeometryChanged || appliedCanvasContentSize == .zero {
+        // `contentSize` describes the content at the current zoom, so writing
+        // unscaled document units while zoomed out would make the scroll view
+        // infer a much wider document. That is what pushed the page off centre
+        // and left a writable margin beside it. Scale the assignment, and track
+        // the unscaled value separately because the getter reports zoomed size.
+        let zoomedContentSize = CGSize(
+            width: documentContentSize.width * scale,
+            height: documentContentSize.height * scale
+        )
+        if documentGeometryChanged
+            || appliedCanvasContentSize == .zero
+            || abs(documentScrollView.contentSize.width - zoomedContentSize.width) > 0.5
+            || abs(documentScrollView.contentSize.height - zoomedContentSize.height) > 0.5
+        {
             appliedCanvasContentSize = documentContentSize
-            documentScrollView.contentSize = documentContentSize
+            documentScrollView.contentSize = zoomedContentSize
         }
 
         let horizontalInset = max(0, (documentScrollView.bounds.width - scaledWidth) / 2)
@@ -671,16 +681,14 @@ final class EditJotViewController: UIViewController {
             canvasView.topEdgeEffect.isHidden = true
             highlighterCanvasView.topEdgeEffect.isHidden = true
         }
-        // Both mirrored planes are nested inside the scrolling canvas rather
-        // than placed beside it. A gesture recognizer only receives touches
-        // whose hit-test view is its own view or a descendant, so siblings would
-        // swallow document pan and pinch as soon as they covered the page.
-        // PencilKit inserts its ink views after these, so pen ink still
-        // composites above marker ink.
+        // The background is nested inside the scrolling canvas rather than
+        // placed beside it. A gesture recognizer only receives touches whose
+        // hit-test view is its own view or a descendant, so a sibling would
+        // swallow document pan and pinch as soon as it covered the page.
+        // PencilKit inserts its ink views after this one, so ink draws on top.
         view.addSubview(canvasView)
         backgroundContainerView.addSubview(backgroundView)
         canvasView.insertSubview(backgroundContainerView, at: 0)
-        canvasView.insertSubview(highlighterCanvasView, aboveSubview: backgroundContainerView)
         canvasView.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
             canvasView.topAnchor.constraint(equalTo: view.topAnchor),
@@ -724,11 +732,13 @@ final class EditJotViewController: UIViewController {
             liveDrawing,
             strokePageIndices: indices
         )
+        // Scribble-erase is a pen behaviour, so suppress it while the marker is
+        // selected. The canvas mode no longer distinguishes the two.
+        let isMarkerSelected = (canvasView.tool as? PKInkingTool)?.inkType == .marker
         viewModel.didChangeDrawing(
             combined,
             strokePageIndices: inkCanvasCoordinator.committedStrokePageIndices,
-            detectsScribbleErase: detectsScribbleErase
-                && inkCanvasCoordinator.mode != .highlighter
+            detectsScribbleErase: detectsScribbleErase && !isMarkerSelected
         )
         finishToolUndoGrouping()
         if contentExtent(for: combined) != previousExtent {
@@ -774,9 +784,10 @@ final class EditJotViewController: UIViewController {
 
         switch gestureRecognizer.state {
         case .began:
+            // All tools share one canvas now, so the selected tool, rather than
+            // a canvas mode, decides whether a hold may snap to a shape.
             guard isDrawAndHoldShapeConversionEnabled,
                 isEditingEnabled,
-                inkCanvasCoordinator.mode == .foreground,
                 let inkingTool = canvasView.tool as? PKInkingTool,
                 inkingTool.inkType != .marker
             else {
@@ -1040,11 +1051,10 @@ final class EditJotViewController: UIViewController {
         return (fitLongEdge, max(fitLongEdge, fillShortEdge))
     }
 
-    /// Projects the canvas's scroll and zoom state onto the background and the
-    /// highlighter plane.
+    /// Projects the canvas's zoom onto the background plane.
     ///
     /// PencilKit applies the zoom as a transform on its own internal content
-    /// view, so sibling views have to be scaled explicitly. Doing it with a
+    /// view, so a view the app adds has to be scaled explicitly. Doing it with a
     /// layer transform keeps the PDF's vector re-render and the ink perfectly
     /// registered without re-laying out the page views on every frame.
     private func syncDocumentPlanes() {
@@ -1054,19 +1064,17 @@ final class EditJotViewController: UIViewController {
         let offset = canvasView.contentOffset
 
         // No CATransaction override here. During an animated zoom PencilKit
-        // animates its own content, so the mirrored planes have to inherit the
-        // very same animation to stay visually locked to the ink. Suppressing
-        // actions would make the background snap while the ink glides.
+        // animates its own content, so the background has to inherit the very
+        // same animation to stay visually locked to the ink. Suppressing actions
+        // would make the background snap while the ink glides.
         //
-        // These planes are subviews of the canvas, so they already scroll with
-        // it and only the zoom has to be reproduced. Anchoring at the layer
-        // origin scales the document about its top-left corner, matching how
-        // the canvas scales its own content.
-        for plane in [backgroundContainerView, highlighterCanvasView] {
-            plane.layer.anchorPoint = .zero
-            plane.layer.position = .zero
-            plane.layer.transform = CATransform3DMakeScale(scale, scale, 1)
-        }
+        // The plane is a subview of the canvas, so it already scrolls with it
+        // and only the zoom has to be reproduced. Anchoring at the layer origin
+        // scales the document about its top-left corner, matching how the canvas
+        // scales its own content.
+        backgroundContainerView.layer.anchorPoint = .zero
+        backgroundContainerView.layer.position = .zero
+        backgroundContainerView.layer.transform = CATransform3DMakeScale(scale, scale, 1)
 
         backgroundView.sync(
             scrollOffset: offset,
@@ -1213,14 +1221,13 @@ extension EditJotViewController: PKToolPickerObserver {
             dismissPencilKitEditMenus()
         }
 
-        let nextMode: JotInkCanvasCoordinator.Mode
-        if let inkingTool = selectedTool as? PKInkingTool {
-            nextMode = inkingTool.inkType == .marker ? .highlighter : .foreground
-        } else if selectedTool is PKLassoTool || selectedTool is PKEraserTool {
-            nextMode = .combined
-        } else {
-            nextMode = .foreground
-        }
+        // Every tool draws on the canvas that owns scrolling. PencilKit's own
+        // gesture view covers the whole viewport, and a gesture recognizer only
+        // sees touches whose hit-test view is itself or a descendant, so a
+        // nested sibling canvas can never receive input. Marker ordering is
+        // preserved by JotDrawingLayerPartition, which always stores marker
+        // strokes first, so a single canvas still composites ink correctly.
+        let nextMode = JotInkCanvasCoordinator.Mode.combined
 
         if inkCanvasCoordinator.mode != nextMode,
             hasPendingDrawingChange || inkCanvasCoordinator.hasUncommittedChanges
@@ -1286,28 +1293,29 @@ extension EditJotViewController {
     }
 
     private func updateCanvasInteraction() {
-        let activeCanvas = inkCanvasCoordinator.activeCanvas
-        for canvas in [highlighterCanvasView, canvasView] {
-            let isActive = isEditingEnabled && canvas === activeCanvas
-            // The foreground canvas owns document scrolling, so it always stays
-            // interactive; only its drawing input follows the editing state.
-            canvas.isUserInteractionEnabled = isActive || canvas === canvasView
-            if #available(iOS 18.0, *) {
-                canvas.isDrawingEnabled = isActive
-            } else if canvas.drawingGestureRecognizer.isEnabled != isActive {
-                canvas.drawingGestureRecognizer.isEnabled = isActive
-            }
-            if !isActive {
-                canvas.resignFirstResponder()
-            }
+        // Only the scrolling canvas draws. It stays interactive regardless so it
+        // keeps owning document pan and zoom; the editing state gates ink input.
+        highlighterCanvasView.isUserInteractionEnabled = false
+        if #available(iOS 18.0, *) {
+            highlighterCanvasView.isDrawingEnabled = false
+        }
+        highlighterCanvasView.resignFirstResponder()
+
+        canvasView.isUserInteractionEnabled = true
+        if #available(iOS 18.0, *) {
+            canvasView.isDrawingEnabled = isEditingEnabled
+        } else if canvasView.drawingGestureRecognizer.isEnabled != isEditingEnabled {
+            canvasView.drawingGestureRecognizer.isEnabled = isEditingEnabled
         }
 
-
-        guard isEditingEnabled else { return }
+        guard isEditingEnabled else {
+            canvasView.resignFirstResponder()
+            return
+        }
         #if !targetEnvironment(macCatalyst)
-        toolPicker.setVisible(true, forFirstResponder: activeCanvas)
+        toolPicker.setVisible(true, forFirstResponder: canvasView)
         #endif
-        activeCanvas.becomeFirstResponder()
+        canvasView.becomeFirstResponder()
     }
 
     private var isDrawAndHoldShapeConversionEnabled: Bool {

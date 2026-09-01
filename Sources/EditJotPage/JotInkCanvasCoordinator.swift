@@ -46,7 +46,11 @@ final class JotInkCanvasCoordinator {
     private let highlighterCanvas: PKCanvasView
     private let foregroundCanvas: PKCanvasView
 
-    private(set) var mode = Mode.foreground
+    /// The editor draws every tool on one canvas, because PencilKit's gesture
+    /// view covers the whole viewport and a nested sibling canvas can never
+    /// receive touches. Marker ordering still holds: `JotDrawingLayerPartition`
+    /// always stores marker strokes first.
+    private(set) var mode = Mode.combined
     private(set) var committedDrawing = PKDrawing()
     private(set) var committedStrokePageIndices: [Int] = []
     private(set) var partition = JotDrawingLayerPartition(drawing: PKDrawing())
