@@ -313,7 +313,7 @@ final class WebDAVAutoBackupScheduler {
                 identifier: backgroundTaskIdentifier,
                 earliestBeginDate: earliestBeginDate,
                 requiresNetworkConnectivity: true,
-                requiresExternalPower: false
+                requiresExternalPower: true
             )
         } catch {
             // Scheduling is best-effort (for example, Background App Refresh

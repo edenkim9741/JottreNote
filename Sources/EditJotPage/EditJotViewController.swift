@@ -1055,7 +1055,7 @@ final class EditJotViewController: UIViewController {
     ///
     /// PencilKit applies the zoom as a transform on its own internal content
     /// view, so a view the app adds has to be scaled explicitly. Doing it with a
-    /// layer transform keeps the PDF's vector re-render and the ink perfectly
+    /// layer transform keeps the PDF page re-render and the ink perfectly
     /// registered without re-laying out the page views on every frame.
     private func syncDocumentPlanes() {
         guard documentContentSize.width > 0, documentContentSize.height > 0 else { return }

@@ -388,8 +388,8 @@ struct WebDAVBackupService: Sendable {
                                 fillsBackground: false
                             )
                         }
-                        // Ink is written as vector paths so a backup reopened at
-                        // any zoom stays as sharp as the editor.
+                        // Use PencilKit's renderer so backup PDFs match the editor
+                        // instead of approximating stroke geometry.
                         VectorInkRenderer.draw(
                             drawing: layers.highlighter,
                             canvasRect: canvasRect,

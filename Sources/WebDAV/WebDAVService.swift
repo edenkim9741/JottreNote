@@ -57,6 +57,18 @@ struct WebDAVService: Sendable {
         }
     }
 
+    // Shared HTTP date formatter. `DateFormatter` is expensive to instantiate
+    // (locale, calendar, time-zone databases) and `lastModified` is called
+    // twice per note during automatic sync. A single shared instance avoids
+    // creating hundreds of formatters per backup cycle.
+    private static let httpDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        return formatter
+    }()
+
     /// Returns the `Last-Modified` date of the remote resource, or `nil` if it does not exist (404).
     func lastModified(remotePath: String) async -> Date? {
         var request = URLRequest(url: baseURL.appendingPathComponent(remotePath))
@@ -68,10 +80,8 @@ struct WebDAVService: Sendable {
               httpResponse.statusCode == 200
         else { return nil }
 
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
-        return httpResponse.value(forHTTPHeaderField: "Last-Modified").flatMap { formatter.date(from: $0) }
+        return httpResponse.value(forHTTPHeaderField: "Last-Modified")
+            .flatMap { Self.httpDateFormatter.date(from: $0) }
     }
 
     private func addAuthHeader(to request: inout URLRequest) {

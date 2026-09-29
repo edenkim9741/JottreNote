@@ -146,6 +146,11 @@ struct JotsRepository: JotsRepositoryProtocol {
                                 // sort event may replace the buffered wake-up,
                                 // but cannot erase the required disk reload.
                                 refreshState.recordDirectoryChange()
+                                // Debounce rapid filesystem events (e.g. autosave
+                                // writing .jot files while the user draws) so a
+                                // burst of writes coalesces into one directory scan.
+                                try await Task.sleep(for: .milliseconds(500))
+                                try Task.checkCancellation()
                                 changesContinuation.yield()
                             }
                         }

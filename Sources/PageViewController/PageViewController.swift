@@ -197,8 +197,8 @@ final class PageViewController: UIViewController {
         var snapshot = NSDiffableDataSourceSnapshot<Int, PageCellItem>()
         snapshot.appendSections([0])
         snapshot.appendItems(items)
-        dataSource.apply(snapshot, animatingDifferences: hasExistingItems)
-        collectionViewLayout.invalidateLayout()
+        let shouldAnimate = hasExistingItems && viewIfLoaded?.window != nil
+        dataSource.apply(snapshot, animatingDifferences: shouldAnimate)
         syncSelectionToVisibleItems()
     }
 
