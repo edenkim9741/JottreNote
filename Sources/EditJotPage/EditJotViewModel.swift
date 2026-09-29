@@ -332,6 +332,10 @@ final class EditJotViewModel {
         guard isPersistenceReady else { return }
         let snapshot = makePersistenceSnapshot()
         let shouldFlush = isDirty
+        // Skip WebDAV backup entirely when the note was not modified.
+        // Opening a note just to read it should not trigger PDF re-rendering
+        // and network uploads.
+        guard shouldFlush else { return }
         let writer = persistenceWriter
         let backupService = webDAVBackupService
         let jotFileInfo = jotFileInfo
@@ -339,14 +343,12 @@ final class EditJotViewModel {
 
         backupTask?.cancel()
         backupTask = Task { [weak self] in
-            if shouldFlush {
-                do {
-                    try await writer.saveImmediately(snapshot)
-                    self?.markPersisted(revision: snapshot.revision)
-                } catch {
-                    logger.error("Failed to flush jot before backup: \(error)")
-                    return
-                }
+            do {
+                try await writer.saveImmediately(snapshot)
+                self?.markPersisted(revision: snapshot.revision)
+            } catch {
+                logger.error("Failed to flush jot before backup: \(error)")
+                return
             }
             guard !Task.isCancelled else { return }
             await backupService.backup(jotFileInfo: jotFileInfo, content: snapshot.content)

@@ -382,11 +382,24 @@ private extension SceneCoordinator {
 
     func listFoldersForSelection() async throws -> [FolderBusinessModel] {
         guard let root = try await fileService.documentsDirectory() else { return [] }
-        return try listFoldersRecursively(directory: root)
-            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        // Offload the recursive filesystem traversal to a background thread
+        // so it does not block the main run loop or cause frame drops.
+        let fileService = self.fileService
+        return try await Task.detached(priority: .userInitiated) {
+            try Self.listFoldersRecursivelyOffMain(directory: root, fileService: fileService)
+                .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        }.value
     }
 
     func listFoldersRecursively(directory: URL) throws -> [FolderBusinessModel] {
+        try Self.listFoldersRecursivelyOffMain(directory: directory, fileService: fileService)
+    }
+
+    /// Nonisolated recursive implementation that can run on any thread.
+    private nonisolated static func listFoldersRecursivelyOffMain(
+        directory: URL,
+        fileService: FileServiceProtocol
+    ) throws -> [FolderBusinessModel] {
         let urls = try fileService.listContents(
             directory: directory,
             properties: [.isDirectoryKey, .contentModificationDateKey]
@@ -402,7 +415,7 @@ private extension SceneCoordinator {
                     modificationDate: properties.contentModificationDate
                 )
             )
-            folders.append(contentsOf: try listFoldersRecursively(directory: url))
+            folders.append(contentsOf: try listFoldersRecursivelyOffMain(directory: url, fileService: fileService))
         }
         return folders
     }
