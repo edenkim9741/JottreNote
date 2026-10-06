@@ -17,6 +17,7 @@
 */
 
 @preconcurrency import PencilKit
+import PDFKit
 import UIKit
 
 protocol ShareJotRepositoryProtocol: Sendable {
@@ -58,18 +59,31 @@ struct ShareJotRepository: ShareJotRepositoryProtocol {
         format: ShareFormat
     ) async throws -> URL {
         let jotFile = try jotFileService.readJotFile(jotFileInfo: jotFileInfo)
-        let drawing = try PKDrawing(data: jotFile.jot.drawing)
+        let sourceJot = jotFile.jot
+        let drawing = try PKDrawing(data: sourceJot.drawing)
+        let sourcePDFData = jotFile.jot.pdfData.map(HybridPDFManager.pdfData(in:))
+        let sourcePageCount = sourcePDFData.flatMap { PDFDocument(data: $0)?.pageCount } ?? 0
+        let hasEmbeddedJot = jotFile.jot.pdfData.map { HybridPDFManager.embeddedJotData(in: $0) != nil } ?? false
+        print("[Load] PDF Data Size: \(sourcePDFData?.count ?? 0), PageCount: \(sourcePageCount), Embedded Jot Found: \(hasEmbeddedJot), Drawing Strokes: \(drawing.strokes.count)")
         let temporaryDirectory = fileService.temporaryDirectory()
-        let background = makeBackground(jot: jotFile.jot)
+        let url = temporaryDirectory
+            .appendingPathComponent(jotFileInfo.name)
+            .appendingPathExtension(format.fileExtension)
+
+        if format == .pdf {
+            return try exportHybridPDF(
+                jot: sourceJot,
+                url: url
+            )
+        }
+
+        let background = makeBackground(jot: sourceJot)
 
         return try await exportOnMainActor(
             drawing: drawing,
             background: background,
             format: format,
-            url:
-                temporaryDirectory
-                .appendingPathComponent(jotFileInfo.name)
-                .appendingPathExtension(format.fileExtension)
+            url: url
         )
     }
 
@@ -82,7 +96,7 @@ struct ShareJotRepository: ShareJotRepositoryProtocol {
     ) throws -> URL {
         switch format {
         case .pdf:
-            return try exportPDF(drawing: drawing, background: background, url: url)
+            throw Failure.couldNotRenderImage
         case .jpg:
             return try exportRaster(
                 drawing: drawing,
@@ -102,57 +116,14 @@ struct ShareJotRepository: ShareJotRepositoryProtocol {
 
     // MARK: - PDF
 
-    @MainActor
-    private func exportPDF(
-        drawing: PKDrawing,
-        background: Background,
+    private func exportHybridPDF(
+        jot: Jot,
         url: URL
     ) throws -> URL {
-        let pageBounds = CGRect(origin: .zero, size: background.pageSize)
-        let renderer = UIGraphicsPDFRenderer(bounds: pageBounds)
-        let layers = JotDrawingLayerPartition(drawing: drawing)
-
-        // Stream pages straight to disk. `pdfData` retained the whole output plus
-        // every autoreleased page bitmap and could terminate the app on long notes.
-        try renderer.writePDF(to: url) { rendererContext in
-            for pageIndex in 0..<background.totalPages {
-                autoreleasepool {
-                    rendererContext.beginPage()
-                    renderPageFoundation(
-                        background,
-                        logicalPageIndex: pageIndex,
-                        in: pageBounds,
-                        context: rendererContext.cgContext
-                    )
-
-                    let pageY = CGFloat(pageIndex) * background.pageStride
-                    let canvasRect = CGRect(
-                        x: 0,
-                        y: pageY,
-                        width: background.pageSize.width,
-                        height: background.pageSize.height
-                    )
-                    renderPDFContent(
-                        background,
-                        logicalPageIndex: pageIndex,
-                        in: pageBounds,
-                        context: rendererContext.cgContext
-                    )
-                    VectorInkRenderer.draw(
-                        drawing: layers.highlighter,
-                        canvasRect: canvasRect,
-                        pageBounds: pageBounds,
-                        context: rendererContext.cgContext
-                    )
-                    VectorInkRenderer.draw(
-                        drawing: layers.foreground,
-                        canvasRect: canvasRect,
-                        pageBounds: pageBounds,
-                        context: rendererContext.cgContext
-                    )
-                }
-            }
-        }
+        let hybridPDF = try JotHybridPDFBuilder.buildHybridPDF(jot: jot)
+        let jotDataSize = HybridPDFManager.embeddedJotData(in: hybridPDF)?.count ?? 0
+        print("[Save] Original PDF Size: \(jot.pdfData?.count ?? 0), New PDF Size: \(hybridPDF.count), Embedded Jot Size: \(jotDataSize)")
+        try hybridPDF.write(to: url, options: .atomic)
         return url
     }
 
@@ -272,12 +243,7 @@ struct ShareJotRepository: ShareJotRepositoryProtocol {
         }
 
         let pdfPageCount = min(result.pageCount, Constants.maximumPageCount)
-        let safeExtraPages = min(
-            max(0, jot.extraPages),
-            Constants.maximumPageCount - pdfPageCount
-        )
-        let legacySlots = Array(pdfPageCount..<(pdfPageCount + safeExtraPages))
-        let sourceSlots = jot.pdfInsertedPageSlots.isEmpty ? legacySlots : jot.pdfInsertedPageSlots
+        let sourceSlots = jot.pdfInsertedPageSlots
         let maximumSlot = min(
             Constants.maximumPageCount,
             pdfPageCount + min(sourceSlots.count, Constants.maximumPageCount - pdfPageCount)

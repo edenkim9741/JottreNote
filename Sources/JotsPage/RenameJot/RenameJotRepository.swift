@@ -24,16 +24,12 @@ protocol RenameJotRepositoryProtocol {
 struct RenameJotRepository: RenameJotRepositoryProtocol {
 
     private let jotFileService: JotFileServiceProtocol
-    private let webDAVBackupService: WebDAVBackupService
 
-    init(jotFileService: JotFileServiceProtocol, webDAVBackupService: WebDAVBackupService) {
+    init(jotFileService: JotFileServiceProtocol) {
         self.jotFileService = jotFileService
-        self.webDAVBackupService = webDAVBackupService
     }
 
     func rename(jotFileInfo: JotFile.Info, newName: String) throws -> JotFile.Info {
-        let renamedInfo = try jotFileService.rename(jotFileInfo: jotFileInfo, newName: newName)
-        webDAVBackupService.moveFiles(from: jotFileInfo, to: renamedInfo)
-        return renamedInfo
+        try jotFileService.rename(jotFileInfo: jotFileInfo, newName: newName)
     }
 }

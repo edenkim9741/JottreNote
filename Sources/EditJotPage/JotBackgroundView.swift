@@ -867,6 +867,11 @@ private final class BackgroundPageView: UIView {
             pdfPageIndex = nil
         }
         super.init(frame: .zero)
+        registerForTraitChanges([UITraitUserInterfaceStyle.self]) {
+            (self: BackgroundPageView, previousTraitCollection: UITraitCollection) in
+            guard self.traitCollection.hasDifferentColorAppearance(comparedTo: previousTraitCollection) else { return }
+            self.updateAppearance()
+        }
         isOpaque = true
         layer.drawsAsynchronously = true
         layer.contentsGravity = .resize
@@ -916,12 +921,6 @@ private final class BackgroundPageView: UIView {
         }
         ruledLinesLayer.path = path
         ruledLinesLayer.contentsScale = ruledLineContentsScale
-    }
-
-    override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
-        super.traitCollectionDidChange(previousTraitCollection)
-        guard traitCollection.hasDifferentColorAppearance(comparedTo: previousTraitCollection) else { return }
-        updateAppearance()
     }
 
     func setRasterImage(_ image: CGImage, scale: CGFloat) {

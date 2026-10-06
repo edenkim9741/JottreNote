@@ -19,9 +19,31 @@
 import Foundation
 @preconcurrency import PencilKit
 
+struct TrashedPage: Codable, Sendable, Hashable, Identifiable {
+    let id: UUID
+    let originalIndex: Int
+    let pdfPageData: Data
+    let drawingData: Data
+    let deletedAt: Date
+
+    init(
+        id: UUID = UUID(),
+        originalIndex: Int,
+        pdfPageData: Data,
+        drawingData: Data,
+        deletedAt: Date = Date()
+    ) {
+        self.id = id
+        self.originalIndex = originalIndex
+        self.pdfPageData = pdfPageData
+        self.drawingData = drawingData
+        self.deletedAt = deletedAt
+    }
+}
+
 struct Jot: Codable, Sendable {
 
-    static let currentVersion = 3
+    static let currentVersion = 4
     static let defaultWidth = CGFloat(1200)
 
     private static let emptyDrawingData = PKDrawing().dataRepresentation()
@@ -36,8 +58,6 @@ struct Jot: Codable, Sendable {
     var version: Int
     let drawing: Data
     let width: CGFloat
-    // NOTE: Kept for backwards compatibility.
-    var lastModified: Double?
     var pdfData: Data?
     var extraPages: Int
     var pdfInsertedPageSlots: [Int]
@@ -46,58 +66,67 @@ struct Jot: Codable, Sendable {
     // logical page an ink stroke was created on so we can remove or query
     // all strokes for a specific page efficiently.
     var strokePageIndices: [Int]
+    var trashedPages: [TrashedPage]
+    var zoteroItemKey: String?
+    var zoteroFileName: String?
 
     init(
         version: Int = Self.currentVersion,
         drawing: Data,
         width: CGFloat = Self.defaultWidth,
-        lastModified: Double? = .zero,
         pdfData: Data? = nil,
         extraPages: Int = 0,
         pdfInsertedPageSlots: [Int] = [],
-        strokePageIndices: [Int] = []
+        strokePageIndices: [Int] = [],
+        trashedPages: [TrashedPage] = [],
+        zoteroItemKey: String? = nil,
+        zoteroFileName: String? = nil
     ) {
         self.version = version
         self.drawing = drawing
         self.width = width
-        self.lastModified = lastModified
         self.pdfData = pdfData
         self.extraPages = extraPages
         self.pdfInsertedPageSlots = pdfInsertedPageSlots
         self.strokePageIndices = strokePageIndices
+        self.trashedPages = trashedPages
+        self.zoteroItemKey = zoteroItemKey
+        self.zoteroFileName = zoteroFileName
     }
 
     private enum CodingKeys: String, CodingKey {
         case version
         case drawing
         case width
-        case lastModified
         case pdfData
         case extraPages
         case pdfInsertedPageSlots
         case strokePageIndices
+        case trashedPages
+        case zoteroItemKey
+        case zoteroFileName
     }
 
-    /// Older Jottre files predate the PDF/page metadata fields. Synthesized
-    /// `Decodable` ignores property defaults and would reject those files with
-    /// `keyNotFound`, so optional fields are decoded explicitly here.
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
 
-        version = try values.decodeIfPresent(Int.self, forKey: .version) ?? 1
+        version = try values.decode(Int.self, forKey: .version)
+        guard version == Self.currentVersion else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .version,
+                in: values,
+                debugDescription: "Unsupported Jot format version."
+            )
+        }
         drawing = try values.decode(Data.self, forKey: .drawing)
-        width = try values.decodeIfPresent(CGFloat.self, forKey: .width) ?? Self.defaultWidth
-        lastModified = try values.decodeIfPresent(Double.self, forKey: .lastModified)
+        width = try values.decode(CGFloat.self, forKey: .width)
         pdfData = try values.decodeIfPresent(Data.self, forKey: .pdfData)
-        extraPages = try values.decodeIfPresent(Int.self, forKey: .extraPages) ?? 0
-        pdfInsertedPageSlots = try values.decodeIfPresent(
-            [Int].self,
-            forKey: .pdfInsertedPageSlots
-        ) ?? []
-        strokePageIndices = try values.decodeIfPresent(
-            [Int].self,
-            forKey: .strokePageIndices
-        ) ?? []
+        extraPages = try values.decode(Int.self, forKey: .extraPages)
+        pdfInsertedPageSlots = try values.decode([Int].self, forKey: .pdfInsertedPageSlots)
+        strokePageIndices = try values.decode([Int].self, forKey: .strokePageIndices)
+        trashedPages = try values.decodeIfPresent([TrashedPage].self, forKey: .trashedPages) ?? []
+        zoteroItemKey = try values.decodeIfPresent(String.self, forKey: .zoteroItemKey)
+        zoteroFileName = try values.decodeIfPresent(String.self, forKey: .zoteroFileName)
 
         guard width.isFinite, width > 0, extraPages >= 0 else {
             throw DecodingError.dataCorrupted(
@@ -114,10 +143,12 @@ struct Jot: Codable, Sendable {
         try values.encode(version, forKey: .version)
         try values.encode(drawing, forKey: .drawing)
         try values.encode(width, forKey: .width)
-        try values.encodeIfPresent(lastModified, forKey: .lastModified)
         try values.encodeIfPresent(pdfData, forKey: .pdfData)
         try values.encode(extraPages, forKey: .extraPages)
         try values.encode(pdfInsertedPageSlots, forKey: .pdfInsertedPageSlots)
         try values.encode(strokePageIndices, forKey: .strokePageIndices)
+        try values.encode(trashedPages, forKey: .trashedPages)
+        try values.encodeIfPresent(zoteroItemKey, forKey: .zoteroItemKey)
+        try values.encodeIfPresent(zoteroFileName, forKey: .zoteroFileName)
     }
 }

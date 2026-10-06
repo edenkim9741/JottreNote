@@ -30,4 +30,10 @@
 - UI는 프로젝트 스타일에 맞춰 UIKit을 따르며, 에러 핸들링(`do-catch`, `guard let`)이 명확한 Modern Swift 코드를 작성하세요.
 
 
-xcodebuild -scheme Jottre  -configuration Release -destination 'generic/platform=iOS' build
+xcodebuild -scheme Jottre \
+	-configuration Release \
+	-destination 'generic/platform=iOS' \
+	-allowProvisioningUpdates \
+	MARKETING_VERSION=1.0.0 \
+	CURRENT_PROJECT_VERSION=1 \
+	build

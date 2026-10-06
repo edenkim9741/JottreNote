@@ -19,6 +19,8 @@
 @preconcurrency import PencilKit
 import CoreGraphics
 import Foundation
+import PDFKit
+import UIKit
 
 struct JotPDFMetadata: Sendable {
     let pageCount: Int
@@ -52,7 +54,11 @@ struct JotContent: Sendable {
     let extraPages: Int
     let pdfInsertedPageSlots: [Int]
     let strokePageIndices: [Int]
+    let dirtyPageIndices: Set<Int>
+    let trashedPages: [TrashedPage]
     let pdfMetadata: JotPDFMetadata?
+    let zoteroItemKey: String?
+    let zoteroFileName: String?
 
     init(
         drawing: PKDrawing,
@@ -61,7 +67,11 @@ struct JotContent: Sendable {
         extraPages: Int,
         pdfInsertedPageSlots: [Int],
         strokePageIndices: [Int],
-        pdfMetadata: JotPDFMetadata? = nil
+        dirtyPageIndices: Set<Int> = [],
+        trashedPages: [TrashedPage] = [],
+        pdfMetadata: JotPDFMetadata? = nil,
+        zoteroItemKey: String? = nil,
+        zoteroFileName: String? = nil
     ) {
         self.drawing = drawing
         self.width = width
@@ -69,7 +79,11 @@ struct JotContent: Sendable {
         self.extraPages = extraPages
         self.pdfInsertedPageSlots = pdfInsertedPageSlots
         self.strokePageIndices = strokePageIndices
+        self.dirtyPageIndices = dirtyPageIndices
+        self.trashedPages = trashedPages
         self.pdfMetadata = pdfMetadata
+        self.zoteroItemKey = zoteroItemKey
+        self.zoteroFileName = zoteroFileName
     }
 }
 
@@ -100,17 +114,23 @@ struct EditJotRepository: EditJotRepositoryProtocol {
     private let jotFileConflictService: JotFileConflictServiceProtocol
     private let fileService: FileServiceProtocol
     private let trashService: TrashService
+    private let zoteroCacheStore: ZoteroCacheStore
+    private let defaultsService: DefaultsServiceProtocol
 
     init(
         jotFileService: JotFileServiceProtocol,
         jotFileConflictService: JotFileConflictServiceProtocol,
         fileService: FileServiceProtocol,
-        trashService: TrashService
+        trashService: TrashService,
+        zoteroCacheStore: ZoteroCacheStore = ZoteroCacheStore(),
+        defaultsService: DefaultsServiceProtocol = DefaultsService(userDefaults: .standard)
     ) {
         self.jotFileService = jotFileService
         self.jotFileConflictService = jotFileConflictService
         self.fileService = fileService
         self.trashService = trashService
+        self.zoteroCacheStore = zoteroCacheStore
+        self.defaultsService = defaultsService
     }
 
     func readContent(
@@ -120,16 +140,28 @@ struct EditJotRepository: EditJotRepositoryProtocol {
         onProgress(0.1)
         let file = try jotFileService.readJotFile(jotFileInfo: jotFileInfo)
         onProgress(0.5)
-        let drawing = try PKDrawing(data: file.jot.drawing)
+        // The outer .jot is the authoritative editor state. Its embedded PDF
+        // attachment is an interchange copy and may be stale after PDF-only edits.
+        let sourceJot = file.jot
+        let drawing = try PKDrawing(data: sourceJot.drawing)
+        let storedPDFData = file.jot.pdfData
+        let pdfData = storedPDFData.map(HybridPDFManager.pdfData(in:))
+        let pageCount = pdfData.flatMap { PDFDocument(data: $0)?.pageCount } ?? 0
+        let hasEmbeddedJot = storedPDFData.map { HybridPDFManager.embeddedJotData(in: $0) != nil } ?? false
+        print("[Load] PDF Data Size: \(pdfData?.count ?? 0), PageCount: \(pageCount), Embedded Jot Found: \(hasEmbeddedJot), Drawing Strokes: \(drawing.strokes.count)")
         onProgress(0.9)
         return JotContent(
             drawing: drawing,
-            width: file.jot.width,
-            pdfData: file.jot.pdfData,
-            extraPages: file.jot.extraPages,
-            pdfInsertedPageSlots: file.jot.pdfInsertedPageSlots,
-            strokePageIndices: file.jot.strokePageIndices,
-            pdfMetadata: file.jot.pdfData.flatMap { JotPDFMetadata(pdfData: $0) }
+            width: sourceJot.width,
+            pdfData: pdfData,
+            extraPages: sourceJot.extraPages,
+            pdfInsertedPageSlots: sourceJot.pdfInsertedPageSlots,
+            strokePageIndices: sourceJot.strokePageIndices,
+            dirtyPageIndices: [],
+            trashedPages: sourceJot.trashedPages,
+            pdfMetadata: pdfData.flatMap { JotPDFMetadata(pdfData: $0) },
+            zoteroItemKey: sourceJot.zoteroItemKey,
+            zoteroFileName: sourceJot.zoteroFileName
         )
     }
 
@@ -144,19 +176,65 @@ struct EditJotRepository: EditJotRepositoryProtocol {
         let insertedPageSlots = Array(
             Set(content.pdfInsertedPageSlots.lazy.filter { $0 >= 0 })
         ).sorted()
+        let jot = Jot(
+            version: Jot.currentVersion,
+            drawing: content.drawing.dataRepresentation(),
+            width: content.width,
+            pdfData: content.pdfData,
+            extraPages: max(0, content.extraPages),
+            pdfInsertedPageSlots: insertedPageSlots,
+            strokePageIndices: strokePageIndices,
+            trashedPages: content.trashedPages,
+            zoteroItemKey: content.zoteroItemKey,
+            zoteroFileName: content.zoteroFileName
+        )
+        let savedPDF: Data?
+        if content.pdfData != nil {
+            // Commit native Ink annotations into the PDF once. Later saves can
+            // replace annotations only on pages marked dirty by the editor.
+            savedPDF = try JotHybridPDFBuilder.buildHybridPDF(
+                jot: jot,
+                dirtyPageIndices: content.dirtyPageIndices
+            )
+        } else {
+            // nil pdfData is the persisted representation of a ruled-paper note.
+            // Storing a synthetic white PDF here changes its background to blank
+            // when the editor is reopened.
+            savedPDF = nil
+        }
+        print("[Save] Original PDF Size: \(content.pdfData?.count ?? 0), New PDF Size: \(savedPDF?.count ?? 0), Dirty Pages: \(content.dirtyPageIndices.count), Drawing Strokes: \(strokes.count)")
         let jotFile = JotFile(
             info: jotFileInfo,
             jot: Jot(
                 version: Jot.currentVersion,
                 drawing: content.drawing.dataRepresentation(),
                 width: content.width,
-                pdfData: content.pdfData,
+                pdfData: savedPDF,
                 extraPages: max(0, content.extraPages),
                 pdfInsertedPageSlots: insertedPageSlots,
-                strokePageIndices: strokePageIndices
+                strokePageIndices: strokePageIndices,
+                trashedPages: content.trashedPages,
+                zoteroItemKey: content.zoteroItemKey,
+                zoteroFileName: content.zoteroFileName
             )
         )
         try jotFileService.write(jotFile: jotFile)
+
+        if let key = content.zoteroItemKey,
+           let userID = defaultsService.getValue(DefaultsKey<String>.zoteroUserID),
+           !userID.isEmpty {
+            let hybridPDF = try savedPDF ?? JotHybridPDFBuilder.buildHybridPDF(
+                jot: jotFile.jot,
+                dirtyPageIndices: content.dirtyPageIndices
+            )
+            let cacheURL = try zoteroCacheStore.saveEditedPDF(
+                key: key,
+                data: hybridPDF,
+                userID: userID
+            )
+            print("[ZoteroSave] Successfully saved hybrid PDF to cache: \(cacheURL.path), bytes: \(hybridPDF.count)")
+            NotificationCenter.default.post(name: .zoteroAttachmentCacheChanged, object: key)
+        }
     }
 
     func getConflictingVersions(jotFileInfo: JotFile.Info) -> [JotFileVersion]? {
@@ -232,7 +310,7 @@ actor EditJotPersistenceWriter {
         jotFileInfo: JotFile.Info,
         repository: EditJotRepositoryProtocol,
         logger: LoggerProtocol,
-        debounceDuration: Duration = .milliseconds(300)
+        debounceDuration: Duration = .seconds(2)
     ) {
         self.jotFileInfo = jotFileInfo
         self.repository = repository
@@ -278,6 +356,7 @@ actor EditJotPersistenceWriter {
     private func debounceElapsed(for revision: UInt64) {
         guard revision == highestAcceptedRevision else { return }
         debounceTask = nil
+        print("[SaveDebounce] Quiet period elapsed; starting save for revision \(revision) on utility worker.")
         queueLatestSnapshotIfNeeded()
         startDrainIfNeeded()
     }
@@ -303,11 +382,16 @@ actor EditJotPersistenceWriter {
             activeRevision = snapshot.revision
 
             let result: Result<Void, any Error>
+            let saveStartedAt = ContinuousClock.now
             do {
-                try await repository.writeContent(
-                    jotFileInfo: jotFileInfo,
-                    content: snapshot.content
-                )
+                // PDFKit serialization, PencilKit encoding and cache writes are
+                // CPU/disk work. Keep them off the editor's executor even when
+                // this writer was scheduled by a MainActor view model.
+                try await Task.detached(priority: .utility) { [repository, jotFileInfo, content = snapshot.content] in
+                    try await repository.writeContent(jotFileInfo: jotFileInfo, content: content)
+                }.value
+                let elapsed = saveStartedAt.duration(to: .now)
+                print("[SaveDebounce] Save completed for revision \(snapshot.revision) in \(elapsed) on utility worker.")
                 result = .success(())
             } catch {
                 logger.error("Failed to persist jot: \(error)")

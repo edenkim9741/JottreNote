@@ -22,7 +22,7 @@
 /// used by the editor and every export renderer.
 ///
 /// Marker strokes are deliberately stored first in the combined drawing. This
-/// keeps the `.jot` payload backwards compatible (it is still one `PKDrawing`)
+/// keeps the `.jot` payload as one `PKDrawing` while separating visual layers at export time.
 /// while also giving old readers the best possible ink-on-ink ordering.
 struct JotDrawingLayerPartition: Sendable {
 

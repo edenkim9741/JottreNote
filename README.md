@@ -51,6 +51,14 @@ Jottre Note는 오픈 소스 필기 앱 [Jottre](https://github.com/antonlorani/
 - 백업 전 열린 편집기의 저장을 완료하고 파일 변경 작업을 직렬화해 충돌 방지
 - 네트워크 오류 발생 시 UI를 막지 않고 다음 작업을 다시 예약
 
+### Zotero WebDAV 연동 상태
+
+`Sources/WebDAV/ZoteroSyncService.swift`에는 Zotero WebDAV 저장소용 어댑터가 구현되어 있습니다. 이 어댑터는 PDF를 ZIP으로 묶어 `zotero/{문서ID}.zip` 경로에 올리고, 내려받을 때 ZIP 안의 PDF를 꺼냅니다. 업로드 요청에는 Zotero가 사용하는 `Content-MD5`와 `X-Zotero-Mtime` 헤더도 포함합니다.
+
+다만 **현재 앱에서는 Zotero 연동을 실제로 사용할 수 없습니다.** 설정의 `Sync mode`에서 `Zotero`를 선택하고 API 키를 입력할 수 있지만, 저장 모드와 API 키가 동기화 작업에 연결되어 있지 않습니다. 자동 백업과 `Backup All Notes`는 계속 일반 WebDAV 방식으로 `.pdf` 파일을 올리며, `Test Connection`도 WebDAV 연결만 확인합니다. 따라서 현재는 Zotero 모드를 선택해도 Zotero 라이브러리에 백업하거나 Zotero 파일을 가져오지 않습니다. Zotero API 키 역시 Keychain에 보관될 뿐 API 호출에 쓰이지 않습니다.
+
+일반 WebDAV 백업은 설정에서 `WebDAV` 모드를 선택하고 서버 URL, 사용자 이름, 비밀번호를 입력한 뒤 연결을 테스트해 사용할 수 있습니다. Zotero 연동은 `ZoteroSyncService`를 백업 및 가져오기 흐름에 연결하는 작업이 완료된 뒤 사용할 수 있습니다.
+
 ## 기술 구성
 
 | 영역 | 구현 |

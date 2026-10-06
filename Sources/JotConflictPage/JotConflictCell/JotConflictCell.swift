@@ -53,6 +53,13 @@ final class JotConflictCell: UICollectionViewCell, PageCell {
 
     override init(frame: CGRect) {
         super.init(frame: frame)
+        registerForTraitChanges([
+            UITraitUserInterfaceStyle.self,
+            UITraitAccessibilityContrast.self,
+            UITraitDisplayGamut.self,
+        ]) { (self: JotConflictCell, _: UITraitCollection) in
+            self.loadPreviewImage()
+        }
 
         setUpViews()
     }
@@ -61,14 +68,6 @@ final class JotConflictCell: UICollectionViewCell, PageCell {
     required init?(coder: NSCoder) {
         assertionFailure("\(#function) has not been implemented")
         return nil
-    }
-
-    override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
-        super.traitCollectionDidChange(previousTraitCollection)
-
-        if traitCollection.hasRenderingChange(comparedTo: previousTraitCollection) {
-            loadPreviewImage()
-        }
     }
 
     private func setUpViews() {

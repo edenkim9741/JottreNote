@@ -17,6 +17,7 @@
 */
 
 import UIKit
+import SwiftUI
 
 /// Keeps navigation buttons interactive while allowing PencilKit to receive
 /// touches through the otherwise empty, transparent navigation-bar area.
@@ -43,8 +44,6 @@ private struct SceneServices {
     let fileService: FileServiceProtocol
     let externalFileImportService: ExternalFileImportServiceProtocol
     let applicationService: ApplicationServiceProtocol
-    let deviceService: DeviceServiceProtocol
-    let bundleService: BundleServiceProtocol
     let jotFileService: JotFileServiceProtocol
     let jotFileConflictService: JotFileConflictService
     let jotFilePreviewImageService: JotFilePreviewImageServiceProtocol
@@ -65,7 +64,7 @@ private struct SceneCoordinatorFactories {
 final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
 
     private static var defaultsService: DefaultsService {
-        WebDAVApplicationServices.shared.defaultsService
+        ZoteroApplicationServices.shared.defaultsService
     }
 
     #if targetEnvironment(macCatalyst)
@@ -74,15 +73,13 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
 
     var window: UIWindow?
     private var sceneCoordinator: SceneCoordinator?
+    private var zoteroRootViewController: UIViewController?
 
     func scene(
         _ scene: UIScene,
         willConnectTo session: UISceneSession,
         options connectionOptions: UIScene.ConnectionOptions
     ) {
-        if redirectToExistingSceneIfNeeded(scene: scene, session: session, connectionOptions: connectionOptions) {
-            return
-        }
         guard let windowScene = scene as? UIWindowScene else { return }
         let fileManager = FileManager.default
         let fileService = LocalFileService(fileManager: fileManager)
@@ -94,21 +91,13 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
             symbolBarButtonItemFactory: symbolFactory
         )
         let coordinators = makeCoordinatorFactories(services: services, fileService: fileService)
-        let webDAVBackupService = WebDAVApplicationServices.shared.backupService
+        let zoteroDocumentSyncService = ZoteroApplicationServices.shared.documentSyncService
         let editJotCoordinatorFactory = makeEditJotCoordinatorFactory(
             services: services,
             uiFactories: uiFactories,
             coordinators: coordinators,
-            webDAVBackupService: webDAVBackupService
+            zoteroDocumentSyncService: zoteroDocumentSyncService
         )
-        let jotsCoordinatorFactory = makeJotsCoordinatorFactory(
-            services: services,
-            uiFactories: uiFactories,
-            coordinators: coordinators,
-            editJotCoordinatorFactory: editJotCoordinatorFactory,
-            webDAVBackupService: webDAVBackupService
-        )
-        let rootCoordinatorFactory = RootCoordinatorFactory(jotsCoordinatorFactory: jotsCoordinatorFactory)
         let navigationController = makeNavigationController()
         let navigation = makeNavigation(
             navigationController: navigationController,
@@ -118,40 +107,43 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         self.window?.rootViewController = navigationController
         let sceneCoordinator = makeSceneCoordinator(
             navigation: navigation,
-            services: services,
-            rootCoordinatorFactory: rootCoordinatorFactory,
             editJotCoordinatorFactory: editJotCoordinatorFactory
         )
         self.sceneCoordinator = sceneCoordinator
-        navigationController.viewControllers = sceneCoordinator.handle(
-            session: session,
-            connectionOptions: connectionOptions
-        )
+        sceneCoordinator.start()
+        let rootController = UIHostingController(rootView: ZoteroLibraryView(
+            cacheStore: ZoteroApplicationServices.shared.cacheStore,
+            engine: ZoteroApplicationServices.shared.syncEngine,
+            syncProgress: ZoteroApplicationServices.shared.syncProgress,
+            defaults: Self.defaultsService,
+            onOpenJot: { [navigation] jotInfo in
+                navigation.open(url: EditJotURL(jotFileInfo: jotInfo))
+            }
+        ))
+        rootController.title = "Zotero"
+        zoteroRootViewController = rootController
+        navigationController.viewControllers = [rootController]
         self.window?.makeKeyAndVisible()
-        let incomingURLs = connectionOptions.urlContexts.map(\.url)
-        if incomingURLs.contains(where: {
-            $0.isFileURL && $0.pathExtension.lowercased() == "pdf"
-        }) {
-            sceneCoordinator.handleURLs(incomingURLs)
+        let activityURLString = connectionOptions.userActivities
+            .first(where: { $0.activityType == SceneCoordinator.Constants.activityType })?
+            .userInfo?[SceneCoordinator.Constants.urlKey] as? String
+            ?? session.stateRestorationActivity?.userInfo?[SceneCoordinator.Constants.urlKey] as? String
+        let incomingURL = activityURLString.flatMap(URL.init(string:))
+            ?? connectionOptions.urlContexts.map(\.url).first(where: {
+                $0.isFileURL && $0.pathExtension.lowercased() == JotFile.Info.fileExtension
+            })
+        if let incomingURL {
+            let viewControllers = sceneCoordinator.handle(url: incomingURL)
+            guard !viewControllers.isEmpty else { return }
+            navigationController.setViewControllers([rootController] + viewControllers, animated: false)
         }
     }
 
-    func sceneDidBecomeActive(_ scene: UIScene) {
-        WebDAVApplicationServices.shared.autoBackupScheduler.sceneDidBecomeActive(
-            identifier: scene.session.persistentIdentifier
-        )
-    }
+    func sceneDidBecomeActive(_ scene: UIScene) {}
 
-    func sceneWillResignActive(_ scene: UIScene) {
-        WebDAVApplicationServices.shared.autoBackupScheduler.sceneWillResignActive(
-            identifier: scene.session.persistentIdentifier
-        )
-    }
+    func sceneWillResignActive(_ scene: UIScene) {}
 
     func sceneDidDisconnect(_ scene: UIScene) {
-        WebDAVApplicationServices.shared.autoBackupScheduler.sceneDidDisconnect(
-            identifier: scene.session.persistentIdentifier
-        )
         #if targetEnvironment(macCatalyst)
         guard
             UIApplication.shared.connectedScenes.isEmpty,
@@ -180,94 +172,6 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
 
 extension SceneDelegate {
 
-    fileprivate func redirectToExistingSceneIfNeeded(
-        scene: UIScene,
-        session: UISceneSession,
-        connectionOptions: UIScene.ConnectionOptions
-    ) -> Bool {
-        let pdfURLs = connectionOptions.urlContexts
-            .map(\.url)
-            .filter { $0.isFileURL && $0.pathExtension.lowercased() == "pdf" }
-            .sorted { $0.absoluteString.localizedStandardCompare($1.absoluteString) == .orderedAscending }
-        guard !pdfURLs.isEmpty else { return false }
-
-        let readyWindowScene = UIApplication.shared.connectedScenes
-            .compactMap { $0 as? UIWindowScene }
-            .filter { candidate in
-                guard candidate !== scene, candidate.activationState != .unattached else {
-                    return false
-                }
-                // A scene that was just redirected is still present in
-                // `connectedScenes` until its destruction completes, but it has
-                // no coordinator. Forwarding another URL to it silently drops
-                // that file, so only target a fully initialized scene.
-                return (candidate.delegate as? SceneDelegate)?.sceneCoordinator != nil
-            }
-            .sorted(by: isPreferredRedirectTarget)
-            .first
-        guard
-            let windowScene = readyWindowScene,
-            let existingDelegate = windowScene.delegate as? SceneDelegate,
-            let existingCoordinator = existingDelegate.sceneCoordinator
-        else {
-            return false
-        }
-        // Acquire the grants before returning from `willConnectTo`. Some File
-        // Providers revoke the URLs as soon as this source scene is released.
-        let scopedURLs = pdfURLs.filter { $0.startAccessingSecurityScopedResource() }
-        UIApplication.shared.requestSceneSessionActivation(
-            windowScene.session,
-            userActivity: nil,
-            options: nil,
-            errorHandler: nil
-        )
-        Task { @MainActor in
-            // Keep the source scene alive until File Provider URLs have been
-            // copied into app-owned storage. Destroying it earlier revokes some
-            // providers' access and silently loses every file after the first.
-            await existingCoordinator.handleRedirectedPDFURLs(
-                pdfURLs,
-                securityScopedURLs: scopedURLs
-            )
-            UIApplication.shared.requestSceneSessionDestruction(session, options: nil, errorHandler: nil)
-        }
-        return true
-    }
-
-    fileprivate func isPreferredRedirectTarget(_ lhs: UIWindowScene, _ rhs: UIWindowScene) -> Bool {
-        let lhsIsKey = lhs.windows.contains { $0.isKeyWindow }
-        let rhsIsKey = rhs.windows.contains { $0.isKeyWindow }
-        if lhsIsKey != rhsIsKey {
-            return lhsIsKey
-        }
-
-        let lhsActivationRank = redirectTargetActivationRank(lhs.activationState)
-        let rhsActivationRank = redirectTargetActivationRank(rhs.activationState)
-        if lhsActivationRank != rhsActivationRank {
-            return lhsActivationRank < rhsActivationRank
-        }
-
-        // `connectedScenes` is a Set. A stable tie-break keeps sibling scene
-        // callbacks from selecting different target coordinators as that Set
-        // changes while redirected source scenes are being destroyed.
-        return lhs.session.persistentIdentifier < rhs.session.persistentIdentifier
-    }
-
-    fileprivate func redirectTargetActivationRank(_ activationState: UIScene.ActivationState) -> Int {
-        switch activationState {
-        case .foregroundActive:
-            return 0
-        case .foregroundInactive:
-            return 1
-        case .background:
-            return 2
-        case .unattached:
-            return 3
-        @unknown default:
-            return 4
-        }
-    }
-
     fileprivate func makeServices(fileManager: FileManager, fileService: LocalFileService) -> SceneServices {
         let jotFileService = JotFileService(fileService: fileService)
         let jotFilePreviewImageService = CachedJotFilePreviewImageService(
@@ -278,8 +182,6 @@ extension SceneDelegate {
             fileService: fileService,
             externalFileImportService: ExternalFileImportService(),
             applicationService: ApplicationService(application: .shared),
-            deviceService: DeviceService(device: .current),
-            bundleService: BundleService(bundle: .main),
             jotFileService: jotFileService,
             jotFileConflictService: JotFileConflictService(
                 fileConflictService: FileConflictService(fileManager: fileManager)
@@ -314,41 +216,14 @@ extension SceneDelegate {
 
     fileprivate func makeSceneCoordinator(
         navigation: Navigation,
-        services: SceneServices,
-        rootCoordinatorFactory: RootCoordinatorFactoryProtocol,
         editJotCoordinatorFactory: EditJotCoordinatorFactoryProtocol
     ) -> SceneCoordinator {
-        let createJotCoordinatorFactory = CreateJotCoordinatorFactory(
-            repository: CreateJotRepository(
-                fileService: services.fileService,
-                jotFileService: services.jotFileService
-            ),
-            externalFileImportService: services.externalFileImportService
-        )
-        return SceneCoordinator(
+        SceneCoordinator(
             navigation: navigation,
             defaultsService: Self.defaultsService,
-            applicationService: services.applicationService,
-            fileService: services.fileService,
-            externalFileImportService: services.externalFileImportService,
-            logger: OSLogLogger(category: "SceneCoordinator"),
-            rootCoordinatorFactory: rootCoordinatorFactory,
             editJotCoordinatorFactory: editJotCoordinatorFactory,
-            createJotCoordinatorFactory: createJotCoordinatorFactory,
-            onUpdateUserInterfaceStyle: { [weak self] userInterfaceStyle in
-                Task { @MainActor in self?.window?.overrideUserInterfaceStyle = userInterfaceStyle }
-            },
-            requestSceneSessionActivationProvider: { url in
-                Task { @MainActor in
-                    let activity = NSUserActivity(activityType: SceneCoordinator.Constants.activityType)
-                    activity.userInfo = [SceneCoordinator.Constants.urlKey: url.absoluteString]
-                    UIApplication.shared.requestSceneSessionActivation(
-                        nil,
-                        userActivity: activity,
-                        options: nil,
-                        errorHandler: nil
-                    )
-                }
+            onUpdateUserInterfaceStyle: { [weak self] style in
+                Task { @MainActor in self?.window?.overrideUserInterfaceStyle = style }
             }
         )
     }
@@ -364,13 +239,15 @@ extension SceneDelegate {
         services: SceneServices,
         uiFactories: SceneUIFactories,
         coordinators: SceneCoordinatorFactories,
-        webDAVBackupService: WebDAVBackupService
+        zoteroDocumentSyncService: ZoteroDocumentSyncService
     ) -> EditJotCoordinatorFactory {
         let editJotRepository = EditJotRepository(
             jotFileService: services.jotFileService,
             jotFileConflictService: services.jotFileConflictService,
             fileService: services.fileService,
-            trashService: TrashService()
+            trashService: TrashService(),
+            zoteroCacheStore: ZoteroApplicationServices.shared.cacheStore,
+            defaultsService: Self.defaultsService
         )
         return EditJotCoordinatorFactory(
             repository: editJotRepository,
@@ -380,8 +257,7 @@ extension SceneDelegate {
                 menuConfigurationFactory: uiFactories.menuConfigurationFactory,
                 symbolBarButtonItemFactory: uiFactories.symbolBarButtonItemFactory,
                 defaultsService: Self.defaultsService,
-                webDAVBackupService: webDAVBackupService,
-                webDAVEditorFlushRegistry: WebDAVApplicationServices.shared.editorFlushRegistry,
+                zoteroDocumentSyncService: zoteroDocumentSyncService,
                 logger: OSLogLogger(category: "EditJotViewModel")
             ),
             jotConflictCoordinatorFactory: JotConflictCoordinatorFactory(
@@ -397,78 +273,12 @@ extension SceneDelegate {
             ),
             renameJotCoordinatorFactory: RenameJotCoordinatorFactory(
                 repository: RenameJotRepository(
-                    jotFileService: services.jotFileService,
-                    webDAVBackupService: webDAVBackupService
+                    jotFileService: services.jotFileService
                 )
             ),
             deleteJotCoordinatorFactory: coordinators.deleteJotCoordinatorFactory,
             shareJotCoordinatorFactory: coordinators.shareJotCoordinatorFactory,
             revealFileCoordinatorFactory: coordinators.revealFileCoordinatorFactory
-        )
-    }
-
-    fileprivate func makeJotsCoordinatorFactory(
-        services: SceneServices,
-        uiFactories: SceneUIFactories,
-        coordinators: SceneCoordinatorFactories,
-        editJotCoordinatorFactory: EditJotCoordinatorFactory,
-        webDAVBackupService: WebDAVBackupService
-    ) -> JotsCoordinatorFactoryProtocol {
-        JotsCoordinatorFactory(
-            jotsViewControllerFactory: JotsViewControllerFactory(
-                repository: JotsRepository(
-                    fileService: services.fileService,
-                    applicationService: services.applicationService,
-                    deviceService: services.deviceService,
-                    jotFileService: services.jotFileService,
-                    jotFilePreviewImageService: services.jotFilePreviewImageService,
-                    defaultsService: Self.defaultsService,
-                    webDAVBackupService: webDAVBackupService,
-                    trashService: TrashService()
-                ),
-                menuConfigurationFactory: uiFactories.menuConfigurationFactory,
-                textBarButtonItemFactory: uiFactories.textBarButtonItemFactory,
-                symbolBarButtonItemFactory: uiFactories.symbolBarButtonItemFactory,
-                logger: OSLogLogger(category: "JotsViewModel"),
-                defaultsService: Self.defaultsService
-            ),
-            settingsCoordinatorFactory: SettingsCoordinatorFactory(
-                settingsViewControllerFactory: SettingsViewControllerFactory(
-                    repository: SettingsRepository(
-                        bundleService: services.bundleService,
-                        defaultsService: Self.defaultsService,
-                        webDAVBackupService: webDAVBackupService
-                    ),
-                    textBarButtonItemFactory: uiFactories.textBarButtonItemFactory,
-                    symbolBarButtonItemFactory: uiFactories.symbolBarButtonItemFactory
-                )
-            ),
-            editJotCoordinatorFactory: editJotCoordinatorFactory,
-            createJotCoordinatorFactory: CreateJotCoordinatorFactory(
-                repository: CreateJotRepository(
-                    fileService: services.fileService,
-                    jotFileService: services.jotFileService
-                ),
-                externalFileImportService: services.externalFileImportService
-            ),
-            deleteJotCoordinatorFactory: coordinators.deleteJotCoordinatorFactory,
-            renameJotCoordinatorFactory: RenameJotCoordinatorFactory(
-                repository: RenameJotRepository(
-                    jotFileService: services.jotFileService,
-                    webDAVBackupService: webDAVBackupService
-                )
-            ),
-            shareJotCoordinatorFactory: coordinators.shareJotCoordinatorFactory,
-            revealFileCoordinatorFactory: coordinators.revealFileCoordinatorFactory,
-            trashViewControllerFactory: TrashViewControllerFactory(
-                repository: TrashRepository(
-                    fileService: services.fileService,
-                    trashService: TrashService(),
-                    previewService: services.jotFilePreviewImageService
-                ),
-                textBarButtonItemFactory: uiFactories.textBarButtonItemFactory,
-                symbolBarButtonItemFactory: uiFactories.symbolBarButtonItemFactory
-            )
         )
     }
 
@@ -479,8 +289,9 @@ extension SceneDelegate {
         Navigation(
             openURLProvider: { [weak self, weak navigationController] url in
                 Task { @MainActor in
-                    guard let viewControllers = self?.sceneCoordinator?.handle(url: url) else { return }
-                    navigationController?.setViewControllers(viewControllers, animated: true)
+                    guard let self, let viewControllers = self.sceneCoordinator?.handle(url: url) else { return }
+                    let root = self.zoteroRootViewController.map { [$0] } ?? []
+                    navigationController?.setViewControllers(root + viewControllers, animated: true)
                 }
             },
             openExternalURLProvider: { url in
@@ -489,9 +300,7 @@ extension SceneDelegate {
                     applicationService.open(url: url)
                 }
             },
-            openSceneProvider: { [weak self] url in
-                Task { @MainActor in self?.sceneCoordinator?.openScene(url: url) }
-            },
+            openSceneProvider: { _ in },
             presentViewControllerProvider: { [weak navigationController] viewController, animated in
                 Task { @MainActor in navigationController?.present(viewController, animated: animated) }
             },
@@ -500,10 +309,9 @@ extension SceneDelegate {
                     navigationController?.dismiss(animated: animated, completion: completion)
                 }
             },
-            popViewControllerProvider: { [weak self, weak navigationController] animated in
+            popViewControllerProvider: { [weak navigationController] animated in
                 Task { @MainActor in
                     navigationController?.popViewController(animated: animated)
-                    self?.sceneCoordinator?.handlePop()
                 }
             },
             getViewControllersProvider: { [weak navigationController] in

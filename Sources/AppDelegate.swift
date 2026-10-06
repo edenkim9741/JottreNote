@@ -25,11 +25,6 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
-        // BackgroundTasks handlers must be registered before launch completes,
-        // and registration must happen once per process rather than per scene.
-        let scheduler = WebDAVApplicationServices.shared.autoBackupScheduler
-        _ = scheduler.registerBackgroundTask()
-        scheduler.start()
         return true
     }
 

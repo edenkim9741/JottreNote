@@ -18,6 +18,7 @@
 
 import CoreGraphics
 @preconcurrency import PencilKit
+import PDFKit
 
 @MainActor
 final class EditJotViewModel {
@@ -41,6 +42,12 @@ final class EditJotViewModel {
         let result: Drawing
     }
 
+    private struct StrokePageSignature: Equatable {
+        let pageIndex: Int
+        let bounds: CGRect
+        let pointCount: Int
+    }
+
     enum Background: Sendable {
         case ruled(extraPages: Int)
         case pdf(data: Data, extraPages: Int, insertedPageSlots: [Int])
@@ -57,24 +64,6 @@ final class EditJotViewModel {
                 )
             }
         },
-        onRename: { [weak self] in
-            Task { @MainActor [weak self] in
-                guard let self, await self.prepareForFileMutation() else { return }
-                self.coordinator?.showRenameAlert(jotFileInfo: self.jotFileInfo)
-            }
-        },
-        onDuplicate: { [weak self] in
-            Task { @MainActor [weak self] in
-                guard let self, await self.flushPendingChanges() else { return }
-                self.didTapDuplicateJot(jotFileInfo: self.jotFileInfo)
-            }
-        },
-        onDelete: { [weak self] in
-            Task { @MainActor [weak self] in
-                guard let self, await self.prepareForFileMutation() else { return }
-                self.coordinator?.openDeleteJot(jotFileInfo: self.jotFileInfo)
-            }
-        },
         onShowInFiles: { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self, await self.flushPendingChanges() else { return }
@@ -88,13 +77,17 @@ final class EditJotViewModel {
                 self.addPage(afterPageIndex: index)
             }
         },
-        onDeletePage: { [weak self] in Task { @MainActor [weak self] in self?.promptDeletePage() } }
+        onDeletePage: { [weak self] in Task { @MainActor [weak self] in self?.promptDeletePage() } },
+        onManagePageTrash: { [weak self] in
+            Task { @MainActor [weak self] in self?.onPresentPageTrash?() }
+        }
     )
 
     // When the UI presents the menu we set this to allow insertion after the
     // currently visible page. The controller should set this before accessing
     // `menuConfigurations`.
     var visiblePageProvider: (() -> Int?)?
+    var onPresentPageTrash: (() -> Void)?
 
     var title: String { jotFileInfo.name }
 
@@ -117,15 +110,14 @@ final class EditJotViewModel {
     private let loadingProgressContinuation: AsyncStream<Double?>.Continuation
 
     private var loadingTask: Task<Void, Never>?
-    private var backupTask: Task<Void, Never>?
     private var persistenceRevision = UInt64.zero
     private var isPersistenceReady = false
     private var isDirty = false
     private let persistenceWriter: EditJotPersistenceWriter
-    private let webDAVEditorFlushRegistry: WebDAVEditorFlushRegistry
-    private var webDAVEditorFlushRegistration: WebDAVEditorFlushRegistry.Registration?
 
     var currentPdfData: Data?
+    private var currentZoteroItemKey: String?
+    private var currentZoteroFileName: String?
     var currentExtraPages: Int = 0
     var currentPdfInsertedPageSlots: [Int] = []
     var currentDrawing: PKDrawing = PKDrawing()
@@ -134,6 +126,8 @@ final class EditJotViewModel {
     // Per-stroke page indices aligned with `currentDrawing.strokes`.
     // Each entry records the logical page index the stroke was created on.
     var currentStrokePageIndices: [Int] = []
+    private(set) var dirtyPageIndices: Set<Int> = []
+    private(set) var trashedPages: [TrashedPage] = []
     private var cachedPDFPageAspectRatio: CGFloat?
     private var cachedPDFPageCount: Int?
 
@@ -141,7 +135,7 @@ final class EditJotViewModel {
     let repository: EditJotRepositoryProtocol
     private weak var coordinator: EditJotCoordinatorProtocol?
     private let menuConfigurationFactory: JotMenuConfigurationFactory
-    let webDAVBackupService: WebDAVBackupService
+    let zoteroDocumentSyncService: ZoteroDocumentSyncService
     let logger: LoggerProtocol
 
     init(
@@ -149,16 +143,14 @@ final class EditJotViewModel {
         repository: EditJotRepositoryProtocol,
         coordinator: EditJotCoordinatorProtocol,
         menuConfigurationFactory: JotMenuConfigurationFactory,
-        webDAVBackupService: WebDAVBackupService,
-        webDAVEditorFlushRegistry: WebDAVEditorFlushRegistry,
+        zoteroDocumentSyncService: ZoteroDocumentSyncService,
         logger: LoggerProtocol
     ) {
         self.jotFileInfo = jotFileInfo
         self.coordinator = coordinator
         self.repository = repository
         self.menuConfigurationFactory = menuConfigurationFactory
-        self.webDAVBackupService = webDAVBackupService
-        self.webDAVEditorFlushRegistry = webDAVEditorFlushRegistry
+        self.zoteroDocumentSyncService = zoteroDocumentSyncService
         self.logger = logger
         persistenceWriter = EditJotPersistenceWriter(
             jotFileInfo: jotFileInfo,
@@ -196,10 +188,6 @@ final class EditJotViewModel {
         isEditingContinuation.yield(true)
         #endif
 
-        webDAVEditorFlushRegistration = webDAVEditorFlushRegistry.register { [weak self] in
-            guard let self else { return true }
-            return await self.flushPendingChanges(presentsError: false)
-        }
     }
 
     func didLoad() {
@@ -255,10 +243,19 @@ final class EditJotViewModel {
     func didChangeDrawing(
         _ drawing: PKDrawing,
         strokePageIndices: [Int]? = nil,
-        detectsScribbleErase: Bool = true
+        detectsScribbleErase: Bool = true,
+        changedPageIndices: Set<Int> = []
     ) {
         guard isPersistenceReady else { return }
         let prev = previousDrawing
+        let priorIndices = currentStrokePageIndices
+        dirtyPageIndices.formUnion(changedPageIndices)
+        dirtyPageIndices.formUnion(changedPages(
+            from: prev,
+            oldPageIndices: priorIndices,
+            to: drawing,
+            newPageIndices: strokePageIndices ?? []
+        ))
         previousDrawing = drawing
 
         if detectsScribbleErase,
@@ -271,6 +268,12 @@ final class EditJotViewModel {
                 after: result,
                 previousDrawing: prev
             )
+            dirtyPageIndices.formUnion(changedPages(
+                from: prev,
+                oldPageIndices: priorIndices,
+                to: processed,
+                newPageIndices: currentStrokePageIndices
+            ))
             scribbleEraseContinuation.yield(
                 ScribbleEraseEvent(
                     beforeDrawing: drawing,
@@ -307,6 +310,7 @@ final class EditJotViewModel {
     func didTapBackButton() {
         Task { @MainActor [weak self] in
             guard let self, await self.flushPendingChanges() else { return }
+            self.enqueueZoteroUpload()
             if let jotFileVersions = self.repository.getConflictingVersions(
                 jotFileInfo: self.jotFileInfo
             ) {
@@ -326,49 +330,38 @@ final class EditJotViewModel {
         previousDrawing = expectedDrawing
     }
 
-    func didDisappear() {
+    func didDisappear() async {
         // A quick back/background event can arrive before an asynchronous read
         // completes. Never replace an existing note with the VM's empty defaults.
         guard isPersistenceReady else { return }
-        let snapshot = makePersistenceSnapshot()
-        let shouldFlush = isDirty
-        // Skip WebDAV backup entirely when the note was not modified.
+        // Skip Zotero upload entirely when the note was not modified.
         // Opening a note just to read it should not trigger PDF re-rendering
         // and network uploads.
-        guard shouldFlush else { return }
-        let writer = persistenceWriter
-        let backupService = webDAVBackupService
-        let jotFileInfo = jotFileInfo
-        let logger = logger
-
-        backupTask?.cancel()
-        backupTask = Task { [weak self] in
-            do {
-                try await writer.saveImmediately(snapshot)
-                self?.markPersisted(revision: snapshot.revision)
-            } catch {
-                logger.error("Failed to flush jot before backup: \(error)")
-                return
-            }
-            guard !Task.isCancelled else { return }
-            await backupService.backup(jotFileInfo: jotFileInfo, content: snapshot.content)
-        }
+        guard await flushPendingChanges(presentsError: false) else { return }
+        enqueueZoteroUpload()
     }
 
     /// Flushes local state while UIKit grants finite background execution time.
-    /// WebDAV remains best-effort and is launched only after the durable local
+    /// Zotero upload is launched only after the durable local
     /// write has completed.
     func didEnterBackground() async {
         guard await flushPendingChanges(presentsError: false), !Task.isCancelled else { return }
-        didDisappear()
+        enqueueZoteroUpload()
+    }
+
+    private func enqueueZoteroUpload() {
+        guard let key = currentZoteroItemKey else { return }
+        let service = zoteroDocumentSyncService
+        let modificationDate = jotFileInfo.modificationDate
+        Task.detached(priority: .utility) {
+            _ = await service.uploadCachedAttachment(
+                key: key,
+                fallbackModificationDate: modificationDate
+            )
+        }
     }
 
     deinit {
-        let flushRegistry = webDAVEditorFlushRegistry
-        let flushRegistration = webDAVEditorFlushRegistration
-        Task { @MainActor in
-            flushRegistry.unregister(flushRegistration)
-        }
         loadingTask?.cancel()
         isEditingContinuation.finish()
         drawingContinuation.finish()
@@ -413,14 +406,36 @@ extension EditJotViewModel {
         guard isPersistenceReady else { return }
         let pageHeight = normalizedPageHeight()
         let pageStride = pageHeight + JotBackgroundView.pageSpacing
-        let basePages = basePageCount()
-        let totalPages =
-            currentPdfData == nil
-            ? 1 + currentExtraPages
-            : basePages + currentPdfInsertedPageSlots.count
+        let totalPages = logicalPageCount()
         guard totalPages < Self.maximumPageCount else { return }
 
         let insertIndex = insertionIndex(after: afterPageIndex, totalPages: totalPages)
+        do {
+            let fallbackPageSize = CGSize(width: currentWidth, height: pageHeight)
+            let materialized = try materializedCurrentPDF(pageSize: fallbackPageSize)
+            let matchingPageIndex = min(max(0, insertIndex > 0 ? insertIndex - 1 : 0), totalPages - 1)
+            let pageSize: CGSize
+            if currentPdfData != nil {
+                pageSize = try HybridPDFManager.displayedMediaBoxSize(
+                    in: materialized,
+                    pageIndex: matchingPageIndex
+                )
+            } else {
+                pageSize = fallbackPageSize
+            }
+            let blankPage = try JotHybridPDFBuilder.makeRuledPDF(pageSize: pageSize, pageCount: 1)
+            currentPdfData = try HybridPDFManager.insertingPage(blankPage, into: materialized, at: insertIndex)
+            currentPdfInsertedPageSlots = []
+            currentExtraPages = 0
+            cacheCurrentPDFMetadata()
+        } catch {
+            coordinator?.showInfoAlert(
+                title: String(localized: "editJot.pages.insertFailed"),
+                message: error.localizedDescription
+            )
+            return
+        }
+
         let mutation = drawingByInsertingPage(at: insertIndex, pageStride: pageStride)
         currentDrawing = mutation.drawing
         previousDrawing = mutation.drawing
@@ -436,33 +451,22 @@ extension EditJotViewModel {
             )
         }
 
-        if currentPdfData != nil {
-            for index in currentPdfInsertedPageSlots.indices
-            where currentPdfInsertedPageSlots[index] >= insertIndex {
-                currentPdfInsertedPageSlots[index] += 1
-            }
-            let position =
-                currentPdfInsertedPageSlots.firstIndex { $0 >= insertIndex }
-                ?? currentPdfInsertedPageSlots.endIndex
-            currentPdfInsertedPageSlots.insert(insertIndex, at: position)
-            currentExtraPages = currentPdfInsertedPageSlots.count
-        } else {
-            currentExtraPages += 1
-        }
-
         yieldBackground()
         persistCurrentContent()
     }
 
     func promptDeletePage() {
         guard isPersistenceReady else { return }
-        guard currentExtraPages > 0 else {
-            coordinator?.showInfoAlert(title: L10n.EditJot.PDF.DeletePage.nothingToDelete, message: "")
+        guard logicalPageCount() > 1 else {
+            coordinator?.showInfoAlert(
+                title: String(localized: "editJot.pages.keepOnePage"),
+                message: ""
+            )
             return
         }
         coordinator?.showConfirmAlert(
-            title: L10n.EditJot.PDF.DeletePage.title,
-            message: L10n.EditJot.PDF.DeletePage.message,
+            title: String(localized: "editJot.pages.moveToTrash"),
+            message: String(localized: "editJot.pages.moveToTrashConfirmation"),
             confirmTitle: L10n.Action.delete,
             isDestructive: true
         ) { [weak self] in
@@ -501,6 +505,7 @@ extension EditJotViewModel {
         currentDrawing = newDrawing
         previousDrawing = newDrawing
         currentStrokePageIndices = newIndices
+        dirtyPageIndices.insert(page)
         drawingContinuation.yield(
             Drawing(
                 value: newDrawing,
@@ -518,39 +523,43 @@ extension EditJotViewModel {
 
     func deleteExtraPage(at index: Int?) {
         guard isPersistenceReady else { return }
-        guard currentExtraPages > 0 else { return }
+        let totalPages = logicalPageCount()
+        guard totalPages > 1 else { return }
 
         let pageHeight = normalizedPageHeight()
         let pageStride = pageHeight + JotBackgroundView.pageSpacing
-        let basePages = basePageCount()
-
-        let deleteIndex: Int
-        if currentPdfData != nil {
-            if currentPdfInsertedPageSlots.isEmpty, currentExtraPages > 0 {
-                currentPdfInsertedPageSlots = Array(basePages..<(basePages + currentExtraPages))
-            }
-            let totalPages = basePages + currentPdfInsertedPageSlots.count
-            let preferred: Int = {
-                if let idx = index, currentPdfInsertedPageSlots.contains(idx) { return idx }
-                return currentPdfInsertedPageSlots.last ?? max(basePages, totalPages - 1)
-            }()
-            deleteIndex = preferred
-            if let pos = currentPdfInsertedPageSlots.firstIndex(of: deleteIndex) {
-                currentPdfInsertedPageSlots.remove(at: pos)
-            } else {
-                _ = currentPdfInsertedPageSlots.popLast()
-            }
-            currentPdfInsertedPageSlots = currentPdfInsertedPageSlots.map {
-                $0 > deleteIndex ? $0 - 1 : $0
-            }
-            currentExtraPages = currentPdfInsertedPageSlots.count
-        } else {
-            let totalPages = max(1, basePages + currentExtraPages)
-            deleteIndex = index.map { min(max(0, $0), totalPages - 1) } ?? (totalPages - 1)
-            currentExtraPages = max(0, currentExtraPages - 1)
+        let deleteIndex = index.map { min(max(0, $0), totalPages - 1) } ?? (totalPages - 1)
+        let fullPDF: Data
+        let pagePDFData: Data
+        let reducedPDF: Data
+        do {
+            let pageSize = CGSize(width: currentWidth, height: pageHeight)
+            fullPDF = try materializedCurrentPDF(pageSize: pageSize)
+            pagePDFData = try HybridPDFManager.pageData(deleteIndex, in: fullPDF)
+            reducedPDF = try HybridPDFManager.removingPage(deleteIndex, from: fullPDF)
+        } catch {
+            coordinator?.showInfoAlert(
+                title: String(localized: "editJot.pages.deleteFailed"),
+                message: error.localizedDescription
+            )
+            return
         }
 
         let mutation = drawingByDeletingPage(at: deleteIndex, pageStride: pageStride)
+        let localTrashDrawing = PKDrawing(strokes: mutation.removedStrokes.map {
+            translated($0, byY: -CGFloat(deleteIndex) * pageStride)
+        })
+        trashedPages.append(
+            TrashedPage(
+                originalIndex: deleteIndex,
+                pdfPageData: pagePDFData,
+                drawingData: localTrashDrawing.dataRepresentation()
+            )
+        )
+        currentPdfData = reducedPDF
+        currentPdfInsertedPageSlots = []
+        currentExtraPages = 0
+        cacheCurrentPDFMetadata()
         currentDrawing = mutation.drawing
         previousDrawing = mutation.drawing
         currentStrokePageIndices = mutation.indices
@@ -563,11 +572,68 @@ extension EditJotViewModel {
         )
         yieldBackground()
         persistCurrentContent()
-        schedulePageTrashSave(
-            strokes: mutation.removedStrokes,
-            deleteIndex: deleteIndex,
-            pageStride: pageStride
+    }
+
+    @discardableResult
+    func restoreTrashedPage(id: UUID) -> Bool {
+        guard isPersistenceReady,
+              let trashedPage = trashedPages.first(where: { $0.id == id }) else { return false }
+        let pageHeight = normalizedPageHeight()
+        let pageStride = pageHeight + JotBackgroundView.pageSpacing
+        let pageSize = CGSize(width: currentWidth, height: pageHeight)
+        let currentPageCount = logicalPageCount()
+        let insertionIndex = min(max(0, trashedPage.originalIndex), currentPageCount)
+        do {
+            let materialized = try materializedCurrentPDF(pageSize: pageSize)
+            currentPdfData = try HybridPDFManager.insertingPage(
+                trashedPage.pdfPageData,
+                into: materialized,
+                at: insertionIndex
+            )
+            let pageDrawing = try PKDrawing(data: trashedPage.drawingData)
+            let insertion = drawingByInsertingPage(at: insertionIndex, pageStride: pageStride)
+            let restoredStrokes = pageDrawing.strokes.map {
+                translated($0, byY: CGFloat(insertionIndex) * pageStride)
+            }
+            currentDrawing = PKDrawing(strokes: insertion.drawing.strokes + restoredStrokes)
+            previousDrawing = currentDrawing
+            currentStrokePageIndices = insertion.indices + Array(repeating: insertionIndex, count: restoredStrokes.count)
+            currentPdfInsertedPageSlots = []
+            currentExtraPages = 0
+            trashedPages.removeAll { $0.id == id }
+            cacheCurrentPDFMetadata()
+            drawingContinuation.yield(
+                Drawing(value: currentDrawing, width: currentWidth, strokePageIndices: currentStrokePageIndices)
+            )
+            yieldBackground()
+            persistCurrentContent()
+            return true
+        } catch {
+            coordinator?.showInfoAlert(
+                title: String(localized: "editJot.pages.restoreFailed"),
+                message: error.localizedDescription
+            )
+            return false
+        }
+    }
+
+    private func logicalPageCount() -> Int {
+        if currentPdfData != nil { return basePageCount() + currentPdfInsertedPageSlots.count }
+        return max(1, 1 + currentExtraPages)
+    }
+
+    private func materializedCurrentPDF(pageSize: CGSize) throws -> Data {
+        try HybridPDFManager.materializePages(
+            pdfData: currentPdfData,
+            insertedPageSlots: currentPdfInsertedPageSlots,
+            blankPageCount: currentPdfData == nil ? currentExtraPages : 0,
+            pageSize: pageSize
         )
+    }
+
+    private func translated(_ stroke: PKStroke, byY offset: CGFloat) -> PKStroke {
+        let transform = stroke.transform.translatedBy(x: 0, y: offset)
+        return PKStroke(ink: stroke.ink, path: stroke.path, transform: transform, mask: stroke.mask)
     }
 }
 
@@ -582,11 +648,14 @@ extension EditJotViewModel {
     }
 
     fileprivate func applyLoadedContent(_ content: JotContent) {
+        currentZoteroItemKey = content.zoteroItemKey
+        currentZoteroFileName = content.zoteroFileName
         currentWidth =
             content.width.isFinite && content.width > 0
             ? content.width
             : Jot.defaultWidth
         currentPdfData = content.pdfData
+        trashedPages = content.trashedPages
         cachedPDFPageAspectRatio = content.pdfMetadata?.pageAspectRatio
         cachedPDFPageCount = content.pdfMetadata.map {
             min($0.pageCount, Self.maximumPageCount)
@@ -624,6 +693,7 @@ extension EditJotViewModel {
         currentDrawing = layeredDrawing
         previousDrawing = layeredDrawing
         currentStrokePageIndices = layers.combinedPageIndices
+        dirtyPageIndices.removeAll()
         isDirty = false
         isPersistenceReady = true
         drawingContinuation.yield(
@@ -736,6 +806,39 @@ extension EditJotViewModel {
         let value = floor(stroke.renderBounds.midY / stride)
         guard value.isFinite, value > 0 else { return 0 }
         return min(Int(min(value, CGFloat(Self.maximumPageCount - 1))), Self.maximumPageCount - 1)
+    }
+
+    private func changedPages(
+        from oldDrawing: PKDrawing,
+        oldPageIndices: [Int],
+        to newDrawing: PKDrawing,
+        newPageIndices: [Int]
+    ) -> Set<Int> {
+        func signatures(for drawing: PKDrawing, indices: [Int]) -> [UInt32: StrokePageSignature] {
+            var result: [UInt32: StrokePageSignature] = [:]
+            result.reserveCapacity(drawing.strokes.count)
+            for (index, stroke) in drawing.strokes.enumerated() {
+                let owner = indices.indices.contains(index) ? indices[index] : pageIndex(for: stroke)
+                result[stroke.randomSeed] = StrokePageSignature(
+                    pageIndex: max(0, owner),
+                    bounds: stroke.renderBounds,
+                    pointCount: stroke.path.count
+                )
+            }
+            return result
+        }
+
+        let old = signatures(for: oldDrawing, indices: oldPageIndices)
+        let new = signatures(for: newDrawing, indices: newPageIndices)
+        var changed = Set<Int>()
+        for seed in Set(old.keys).union(new.keys) {
+            let before = old[seed]
+            let after = new[seed]
+            guard before != after else { continue }
+            if let before { changed.insert(before.pageIndex) }
+            if let after { changed.insert(after.pageIndex) }
+        }
+        return changed
     }
 
     fileprivate func insertionIndex(after index: Int?, totalPages: Int) -> Int {
@@ -873,6 +976,7 @@ extension EditJotViewModel {
     fileprivate func markPersisted(revision: UInt64) {
         guard persistenceRevision == revision else { return }
         isDirty = false
+        dirtyPageIndices.removeAll()
     }
 
     fileprivate func flushPendingChanges(presentsError: Bool = true) async -> Bool {
@@ -899,15 +1003,6 @@ extension EditJotViewModel {
         return true
     }
 
-    fileprivate func prepareForFileMutation() async -> Bool {
-        if let backupTask {
-            backupTask.cancel()
-            await backupTask.value
-            self.backupTask = nil
-        }
-        return await flushPendingChanges()
-    }
-
     fileprivate func makePersistenceSnapshot() -> EditJotPersistenceSnapshot {
         persistenceRevision += 1
         let content = JotContent(
@@ -920,12 +1015,16 @@ extension EditJotViewModel {
                 currentStrokePageIndices,
                 for: currentDrawing
             ),
+            dirtyPageIndices: dirtyPageIndices,
+            trashedPages: trashedPages,
             pdfMetadata: cachedPDFPageCount.map {
                 JotPDFMetadata(
                     pageCount: $0,
                     pageAspectRatio: cachedPDFPageAspectRatio ?? (4.0 / 3.0)
                 )
-            }
+            },
+            zoteroItemKey: currentZoteroItemKey,
+            zoteroFileName: currentZoteroFileName
         )
         currentStrokePageIndices = content.strokePageIndices
         return EditJotPersistenceSnapshot(revision: persistenceRevision, content: content)
@@ -941,15 +1040,4 @@ extension EditJotViewModel {
         }
     }
 
-    fileprivate func didTapDuplicateJot(jotFileInfo: JotFile.Info) {
-        do {
-            let duplicatedJotFileInfo = try repository.duplicate(jotFileInfo: jotFileInfo)
-            coordinator?.openJot(jotFileInfo: duplicatedJotFileInfo)
-        } catch {
-            coordinator?.showInfoAlert(
-                title: L10n.Jots.Duplicate.Error.generic(jotFileInfo.name),
-                message: error.localizedDescription
-            )
-        }
-    }
 }

@@ -33,8 +33,7 @@ struct EditJotViewControllerFactory: EditJotViewControllerFactoryProtocol {
     let menuConfigurationFactory: JotMenuConfigurationFactory
     let symbolBarButtonItemFactory: SymbolBarButtonItemFactory
     let defaultsService: DefaultsServiceProtocol
-    let webDAVBackupService: WebDAVBackupService
-    let webDAVEditorFlushRegistry: WebDAVEditorFlushRegistry
+    let zoteroDocumentSyncService: ZoteroDocumentSyncService
     let logger: LoggerProtocol
 
     func make(
@@ -47,8 +46,7 @@ struct EditJotViewControllerFactory: EditJotViewControllerFactoryProtocol {
                 repository: repository,
                 coordinator: coordinator,
                 menuConfigurationFactory: menuConfigurationFactory,
-                webDAVBackupService: webDAVBackupService,
-                webDAVEditorFlushRegistry: webDAVEditorFlushRegistry,
+                zoteroDocumentSyncService: zoteroDocumentSyncService,
                 logger: logger
             ),
             symbolBarButtonItemFactory: symbolBarButtonItemFactory,

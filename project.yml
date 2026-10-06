@@ -2,7 +2,7 @@ name: Jottre
 options:
   bundleIdPrefix: com.edenkim
   deploymentTarget:
-    iOS: "15.0"
+    iOS: "18.0"
   knownRegions:
     - en
     - de
@@ -35,7 +35,7 @@ targets:
   Jottre:
     type: application
     platform: iOS
-    deploymentTarget: "16.0"
+    deploymentTarget: "18.0"
     sources:
       - Sources
       - path: Resources/Assets.xcassets
@@ -44,6 +44,8 @@ targets:
     info:
       path: Resources/Info.plist
       properties:
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         LSApplicationCategoryType: public.app-category.productivity
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
@@ -62,12 +64,6 @@ targets:
             LSHandlerRank: Owner
             LSItemContentTypes:
               - com.edenkim.jottre.jot
-          - CFBundleTypeName: PDF
-            CFBundleTypeRole: Viewer
-            LSHandlerRank: Alternate
-            LSItemContentTypes:
-              - com.adobe.pdf
-              - public.data
         LSApplicationQueriesSchemes:
           - shareddocuments
         UTExportedTypeDeclarations:
@@ -83,10 +79,6 @@ targets:
         NSQuitAlwaysKeepsWindows: true
         NSUserActivityTypes:
           - com.edenkim.jottre.openJot
-        BGTaskSchedulerPermittedIdentifiers:
-          - com.edenkim.jottre.webdav-auto-backup
-        UIBackgroundModes:
-          - processing
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: true
           UISceneConfigurations:
@@ -102,32 +94,23 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.edenkim.jottre
         PRODUCT_NAME: Jottre
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "1"
         SWIFT_VERSION: "6.0"
         SWIFT_STRICT_CONCURRENCY: complete
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-        SUPPORTS_MACCATALYST: YES
-        MACCATALYST_UI_IDIOM: mac
-        DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: NO
-        BUNDLE_IDENTIFIER_MACCATALYST: com.edenkim.jottre
+        SUPPORTS_MACCATALYST: NO
         SWIFT_EMIT_LOC_STRINGS: YES
         ENABLE_HARDENED_RUNTIME: YES
         ENABLE_APP_SANDBOX: YES
         ENABLE_USER_SCRIPT_SANDBOXING: YES
         VALIDATE_PRODUCT: YES
-        EXCLUDED_SOURCE_FILE_NAMES[sdk=iphoneos*]: AppKitPlugin.bundle
-    dependencies:
-      - target: AppKitPlugin
-        embed: true
-        codeSign: true
-        # The AppKit bridge is loaded only by the Mac Catalyst code path. Without
-        # this filter Xcode also attempts to compile it for iPhone/iPad simulators.
-        platformFilter: macOS
     packages: []
 
   JottreTests:
     type: bundle.unit-test
     platform: iOS
-    deploymentTarget: "16.0"
+    deploymentTarget: "18.0"
     sources:
       - path: CoreTests
       - path: Tests/Resources
@@ -141,36 +124,11 @@ targets:
         SWIFT_STRICT_CONCURRENCY: complete
         GENERATE_INFOPLIST_FILE: YES
 
-  AppKitPlugin:
-    type: bundle
-    platform: macOS
-    deploymentTarget: "12.0"
-    sources:
-      - AppKitPlugin
-    info:
-      path: AppKitPlugin/Info.plist
-      properties:
-        CFBundleName: AppKitPlugin
-        CFBundleIdentifier: com.edenkim.jottre.AppKitPlugin
-        CFBundleVersion: "2"
-        CFBundleShortVersionString: 1.3.0
-        CFBundlePackageType: BNDL
-        CFBundleExecutable: AppKitPlugin
-    settings:
-      base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.edenkim.jottre.AppKitPlugin
-        SWIFT_VERSION: "6.0"
-        CODE_SIGN_STYLE: Manual
-        CODE_SIGN_IDENTITY: "-"
-        MACH_O_TYPE: mh_bundle
-        ENABLE_HARDENED_RUNTIME: YES
-
 schemes:
   Jottre:
     build:
       targets:
         Jottre: all
-        AppKitPlugin: all
     run:
       config: Debug
       executable: Jottre
@@ -194,18 +152,5 @@ schemes:
       config: Debug
       targets:
         - name: JottreTests
-    analyze:
-      config: Debug
-
-  AppKitPlugin:
-    build:
-      targets:
-        AppKitPlugin: all
-    run:
-      config: Debug
-    archive:
-      config: Release
-    profile:
-      config: Release
     analyze:
       config: Debug

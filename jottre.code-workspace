@@ -6,6 +6,10 @@
 	],
 	"settings": {
 		"claudeCode.allowDangerouslySkipPermissions": true,
-		"sweetpad.build.scheme": "Jottre"
+		"sweetpad.build.scheme": "Jottre",
+		"sweetpad.build.destination": {
+			"id": "iossimulator-90D44C2F-43EF-4AA1-8C1A-E6990BF3220E",
+			"type": "iOSSimulator"
+		}
 	}
 }

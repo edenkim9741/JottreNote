@@ -19,12 +19,9 @@
 @preconcurrency import PencilKit
 import UIKit
 
-/// Owns the canonical drawing and the two PencilKit presentation planes.
-///
-/// Pen and marker input stay on their final canvas for the entire gesture. A
-/// normal stroke commit therefore updates only the model snapshot; it never
-/// replaces either canvas drawing. Lasso and eraser temporarily use a combined
-/// presentation because PencilKit must see every stroke to edit it.
+/// Owns the canonical drawing snapshot and marker-first ordering used by the
+/// page overlay canvases. The two backing canvases are non-visible storage
+/// surfaces; PDFView page overlays receive all user input.
 @MainActor
 final class JotInkCanvasCoordinator {
 
@@ -46,10 +43,8 @@ final class JotInkCanvasCoordinator {
     private let highlighterCanvas: PKCanvasView
     private let foregroundCanvas: PKCanvasView
 
-    /// The editor draws every tool on one canvas, because PencilKit's gesture
-    /// view covers the whole viewport and a nested sibling canvas can never
-    /// receive touches. Marker ordering still holds: `JotDrawingLayerPartition`
-    /// always stores marker strokes first.
+    /// Retained presentation mode for legacy undo and selection helpers. Visible
+    /// page input is owned by one independent `PKCanvasView` per PDF page.
     private(set) var mode = Mode.combined
     private(set) var committedDrawing = PKDrawing()
     private(set) var committedStrokePageIndices: [Int] = []

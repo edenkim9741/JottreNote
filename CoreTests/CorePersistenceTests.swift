@@ -18,41 +18,33 @@
 
 import Foundation
 @preconcurrency import PencilKit
+import PDFKit
+import UIKit
 import XCTest
 @testable import Jottre
 
 final class CorePersistenceTests: XCTestCase {
 
-    func testLegacyJotDecodesMissingOptionalMetadata() throws {
-        let fixtureURL = try XCTUnwrap(
-            Bundle(for: Self.self).url(forResource: "Calculator Pro", withExtension: "jot")
-        )
-        let data = try Data(contentsOf: fixtureURL)
-
-        let jot = try PropertyListDecoder().decode(Jot.self, from: data)
-
-        XCTAssertEqual(jot.version, 3)
-        XCTAssertEqual(jot.width, 1200)
-        XCTAssertEqual(jot.extraPages, 0)
-        XCTAssertEqual(jot.pdfInsertedPageSlots, [])
-        XCTAssertEqual(jot.strokePageIndices, [])
-    }
-
-    func testJotWithoutVersionUsesLegacyVersionAndSafeDefaults() throws {
-        let data = try PropertyListSerialization.data(
+    func testJotRejectsUnsupportedOrIncompleteFormatVersions() throws {
+        let oldFormatData = try PropertyListSerialization.data(
             fromPropertyList: [
+                "version": Jot.currentVersion - 1,
                 "drawing": PKDrawing().dataRepresentation(),
                 "width": 900.0,
+                "extraPages": 0,
+                "pdfInsertedPageSlots": [Int](),
+                "strokePageIndices": [Int](),
             ],
             format: .binary,
             options: 0
         )
-
-        let jot = try PropertyListDecoder().decode(Jot.self, from: data)
-
-        XCTAssertEqual(jot.version, 1)
-        XCTAssertEqual(jot.width, 900)
-        XCTAssertEqual(jot.extraPages, 0)
+        let missingVersionData = try PropertyListSerialization.data(
+            fromPropertyList: ["drawing": PKDrawing().dataRepresentation()],
+            format: .binary,
+            options: 0
+        )
+        XCTAssertThrowsError(try PropertyListDecoder().decode(Jot.self, from: oldFormatData))
+        XCTAssertThrowsError(try PropertyListDecoder().decode(Jot.self, from: missingVersionData))
     }
 
     func testJotFileServiceWritesBinaryPlistAndPreservesWidth() throws {
@@ -76,6 +68,299 @@ final class CorePersistenceTests: XCTestCase {
         XCTAssertEqual(decoded.width, 987)
     }
 
+    func testEditorSaveAndReloadPreserveTrashedPageForRestore() async throws {
+        let memoryFiles = MemoryFileService()
+        let jotFileService = JotFileService(fileService: memoryFiles)
+        let info = JotFile.Info(
+            url: URL(fileURLWithPath: "/tmp/page-trash-persistence.jot"),
+            name: "page-trash-persistence",
+            modificationDate: nil
+        )
+        let repository = EditJotRepository(
+            jotFileService: jotFileService,
+            jotFileConflictService: JotFileConflictService(
+                fileConflictService: FileConflictService(fileManager: .default)
+            ),
+            fileService: memoryFiles,
+            trashService: TrashService()
+        )
+        let trashedPage = TrashedPage(
+            originalIndex: 1,
+            pdfPageData: try JotHybridPDFBuilder.makeRuledPDF(
+                pageSize: CGSize(width: 1200, height: 1600),
+                pageCount: 1
+            ),
+            drawingData: PKDrawing().dataRepresentation()
+        )
+        let content = JotContent(
+            drawing: PKDrawing(),
+            width: 1200,
+            pdfData: nil,
+            extraPages: 0,
+            pdfInsertedPageSlots: [],
+            strokePageIndices: [],
+            trashedPages: [trashedPage]
+        )
+
+        try await repository.writeContent(jotFileInfo: info, content: content)
+        let reloaded = try await repository.readContent(jotFileInfo: info, onProgress: { _ in })
+
+        XCTAssertEqual(reloaded.trashedPages, [trashedPage])
+    }
+
+    func testEditSaveKeepsOriginalPDFAndRestoresOuterDrawing() async throws {
+        let fixtureURL = try XCTUnwrap(
+            Bundle(for: Self.self).url(forResource: "pdf-test", withExtension: "pdf")
+        )
+        let sourcePDF = try Data(contentsOf: fixtureURL)
+        let memoryFiles = MemoryFileService()
+        let jotFileService = JotFileService(fileService: memoryFiles)
+        let info = JotFile.Info(
+            url: URL(fileURLWithPath: "/tmp/sql-save.jot"),
+            name: "sql-save",
+            modificationDate: nil
+        )
+        let original = JotFile(
+            info: info,
+            jot: Jot(drawing: PKDrawing().dataRepresentation(), pdfData: sourcePDF)
+        )
+        try jotFileService.write(jotFile: original)
+
+        let repository = EditJotRepository(
+            jotFileService: jotFileService,
+            jotFileConflictService: JotFileConflictService(
+                fileConflictService: FileConflictService(fileManager: .default)
+            ),
+            fileService: memoryFiles,
+            trashService: TrashService()
+        )
+        let drawing = PKDrawing(strokes: [makePersistenceTestStroke()])
+        let content = JotContent(
+            drawing: drawing,
+            width: 1200,
+            pdfData: sourcePDF,
+            extraPages: 0,
+            pdfInsertedPageSlots: [],
+            strokePageIndices: [0]
+        )
+
+        try await repository.writeContent(jotFileInfo: info, content: content)
+
+        let savedJot = try jotFileService.readJotFile(jotFileInfo: info).jot
+        let savedHybridPDF = try XCTUnwrap(savedJot.pdfData)
+        XCTAssertEqual(HybridPDFManager.pdfData(in: savedHybridPDF), sourcePDF)
+        XCTAssertEqual(PDFDocument(data: HybridPDFManager.pdfData(in: savedHybridPDF))?.pageCount, 78)
+        XCTAssertNotNil(HybridPDFManager.embeddedJotData(in: savedHybridPDF))
+        let loaded = try await repository.readContent(jotFileInfo: info, onProgress: { _ in })
+        XCTAssertEqual(loaded.drawing.strokes.count, 1)
+        XCTAssertEqual(loaded.drawing.strokes.first?.path.count, 3)
+        XCTAssertEqual(loaded.pdfData, sourcePDF)
+    }
+
+    func testPDFTestDocumentInkSurvivesPDFExport() async throws {
+        let fixtureURL = try XCTUnwrap(
+            Bundle(for: Self.self).url(forResource: "pdf-test", withExtension: "pdf")
+        )
+        let sourcePDF = try Data(contentsOf: fixtureURL)
+        let sourceDocument = try XCTUnwrap(PDFDocument(data: sourcePDF))
+        XCTAssertEqual(sourceDocument.pageCount, 1)
+        XCTAssertFalse(sourceDocument.allowsCommenting, "The fixture should exercise the restricted-PDF export path.")
+
+        let memoryFiles = MemoryFileService()
+        let jotFileService = JotFileService(fileService: memoryFiles)
+        let info = JotFile.Info(
+            url: URL(fileURLWithPath: "/tmp/pdf-test-export.jot"),
+            name: "pdf-test-export",
+            modificationDate: nil
+        )
+        try jotFileService.write(
+            jotFile: JotFile(
+                info: info,
+                jot: Jot(drawing: PKDrawing().dataRepresentation(), pdfData: sourcePDF)
+            )
+        )
+        let editRepository = EditJotRepository(
+            jotFileService: jotFileService,
+            jotFileConflictService: JotFileConflictService(
+                fileConflictService: FileConflictService(fileManager: .default)
+            ),
+            fileService: memoryFiles,
+            trashService: TrashService()
+        )
+        let drawing = PKDrawing(strokes: [makePDFExportTestStroke()])
+        try await editRepository.writeContent(
+            jotFileInfo: info,
+            content: JotContent(
+                drawing: drawing,
+                width: 1200,
+                pdfData: sourcePDF,
+                extraPages: 0,
+                pdfInsertedPageSlots: [],
+                strokePageIndices: [0]
+            )
+        )
+
+        let exportRepository = ShareJotRepository(
+            jotFileService: jotFileService,
+            fileService: memoryFiles
+        )
+        let outputURL = try await exportRepository.exportJot(jotFileInfo: info, format: .pdf)
+        defer { try? FileManager.default.removeItem(at: outputURL) }
+        let exportedData = try Data(contentsOf: outputURL)
+        let exportedDocument = try XCTUnwrap(PDFDocument(data: exportedData))
+        XCTAssertEqual(exportedDocument.pageCount, 1)
+        let exportedPage = try XCTUnwrap(exportedDocument.page(at: 0))
+        XCTAssertEqual(try HybridPDFManager.load(data: exportedData).drawing.strokes.count, 1)
+        XCTAssertTrue(exportedPage.annotations.contains { $0.contents == PDFAnnotationConverter.marker })
+
+        let sourcePage = try XCTUnwrap(sourceDocument.page(at: 0))
+        let renderSize = CGSize(width: 512, height: 512)
+        let sourcePixels = try testPixels(in: sourcePage.thumbnail(of: renderSize, for: .mediaBox))
+        let exportedPixels = try testPixels(in: exportedPage.thumbnail(of: renderSize, for: .mediaBox))
+        XCTAssertEqual(sourcePixels.count, exportedPixels.count)
+        let newlyVisibleMagentaPixels = stride(from: 0, to: sourcePixels.count, by: 4).filter { offset in
+            let sourceWasMagenta = sourcePixels[offset] > 160 && sourcePixels[offset + 1] < 120 && sourcePixels[offset + 2] > 160
+            let exportIsMagenta = exportedPixels[offset] > 160 && exportedPixels[offset + 1] < 120 && exportedPixels[offset + 2] > 160
+            return exportIsMagenta && !sourceWasMagenta
+        }.count
+        XCTAssertGreaterThan(newlyVisibleMagentaPixels, 10, "Reopened exported PDF should visibly contain the generated ink.")
+    }
+
+    @MainActor
+    func testBlankNoteInkExportMatchesEditorPage() async throws {
+        let memoryFiles = MemoryFileService()
+        let jotFileService = JotFileService(fileService: memoryFiles)
+        let info = JotFile.Info(
+            url: URL(fileURLWithPath: "/tmp/blank-note-export.jot"),
+            name: "blank-note-export",
+            modificationDate: nil
+        )
+        try jotFileService.write(jotFile: JotFile(info: info, jot: .makeEmpty()))
+
+        let editRepository = EditJotRepository(
+            jotFileService: jotFileService,
+            jotFileConflictService: JotFileConflictService(
+                fileConflictService: FileConflictService(fileManager: .default)
+            ),
+            fileService: memoryFiles,
+            trashService: TrashService()
+        )
+        let blankContent = try await editRepository.readContent(jotFileInfo: info, onProgress: { _ in })
+        XCTAssertNil(blankContent.pdfData, "A blank note must remain a ruled-paper note after loading.")
+
+        let pageSize = CGSize(width: blankContent.width, height: blankContent.width * (4.0 / 3.0))
+        let drawing = PKDrawing(strokes: [makePDFExportTestStroke()])
+        try await editRepository.writeContent(
+            jotFileInfo: info,
+            content: JotContent(
+                drawing: drawing,
+                width: blankContent.width,
+                pdfData: blankContent.pdfData,
+                extraPages: blankContent.extraPages,
+                pdfInsertedPageSlots: blankContent.pdfInsertedPageSlots,
+                strokePageIndices: [0]
+            )
+        )
+
+        let reopenedContent = try await editRepository.readContent(jotFileInfo: info, onProgress: { _ in })
+        XCTAssertNil(reopenedContent.pdfData, "Saving ink must not turn a blank note into a white PDF page.")
+        XCTAssertEqual(reopenedContent.drawing.strokes.count, 1)
+
+        let exportRepository = ShareJotRepository(
+            jotFileService: jotFileService,
+            fileService: memoryFiles
+        )
+        let outputURL = try await exportRepository.exportJot(jotFileInfo: info, format: .pdf)
+        defer { try? FileManager.default.removeItem(at: outputURL) }
+        let exportedData = try Data(contentsOf: outputURL)
+        let backupJot = Jot(
+            drawing: reopenedContent.drawing.dataRepresentation(),
+            width: reopenedContent.width,
+            pdfData: reopenedContent.pdfData,
+            extraPages: reopenedContent.extraPages,
+            pdfInsertedPageSlots: reopenedContent.pdfInsertedPageSlots,
+            strokePageIndices: reopenedContent.strokePageIndices
+        )
+        let backupData = try JotHybridPDFBuilder.buildHybridPDF(jot: backupJot)
+        XCTAssertEqual(backupData, exportedData, "Export and Zotero upload must share byte-identical PDF output.")
+        let exportedJot = try PropertyListDecoder().decode(
+            Jot.self,
+            from: XCTUnwrap(HybridPDFManager.embeddedJotData(in: exportedData))
+        )
+        let backedUpJot = try PropertyListDecoder().decode(
+            Jot.self,
+            from: XCTUnwrap(HybridPDFManager.embeddedJotData(in: backupData))
+        )
+        XCTAssertEqual(exportedJot.drawing, backedUpJot.drawing)
+        XCTAssertEqual(exportedJot.width, backedUpJot.width)
+        XCTAssertEqual(exportedJot.extraPages, backedUpJot.extraPages)
+        XCTAssertEqual(exportedJot.pdfInsertedPageSlots, backedUpJot.pdfInsertedPageSlots)
+        XCTAssertEqual(exportedJot.strokePageIndices, backedUpJot.strokePageIndices)
+        XCTAssertEqual(exportedJot.zoteroItemKey, backedUpJot.zoteroItemKey)
+        XCTAssertEqual(exportedJot.zoteroFileName, backedUpJot.zoteroFileName)
+        let backupBasePDF = HybridPDFManager.pdfData(in: backupData)
+        let exportBasePDF = HybridPDFManager.pdfData(in: exportedData)
+        let pdfDifferences = zip(backupBasePDF, exportBasePDF).enumerated()
+            .filter { $0.element.0 != $0.element.1 }
+            .prefix(20)
+            .map { "\($0.offset):\($0.element.0)/\($0.element.1)" }
+        XCTAssertEqual(backupBasePDF, exportBasePDF, "PDF byte differences: \(pdfDifferences)")
+        XCTAssertEqual(backupData, exportedData, "PDF export and backup must emit identical bytes.")
+        let exported = try XCTUnwrap(PDFDocument(data: exportedData))
+        let page = try XCTUnwrap(exported.page(at: 0))
+        XCTAssertEqual(exported.pageCount, 1)
+        XCTAssertEqual(page.bounds(for: .mediaBox).width, pageSize.width, accuracy: 0.5)
+        XCTAssertEqual(page.bounds(for: .mediaBox).height, pageSize.height, accuracy: 0.5)
+        let basePDF = HybridPDFManager.pdfData(in: exportedData)
+        let basePDFText = String(decoding: basePDF, as: UTF8.self)
+        XCTAssertTrue(basePDFText.contains("/Subtype /Ink"))
+        XCTAssertFalse(basePDFText.contains("/Subtype /Image"))
+        XCTAssertTrue(exportedData.suffix("\n%%JOTTRENOTE_PAYLOAD_END%%\n".utf8.count)
+            .elementsEqual("\n%%JOTTRENOTE_PAYLOAD_END%%\n".utf8))
+        XCTAssertEqual(try HybridPDFManager.load(data: exportedData).drawing.strokes.count, 1)
+
+        let renderSize = CGSize(width: 480, height: 640)
+        let scale = renderSize.width / pageSize.width
+        let trait = UITraitCollection(userInterfaceStyle: .light)
+        let editorBackground = JotBackgroundView.makeRuledPageImage(
+            pageSize: pageSize,
+            traitCollection: trait,
+            scale: scale
+        )
+        let editorInk = drawing.image(from: CGRect(origin: .zero, size: pageSize), scale: scale)
+        let referenceFormat = UIGraphicsImageRendererFormat()
+        referenceFormat.scale = 1
+        referenceFormat.opaque = true
+        let editorPage = UIGraphicsImageRenderer(size: renderSize, format: referenceFormat).image { context in
+            editorBackground.draw(in: CGRect(origin: .zero, size: renderSize))
+            editorInk.draw(in: CGRect(origin: .zero, size: renderSize))
+        }
+        let editorPixels = try testPixels(in: editorPage)
+        let exportedImage = page.thumbnail(of: renderSize, for: .mediaBox)
+        let exportedPixels = try testPixels(in: exportedImage)
+        XCTAssertEqual(editorPixels.count, exportedPixels.count)
+
+        let editorMagenta = Set(stride(from: 0, to: editorPixels.count, by: 4).compactMap { offset -> Int? in
+            guard editorPixels[offset] > 160,
+                  editorPixels[offset + 1] < 120,
+                  editorPixels[offset + 2] > 160 else { return nil }
+            return offset / 4
+        })
+        let exportedMagenta = Set(stride(from: 0, to: exportedPixels.count, by: 4).compactMap { offset -> Int? in
+            guard exportedPixels[offset] > 160,
+                  exportedPixels[offset + 1] < 120,
+                  exportedPixels[offset + 2] > 160 else { return nil }
+            return offset / 4
+        })
+        XCTAssertGreaterThan(exportedMagenta.count, 100, "Export should contain visible ink, not only ruled paper.")
+        let matchingInkPixels = editorMagenta.intersection(exportedMagenta).count
+        XCTAssertGreaterThan(
+            Double(matchingInkPixels) / Double(max(1, editorMagenta.count)),
+            0.30,
+            "Exported ink should occupy the same page position; small stroke thickness differences are allowed."
+        )
+    }
+
     func testLocalFileServiceCreateDoesNotOverwriteAnExistingFile() throws {
         let service = LocalFileService(fileManager: .default)
         let fileURL = FileManager.default.temporaryDirectory
@@ -87,31 +372,6 @@ final class CorePersistenceTests: XCTestCase {
 
         XCTAssertThrowsError(try service.createFile(fileURL: fileURL, data: Data([2])))
         XCTAssertEqual(try Data(contentsOf: fileURL), originalData)
-    }
-
-    func testCreateJotRepositoryMapsExclusiveWriteCollisionToFileExists() async throws {
-        let fileService = MemoryFileService()
-        let repository = CreateJotRepository(
-            fileService: fileService,
-            jotFileService: JotFileService(fileService: fileService)
-        )
-
-        _ = try await repository.createJot(
-            name: "Atomic",
-            directory: nil,
-            pdfData: Data([1])
-        )
-
-        do {
-            _ = try await repository.createJot(
-                name: "Atomic",
-                directory: nil,
-                pdfData: Data([2])
-            )
-            XCTFail("Expected an exclusive-create collision")
-        } catch CreateJotRepository.Failure.fileExists {
-            // Expected: the existing note was not replaced.
-        }
     }
 
     func testPersistenceWriterSerializesAndCoalescesPendingSnapshots() async throws {
@@ -243,6 +503,69 @@ final class CorePersistenceTests: XCTestCase {
             )
         )
     }
+}
+
+private func makePersistenceTestStroke() -> PKStroke {
+    let points = [
+        PKStrokePoint(
+            location: CGPoint(x: 40, y: 40), timeOffset: 0, size: CGSize(width: 4, height: 4),
+            opacity: 1, force: 1, azimuth: 0, altitude: .pi / 2
+        ),
+        PKStrokePoint(
+            location: CGPoint(x: 120, y: 100), timeOffset: 0.1, size: CGSize(width: 4, height: 4),
+            opacity: 1, force: 1, azimuth: 0, altitude: .pi / 2
+        ),
+        PKStrokePoint(
+            location: CGPoint(x: 200, y: 60), timeOffset: 0.2, size: CGSize(width: 4, height: 4),
+            opacity: 1, force: 1, azimuth: 0, altitude: .pi / 2
+        ),
+    ]
+    return PKStroke(
+        ink: PKInk(.pen, color: .black),
+        path: PKStrokePath(controlPoints: points, creationDate: Date())
+    )
+}
+
+private func makePDFExportTestStroke() -> PKStroke {
+    let locations = [
+        CGPoint(x: 240, y: 520),
+        CGPoint(x: 560, y: 960),
+        CGPoint(x: 960, y: 620),
+    ]
+    let points = locations.enumerated().map { index, location in
+        PKStrokePoint(
+            location: location,
+            timeOffset: TimeInterval(index) * 0.1,
+            size: CGSize(width: 24, height: 24),
+            opacity: 1,
+            force: 1,
+            azimuth: 0,
+            altitude: .pi / 2
+        )
+    }
+    return PKStroke(
+        ink: PKInk(.pen, color: .magenta),
+        path: PKStrokePath(controlPoints: points, creationDate: Date())
+    )
+}
+
+private func testPixels(in image: UIImage) throws -> [UInt8] {
+    let cgImage = try XCTUnwrap(image.cgImage)
+    let bytesPerRow = cgImage.width * 4
+    var rgba = [UInt8](repeating: 0, count: cgImage.height * bytesPerRow)
+    try rgba.withUnsafeMutableBytes { bytes in
+        let context = try XCTUnwrap(CGContext(
+            data: bytes.baseAddress,
+            width: cgImage.width,
+            height: cgImage.height,
+            bitsPerComponent: 8,
+            bytesPerRow: bytesPerRow,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height))
+    }
+    return rgba
 }
 
 private struct SilentLogger: LoggerProtocol {

@@ -1,7 +1,8 @@
 import Foundation
 
+/// Zotero WebDAV transport. Library discovery comes from Zotero's Web API;
+/// this service only transfers attachment archives and their .prop metadata.
 struct WebDAVService: Sendable {
-
     enum Failure: Error {
         case badURL
         case unexpectedResponse(Int)
@@ -11,77 +12,61 @@ struct WebDAVService: Sendable {
     let username: String
     let password: String
 
-    func makeDirectory(remotePath: String) async throws {
-        let remoteURL = baseURL.appendingPathComponent(remotePath)
-        var request = URLRequest(url: remoteURL)
-        request.httpMethod = "MKCOL"
-        addAuthHeader(to: &request)
+    private static let session: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 60
+        configuration.timeoutIntervalForResource = 60
+        return URLSession(configuration: configuration)
+    }()
 
-        let (_, response) = try await URLSession.shared.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse else { return }
-        // 201 Created or 405 Method Not Allowed (already exists) are both acceptable
-        let status = httpResponse.statusCode
-        guard (200...299).contains(status) || status == 405 else {
-            throw Failure.unexpectedResponse(status)
-        }
-    }
-
-    func upload(data: Data, remotePath: String) async throws {
-        let remoteURL = baseURL.appendingPathComponent(remotePath)
-        var request = URLRequest(url: remoteURL)
+    func upload(
+        data: Data,
+        remotePath: String,
+        metadata: ZoteroUploadMetadata = ZoteroUploadMetadata()
+    ) async throws -> Int {
+        let url = baseURL.appendingPathComponent(remotePath)
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 60
         request.httpMethod = "PUT"
         request.httpBody = data
         request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
-        addAuthHeader(to: &request)
-
-        let (_, response) = try await URLSession.shared.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse else { return }
-        guard (200...299).contains(httpResponse.statusCode) else {
-            throw Failure.unexpectedResponse(httpResponse.statusCode)
+        if let md5 = metadata.md5, let digest = Data(hex: md5)?.base64EncodedString() {
+            request.setValue(digest, forHTTPHeaderField: "Content-MD5")
         }
+        if let mtime = metadata.modificationTimeMilliseconds {
+            request.setValue(String(mtime), forHTTPHeaderField: "X-Zotero-Mtime")
+        }
+        addAuthHeader(to: &request)
+        let (_, response) = try await send(request)
+        guard let http = response as? HTTPURLResponse else { throw Failure.badURL }
+        guard [200, 201, 204].contains(http.statusCode) else { throw Failure.unexpectedResponse(http.statusCode) }
+        return http.statusCode
     }
 
-    func move(fromPath: String, toPath: String) async throws {
-        let fromURL = baseURL.appendingPathComponent(fromPath)
-        let toURL = baseURL.appendingPathComponent(toPath)
-        var request = URLRequest(url: fromURL)
-        request.httpMethod = "MOVE"
-        request.setValue(toURL.absoluteString, forHTTPHeaderField: "Destination")
-        request.setValue("T", forHTTPHeaderField: "Overwrite")
-        addAuthHeader(to: &request)
-
-        let (_, response) = try await URLSession.shared.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse else { return }
-        guard (200...299).contains(httpResponse.statusCode) || httpResponse.statusCode == 404 else {
-            throw Failure.unexpectedResponse(httpResponse.statusCode)
-        }
-    }
-
-    // Shared HTTP date formatter. `DateFormatter` is expensive to instantiate
-    // (locale, calendar, time-zone databases) and `lastModified` is called
-    // twice per note during automatic sync. A single shared instance avoids
-    // creating hundreds of formatters per backup cycle.
-    private static let httpDateFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(secondsFromGMT: 0)
-        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
-        return formatter
-    }()
-
-    /// Returns the `Last-Modified` date of the remote resource, or `nil` if it does not exist (404).
-    func lastModified(remotePath: String) async -> Date? {
+    func download(remotePath: String) async throws -> Data {
         var request = URLRequest(url: baseURL.appendingPathComponent(remotePath))
-        request.httpMethod = "HEAD"
+        request.timeoutInterval = 60
+        request.httpMethod = "GET"
         addAuthHeader(to: &request)
+        let (data, response) = try await send(request)
+        guard let http = response as? HTTPURLResponse else { throw Failure.badURL }
+        guard (200...299).contains(http.statusCode) else { throw Failure.unexpectedResponse(http.statusCode) }
+        return data
+    }
 
-        guard let (_, response) = try? await URLSession.shared.data(for: request),
-              let httpResponse = response as? HTTPURLResponse,
-              httpResponse.statusCode == 200
-        else { return nil }
-
-        return httpResponse.value(forHTTPHeaderField: "Last-Modified")
-            .flatMap { Self.httpDateFormatter.date(from: $0) }
+    /// Deletes a remote attachment or its .prop file. A missing file is
+    /// treated as already cleaned up, which makes retries safe.
+    func delete(remotePath: String) async throws -> Int {
+        var request = URLRequest(url: baseURL.appendingPathComponent(remotePath))
+        request.timeoutInterval = 60
+        request.httpMethod = "DELETE"
+        addAuthHeader(to: &request)
+        let (_, response) = try await send(request)
+        guard let http = response as? HTTPURLResponse else { throw Failure.badURL }
+        guard [200, 202, 204, 404].contains(http.statusCode) else {
+            throw Failure.unexpectedResponse(http.statusCode)
+        }
+        return http.statusCode
     }
 
     private func addAuthHeader(to request: inout URLRequest) {
@@ -89,5 +74,52 @@ struct WebDAVService: Sendable {
         if let encoded = credentials.data(using: .utf8)?.base64EncodedString() {
             request.setValue("Basic \(encoded)", forHTTPHeaderField: "Authorization")
         }
+    }
+
+    private func send(_ request: URLRequest) async throws -> (Data, URLResponse) {
+        for attempt in 0..<3 {
+            do {
+                let result = try await Self.session.data(for: request)
+                if let response = result.1 as? HTTPURLResponse,
+                   Self.isTransientStatus(response.statusCode), attempt < 2 {
+                    try await Task.sleep(for: .seconds(attempt + 1))
+                    continue
+                }
+                return result
+            } catch {
+                guard attempt < 2, Self.isTransientNetworkError(error) else { throw error }
+                try await Task.sleep(for: .seconds(attempt + 1))
+            }
+        }
+        throw Failure.badURL
+    }
+
+    private static func isTransientStatus(_ status: Int) -> Bool {
+        status == 408 || status == 429 || (500...599).contains(status)
+    }
+
+    private static func isTransientNetworkError(_ error: Error) -> Bool {
+        guard let urlError = error as? URLError else { return false }
+        return [
+            .timedOut, .cannotConnectToHost, .networkConnectionLost,
+            .notConnectedToInternet, .cannotFindHost, .dnsLookupFailed,
+            .resourceUnavailable
+        ].contains(urlError.code)
+    }
+}
+
+private extension Data {
+    init?(hex: String) {
+        guard hex.count.isMultiple(of: 2) else { return nil }
+        var data = Data()
+        data.reserveCapacity(hex.count / 2)
+        var index = hex.startIndex
+        while index < hex.endIndex {
+            let next = hex.index(index, offsetBy: 2)
+            guard let byte = UInt8(hex[index..<next], radix: 16) else { return nil }
+            data.append(byte)
+            index = next
+        }
+        self = data
     }
 }

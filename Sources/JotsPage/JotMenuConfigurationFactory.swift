@@ -39,17 +39,38 @@ struct JotMenuConfigurationFactory: Sendable {
 
     func make(
         onShare: @Sendable @escaping (ShareFormat, PopoverAnchor?) -> Void,
-        onRename: @Sendable @escaping () -> Void,
-        onDuplicate: @Sendable @escaping () -> Void,
-        onDelete: @Sendable @escaping () -> Void,
         onShowInFiles: @Sendable @escaping () -> Void,
         onImportPDF: (@Sendable () -> Void)? = nil,
         onAddPage: (@Sendable () -> Void)? = nil,
         onDeletePage: (@Sendable () -> Void)? = nil,
+        onManagePageTrash: (@Sendable () -> Void)? = nil,
         onOpenInNewWindow: (@Sendable () -> Void)? = nil
     ) -> JotMenuConfigurations {
         JotMenuConfigurations { popoverAnchorProvider in
             var menuConfiguration = [JotMenuConfiguration]()
+
+            if let onAddPage {
+                menuConfiguration.append(.action(JotMenuConfiguration.Action(
+                    title: L10n.EditJot.PDF.Action.addPage,
+                    systemImageName: "plus.page",
+                    handler: { onAddPage() }
+                )))
+            }
+            if let onDeletePage {
+                menuConfiguration.append(.action(JotMenuConfiguration.Action(
+                    title: L10n.EditJot.PDF.Action.deletePage,
+                    systemImageName: "trash.page",
+                    isDestructive: true,
+                    handler: { onDeletePage() }
+                )))
+            }
+            if let onManagePageTrash {
+                menuConfiguration.append(.action(JotMenuConfiguration.Action(
+                    title: String(localized: "editJot.pages.trash"),
+                    systemImageName: "archivebox",
+                    handler: { onManagePageTrash() }
+                )))
+            }
 
             if let onOpenInNewWindow {
                 menuConfiguration.append(
@@ -67,37 +88,6 @@ struct JotMenuConfigurationFactory: Sendable {
             menuConfiguration.append(
                 .action(
                     JotMenuConfiguration.Action(
-                        title: L10n.Action.rename,
-                        systemImageName: "pencil"
-                    ) {
-                        onRename()
-                    }
-                )
-            )
-            menuConfiguration.append(
-                .action(
-                    JotMenuConfiguration.Action(
-                        title: L10n.Action.duplicate,
-                        systemImageName: "plus.square.on.square"
-                    ) {
-                        onDuplicate()
-                    }
-                )
-            )
-            menuConfiguration.append(
-                .action(
-                    JotMenuConfiguration.Action(
-                        title: L10n.Action.delete,
-                        systemImageName: "trash",
-                        isDestructive: true
-                    ) {
-                        onDelete()
-                    }
-                )
-            )
-            menuConfiguration.append(
-                .action(
-                    JotMenuConfiguration.Action(
                         title: {
                             #if targetEnvironment(macCatalyst)
                             L10n.Jots.Menu.revealInFinder
@@ -111,38 +101,6 @@ struct JotMenuConfigurationFactory: Sendable {
                     }
                 )
             )
-
-            let pagesActions: [JotMenuConfiguration.Action] = [
-                onAddPage.map { onAddPage in
-                    JotMenuConfiguration.Action(
-                        title: L10n.EditJot.PDF.Action.addPage,
-                        systemImageName: "plus.app"
-                    ) {
-                        onAddPage()
-                    }
-                },
-                onDeletePage.map { onDeletePage in
-                    JotMenuConfiguration.Action(
-                        title: L10n.EditJot.PDF.Action.deletePage,
-                        systemImageName: "trash",
-                        isDestructive: true
-                    ) {
-                        onDeletePage()
-                    }
-                },
-            ].compactMap { $0 }
-
-            if !pagesActions.isEmpty {
-                menuConfiguration.append(
-                    .group(
-                        JotMenuConfiguration.Group(
-                            title: L10n.EditJot.Pages.title,
-                            systemImageName: "doc.fill",
-                            actions: pagesActions
-                        )
-                    )
-                )
-            }
 
             menuConfiguration.append(
                 .group(
