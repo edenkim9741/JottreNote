@@ -4,147 +4,129 @@
 
 # Jottre Note
 
-Jottre Note는 오픈 소스 필기 앱 [Jottre](https://github.com/antonlorani/jottre)를 기반으로 만든 iPhone, iPad 및 Mac Catalyst용 필기 노트 앱입니다. UIKit과 PencilKit을 중심으로 PDF 위 필기, 다중 페이지 문서, 도형 보정 및 WebDAV 백업 기능을 확장했습니다.
+Jottre Note는 Zotero 라이브러리의 PDF를 iPad에서 읽고 Apple Pencil로 필기하기 위한 앱입니다. Zotero Web API로 컬렉션과 문서 정보를 동기화하고, Zotero WebDAV에서 PDF를 필요할 때 내려받습니다. PDF의 원래 페이지와 텍스트를 보존하면서 필기를 편집하고 다시 Zotero에 저장할 수 있습니다.
 
-> 이 저장소는 원본 Jottre의 파생 프로젝트입니다. 원본 앱의 App Store 배포본과 Jottre Note는 동일한 제품이 아닙니다.
+이 저장소는 [Jottre](https://github.com/antonlorani/jottre)를 기반으로 한 파생 프로젝트입니다. 원본 Jottre와 Jottre Note는 별개의 제품입니다.
 
 ![Jottre Note on iPad](jottre_ipad_app_preview.jpg)
 
 ## 주요 기능
 
-### 필기 및 편집
+### Zotero 라이브러리
 
-- Apple Pencil과 손가락 입력을 지원하는 PencilKit 기반 캔버스
-- 펜, 형광펜, 지우개 및 올가미 도구
-- Pencil 전용 입력 상태에서 한 손가락 스크롤과 멀티 터치 확대·축소
-- 올가미로 잉크를 이동한 뒤에도 유지되는 자연스러운 스크롤 동작
-- 펜을 획 끝에서 잠시 유지하면 선, 원·타원, 사각형, 삼각형 및 화살표로 변환하는 Draw and Hold
-- 문서 우측 상단 설정 메뉴에서 Draw and Hold 도형 변환 활성화 여부 설정
-- 도형 변환과 잉크 편집을 포함한 실행 취소·다시 실행
+- 앱을 열면 로컬 캐시의 컬렉션 트리를 먼저 표시하고, 백그라운드에서 Zotero 변경 사항을 동기화합니다.
+- 컬렉션 계층, 미분류 항목, 휴지통을 탐색하고 제목·추가 날짜·최근 수정일 순으로 문서를 정렬할 수 있습니다.
+- 하나의 Zotero 항목에 연결된 여러 PDF 첨부파일을 각각 열 수 있습니다.
+- 문서 제목·작성자·날짜를 편집하고, 항목을 컬렉션으로 이동하거나 휴지통으로 보내고 복원할 수 있습니다.
+- 여러 문서를 선택해 한 번에 컬렉션으로 이동하거나 삭제할 수 있습니다. 휴지통에서는 복원 또는 영구 삭제를 선택합니다.
+- 새 줄노트를 세로 또는 가로 방향으로 만들 수 있습니다. 제목, 기본 작성자, 선택한 컬렉션을 Zotero 항목에 반영합니다.
 
-### PDF 및 페이지
+### PDF 필기 및 페이지 관리
 
-- 파일 앱과 외부 공유를 통한 단일 또는 여러 PDF 가져오기
-- PDF 페이지 위 직접 필기와 빈 페이지 추가·삭제
-- 원본 PDF 콘텐츠를 유지하는 Core Graphics 기반 페이지 렌더링
-- 형광펜과 일반 잉크를 분리한 이중 캔버스 합성
-  - 불투명한 배경을 가진 PDF에서도 형광펜을 표시
-  - 형광펜 위에 일반 펜 잉크를 선명하게 렌더링
-- 긴 문서에서도 메모리 사용량을 제한하는 페이지 단위 미리보기 및 내보내기
-- 일부 PDF 제작 도구가 생성한 비정상 soft mask를 보정하는 호환성 처리
+- PDF 페이지 위에 PencilKit으로 필기하고 펜, 형광펜, 지우개, 올가미 및 자 도구를 사용할 수 있습니다.
+- 새 줄노트 페이지를 삽입하고, 페이지를 휴지통으로 이동하거나 원래 위치로 복원할 수 있습니다.
+- 페이지 추가 시 문서의 페이지 크기를 사용합니다. 원본 PDF 페이지는 PDFKit으로 유지하고 잉크는 벡터 PDF Ink 주석으로 내보냅니다.
+- 문서를 저장하면 로컬 캐시를 먼저 갱신합니다. 수정된 페이지는 디바운스 저장으로 처리하며, 화면을 닫을 때 대기 중인 변경을 저장합니다.
+- PDF 내보내기에는 표준 PDF와 벡터 잉크 주석을 포함합니다. 앱에서 다시 편집하는 데 필요한 Jot 데이터는 PDF EOF 뒤의 하이브리드 페이로드로 보존합니다.
 
-### 문서 관리
+### 동기화와 오프라인 작업
 
-- 하위 호환성을 유지하는 버전 3 `.jot` 문서 형식
-- 폴더, 이름 변경, 휴지통 및 파일 버전 충돌 처리
-- 마지막으로 보던 페이지 복원
-- PDF, PNG 및 JPEG 내보내기
-- PDF 배경, 형광펜 및 일반 잉크의 레이어 순서를 내보내기와 미리보기에도 동일하게 적용
+- Zotero 컬렉션·아이템 메타데이터는 버전 기반 증분 동기화와 전체 컬렉션 대조를 사용해 로컬 JSON 캐시에 저장합니다.
+- 문서를 탭할 때만 WebDAV의 `zotero/{첨부파일Key}.zip`을 내려받아 PDF를 엽니다.
+- 저장한 문서는 해당 첨부파일 키의 ZIP과 Zotero WebDAV `.prop` 파일로 업로드하고 Zotero API의 첨부파일 메타데이터를 갱신합니다.
+- WebDAV ZIP 안에는 외부 PDF 뷰어에서 열 수 있는 PDF와 앱 재편집용 `.jot` 데이터가 들어갑니다. PDF에는 벡터 잉크 주석이 포함됩니다.
+- 네트워크가 없을 때 만든 노트는 로컬 초안으로 열 수 있으며, 연결이 복구되면 Zotero 항목과 첨부파일을 생성해 동기화합니다.
+- 서버와 로컬 필기본이 충돌하면 로컬 충돌 사본을 보존하고, 동기화 대상에서 격리합니다. 충돌 해결 화면에서 로컬본 유지, 서버본 유지 또는 둘 다 보관을 선택할 수 있습니다.
+- 설정에서 내려받은 문서와 용량을 확인하고, 동기화가 끝난 로컬 파일을 선택하거나 전체 오프로드할 수 있습니다. 수정 대기 중인 파일은 오프로드 대상에서 보호됩니다.
 
-### WebDAV 백업
+## Zotero 설정
 
-- WebDAV 서버 연결 설정 및 연결 테스트
-- 현재 문서 또는 모든 `.jot` 문서의 수동 백업
-- 폴더 구조를 유지한 `.jot` 원본과 렌더링된 PDF 동시 업로드
-- 분 단위 자동 백업 주기 설정 (`0`은 비활성화)
-- 앱 사용 중 주기 백업과 `BGTaskScheduler`를 이용한 백그라운드 처리
-- 백업 전 열린 편집기의 저장을 완료하고 파일 변경 작업을 직렬화해 충돌 방지
-- 네트워크 오류 발생 시 UI를 막지 않고 다음 작업을 다시 예약
+앱의 설정 화면에서 다음 정보를 입력합니다.
 
-### Zotero WebDAV 연동 상태
+1. Zotero User ID와 API Key를 입력합니다. API Key로 User ID를 조회할 수도 있습니다.
+2. Zotero WebDAV 서버 URL, 사용자 이름, 비밀번호를 입력합니다.
+3. 필요하면 새 노트에 사용할 기본 작성자를 설정합니다.
 
-`Sources/WebDAV/ZoteroSyncService.swift`에는 Zotero WebDAV 저장소용 어댑터가 구현되어 있습니다. 이 어댑터는 PDF를 ZIP으로 묶어 `zotero/{문서ID}.zip` 경로에 올리고, 내려받을 때 ZIP 안의 PDF를 꺼냅니다. 업로드 요청에는 Zotero가 사용하는 `Content-MD5`와 `X-Zotero-Mtime` 헤더도 포함합니다.
+API Key와 WebDAV 비밀번호는 Keychain에 보관합니다. 컬렉션·문서 메타데이터 캐시는 앱의 Application Support 디렉터리에 사용자별 JSON 파일로 저장됩니다. PDF 파일은 앱 캐시 디렉터리에 저장하고, 편집 데이터는 Application Support의 로컬 저장소에 보관합니다.
 
-다만 **현재 앱에서는 Zotero 연동을 실제로 사용할 수 없습니다.** 설정의 `Sync mode`에서 `Zotero`를 선택하고 API 키를 입력할 수 있지만, 저장 모드와 API 키가 동기화 작업에 연결되어 있지 않습니다. 자동 백업과 `Backup All Notes`는 계속 일반 WebDAV 방식으로 `.pdf` 파일을 올리며, `Test Connection`도 WebDAV 연결만 확인합니다. 따라서 현재는 Zotero 모드를 선택해도 Zotero 라이브러리에 백업하거나 Zotero 파일을 가져오지 않습니다. Zotero API 키 역시 Keychain에 보관될 뿐 API 호출에 쓰이지 않습니다.
+## 데이터 흐름
 
-일반 WebDAV 백업은 설정에서 `WebDAV` 모드를 선택하고 서버 URL, 사용자 이름, 비밀번호를 입력한 뒤 연결을 테스트해 사용할 수 있습니다. Zotero 연동은 `ZoteroSyncService`를 백업 및 가져오기 흐름에 연결하는 작업이 완료된 뒤 사용할 수 있습니다.
+```text
+Zotero Web API ── 컬렉션/문서 메타데이터 ──> 로컬 JSON 캐시 ──> 라이브러리 화면
+                                                     │
+문서 선택 ──> Zotero WebDAV ZIP ──> PDF + .jot 데이터 ─┘
+                                      │
+                                  필기/저장
+                                      │
+하이브리드 PDF ──> 벡터 PDF + .jot 데이터 ──> PDF/.jot ZIP + .prop ──> Zotero WebDAV
+```
 
 ## 기술 구성
 
 | 영역 | 구현 |
 | --- | --- |
-| UI 및 입력 | UIKit, PencilKit, PDFKit |
-| PDF 렌더링 | Core Graphics, `UIGraphicsPDFRenderer` |
-| 구조 | MVVM-C, Coordinator, `AsyncStream` 기반 상태 전달 |
-| 동시성 | Swift 6 strict concurrency, actor 기반 저장 및 백업 직렬화 |
-| 파일 처리 | `.jot` Codable 모델, `NSFileCoordinator`, 파일 버전 충돌 처리 |
-| 백그라운드 작업 | `BGTaskScheduler`, 활성 세션 주기 스케줄러 |
-| 대상 플랫폼 | iOS/iPadOS 16 이상, Mac Catalyst |
+| 라이브러리 UI | SwiftUI `NavigationSplitView` |
+| PDF 편집 | UIKit, PDFKit, PencilKit |
+| Zotero 연결 | Zotero Web API, WebDAV, ZIP 패키징 |
+| 로컬 데이터 | 사용자별 원자적 JSON 메타데이터 캐시, 앱 파일 저장소 |
+| 잉크 저장 | PDFKit Ink 주석, `%%EOF` 뒤 Jottre 페이로드 |
+| 대상 플랫폼 | iOS/iPadOS 18 이상 |
+| 프로젝트 생성 | XcodeGen |
+
+화면 문자열은 Xcode String Catalog로 관리하며 한국어와 영어를 포함한 다국어 리소스를 사용합니다.
 
 ## 프로젝트 구조
 
 ```text
 Sources/
-├── EditJotPage/       # 캔버스, 도구, 터치 라우팅, 도형 변환
-├── Jot/               # .jot 문서 모델과 직렬화
-├── PDF/               # PDF 로드, 호환성 보정 및 페이지 렌더링
-├── FileService/       # 로컬 파일 및 외부 PDF 가져오기
-├── JotFilePreview/    # 문서 미리보기 생성과 캐시
-├── JotsPage/          # 문서·폴더·휴지통 및 공유 UI
-├── SettingsPage/      # 앱 및 WebDAV 설정
-└── WebDAV/            # 업로드, 작업 잠금 및 자동 백업 스케줄러
-CoreTests/             # 문서, 렌더링, 제스처 및 스케줄러 단위 테스트
+├── EditJotPage/       # PencilKit 편집기, 저장, 페이지 관리
+├── Jot/               # 필기 문서 모델 및 직렬화
+├── PDF/               # PDF 주석 변환, 하이브리드 PDF, 줄노트 생성
+├── SettingsPage/      # Zotero 계정, WebDAV 및 로컬 캐시 설정
+└── WebDAV/            # Zotero API, 캐시, WebDAV 및 동기화 엔진
+CoreTests/             # 문서 저장, PDF 변환 및 동기화 관련 테스트
+Tests/Resources/       # 테스트용 PDF fixture
 ```
 
-## 개발 환경
+## 개발 및 빌드
 
-- Xcode: `.xcode-version`에 지정된 버전
-- Ruby: `.ruby-version`에 지정된 버전
-- Swift 6, complete strict concurrency
-- XcodeGen과 Fastlane
-
-### 설치
-
-[rbenv](https://github.com/rbenv/rbenv)로 저장소에 지정된 Ruby 버전을 설치합니다.
+필요한 도구 버전은 `.xcode-version`과 `.ruby-version`을 참고하세요. Xcode 프로젝트의 원본 설정은 `project.yml`입니다.
 
 ```sh
-curl -fsSL https://github.com/rbenv/rbenv-installer/raw/HEAD/bin/rbenv-installer | bash
-rbenv install $(cat .ruby-version)
-rbenv local $(cat .ruby-version)
-gem install bundler
-bundle install
+# Xcode 프로젝트 생성
+xcodegen generate --spec project.yml
+
+# 서명 없이 generic iOS 빌드
+xcodebuild -project Jottre.xcodeproj \
+  -scheme Jottre \
+  -configuration Debug \
+  -destination 'generic/platform=iOS' \
+  CODE_SIGNING_ALLOWED=NO build
+
+# 테스트 타깃 빌드
+xcodebuild -project Jottre.xcodeproj \
+  -scheme JottreTests \
+  -configuration Debug \
+  -destination 'generic/platform=iOS' \
+  CODE_SIGNING_ALLOWED=NO build
+
+# iOS 시뮬레이터에서 테스트 실행
+xcodebuild test -project Jottre.xcodeproj \
+  -scheme Jottre \
+  -destination 'platform=iOS Simulator,name=iPad Air 13-inch (M4)' \
+  CODE_SIGNING_ALLOWED=NO
 ```
 
-필요한 Xcode 버전은 [xcodes](https://github.com/XcodesOrg/xcodes)로 설치할 수 있습니다.
+### IPA 생성
+
+저장소 루트의 `build.sh`는 Release 빌드, `Payload/Jottre.app` 구성, `Jottre.ipa` 압축을 수행합니다.
 
 ```sh
-brew install xcodesorg/made/xcodes aria2
-xcodes install $(cat .xcode-version) --experimental-unxip
-xcodes select $(cat .xcode-version)
+./build.sh
 ```
 
-Xcode 프로젝트를 생성합니다.
+이 스크립트는 자동 프로비저닝 갱신을 사용하며 마케팅 버전과 빌드 번호를 스크립트 안에서 지정합니다. 배포 전에 `MARKETING_VERSION`과 `CURRENT_PROJECT_VERSION` 값을 확인하고 Apple 개발자 계정의 서명 설정을 준비하세요. 생성 결과는 저장소 루트의 `Jottre.ipa`입니다.
 
-```sh
-bundle exec fastlane ios generate_project
-open Jottre.xcodeproj
-```
+## 라이선스
 
-### 빌드 및 검증
-
-```sh
-# iOS/iPadOS Debug 빌드
-bundle exec fastlane ios build_debug
-
-# Mac Catalyst Debug 빌드
-bundle exec fastlane mac build_debug
-
-# 단위 테스트
-bundle exec fastlane ios test
-```
-
-`project.yml`이 프로젝트 구성의 기준이므로, 타깃이나 빌드 설정을 변경한 뒤에는 Xcode 프로젝트를 다시 생성해야 합니다.
-
-## 기여
-
-기여하기 전에 다음 문서를 확인해 주세요.
-
-- [기여 가이드](CONTRIBUTING.md)
-- [행동 강령](CODE_OF_CONDUCT.md)
-- [보안 정책](SECURITY_POLICY.md)
-
-## 원본 프로젝트와 라이선스
-
-Jottre Note는 Anton Lorani의 [Jottre](https://github.com/antonlorani/jottre)를 기반으로 하며, 원본 프로젝트의 저작권 고지와 라이선스를 유지합니다.
-
-이 프로젝트는 [GNU General Public License v3.0](LICENSE)에 따라 배포됩니다. GPLv3가 허용하는 범위에서 소프트웨어를 사용, 수정 및 재배포할 수 있으며, 동일한 라이선스 의무가 적용됩니다.
+Jottre Note는 원본 프로젝트의 저작권 고지와 라이선스를 유지합니다. 이 프로젝트는 [GNU GPLv3](LICENSE)에 따라 배포됩니다.
