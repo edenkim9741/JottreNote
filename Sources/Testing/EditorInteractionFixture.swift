@@ -20,6 +20,7 @@ enum EditorInteractionFixture {
             label.frame = CGRect(x: 100, y: 50 + index * 20, width: 120, height: 18)
             label.text = "UI test page \(index + 1)"
             label.font = .systemFont(ofSize: 10)
+            label.textColor = .clear
             label.isUserInteractionEnabled = false
             label.isAccessibilityElement = true
             label.accessibilityIdentifier = identifier
@@ -29,14 +30,27 @@ enum EditorInteractionFixture {
             guard let canvas, let pdfView, let host, let page = pdfView.document?.page(at: index),
                 let window = host.window else { return nil }
             let rect = pdfView.convert(pdfView.convert(page.bounds(for: .cropBox), from: page), to: window)
+            let canvasRect = canvas.convert(canvas.bounds, to: window)
+            label.frame = host.convert(rect, from: window)
             let midX = canvas.drawing.strokes.isEmpty ? 0 : canvas.drawing.bounds.midX
-            guard [rect.minX, rect.minY, rect.width, rect.height, midX].allSatisfy(\.isFinite),
+            let toolName: String
+            if canvas.tool is PKLassoTool {
+                toolName = "lasso"
+            } else if canvas.tool is PKEraserTool {
+                toolName = "eraser"
+            } else {
+                toolName = "pen"
+            }
+            guard [rect.minX, rect.minY, rect.width, rect.height, canvasRect.minX, canvasRect.minY,
+                   canvasRect.width, canvasRect.height, midX, pdfView.scaleFactor].allSatisfy(\.isFinite),
                 rect.width > 0, rect.height > 0 else { return nil }
             let info: [String: Any] = [
                 "midX": midX,
                 "strokes": canvas.drawing.strokes.count,
                 "rect": [rect.minX, rect.minY, rect.width, rect.height],
-                "tool": canvas.tool is PKLassoTool ? "lasso" : "pen",
+                "canvasRect": [canvasRect.minX, canvasRect.minY, canvasRect.width, canvasRect.height],
+                "scaleFactor": pdfView.scaleFactor,
+                "tool": toolName,
                 "firstResponder": canvas.isFirstResponder,
                 "markup": pdfView.isInMarkupMode,
                 "input": canvas.isDrawingEnabled,

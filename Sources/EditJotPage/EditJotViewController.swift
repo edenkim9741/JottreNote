@@ -273,6 +273,7 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
+        zoomCoordinator.stopObservingDoubleTapZoom()
         (navigationController?.navigationBar as? JottreNavigationBar)?
             .passesThroughBackgroundTouches = false
         gestureCoordinator.update(
@@ -502,7 +503,7 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
 
     private func synchronizePageInputState() {
         zoomCoordinator.observe(gestureCoordinator.pdfNavigationScrollViews())
-        zoomCoordinator.observeDoubleTapZoom(in: pdfView)
+        zoomCoordinator.observeDoubleTapZoom(in: pdfView, isEnabled: !cachedRulerActive)
         gestureCoordinator.update(
             isEditing: isEditingEnabled,
             tool: selectedToolFromPickerIfAvailable(),

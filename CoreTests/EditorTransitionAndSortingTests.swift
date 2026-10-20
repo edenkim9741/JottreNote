@@ -69,23 +69,67 @@ final class EditorTransitionAndSortingTests: XCTestCase {
         XCTAssertFalse(canvas.isRulerActive)
     }
 
-    func testDoubleTapZoomObserverLeavesPDFKitRecognizerConfigurationUntouched() {
+    func testDoubleTapZoomInstallsOneFingerOnlyRecognizerAndSuppressesPDFKitDuplicate() throws {
         let pdf = JotPDFView()
-        let doubleTap = UITapGestureRecognizer()
-        doubleTap.numberOfTapsRequired = 2
-        doubleTap.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
-        doubleTap.cancelsTouchesInView = true
-        pdf.addGestureRecognizer(doubleTap)
-        let originalEnabled = doubleTap.isEnabled
-        let originalTouchTypes = doubleTap.allowedTouchTypes
-        let originalCancelsTouches = doubleTap.cancelsTouchesInView
+        let pdfKitDoubleTap = UITapGestureRecognizer()
+        pdfKitDoubleTap.numberOfTapsRequired = 2
+        pdfKitDoubleTap.numberOfTouchesRequired = 1
+        pdf.addGestureRecognizer(pdfKitDoubleTap)
         let coordinator = JotCanvasZoomCoordinator {}
 
         coordinator.observeDoubleTapZoom(in: pdf)
+        let installed = try XCTUnwrap(coordinator.doubleTapRecognizer)
+        coordinator.observeDoubleTapZoom(in: pdf)
 
-        XCTAssertEqual(doubleTap.isEnabled, originalEnabled)
-        XCTAssertEqual(doubleTap.allowedTouchTypes, originalTouchTypes)
-        XCTAssertEqual(doubleTap.cancelsTouchesInView, originalCancelsTouches)
+        XCTAssertFalse(pdfKitDoubleTap.isEnabled)
+        XCTAssertTrue(JotCanvasZoomCoordinator.acceptsDoubleTapTouch(.direct))
+        XCTAssertFalse(JotCanvasZoomCoordinator.acceptsDoubleTapTouch(.pencil))
+        XCTAssertTrue(installed.delegate === coordinator)
+        XCTAssertFalse(installed.cancelsTouchesInView)
+        let enabledDoubleTaps = pdf.gestureRecognizers?.compactMap { $0 as? UITapGestureRecognizer }
+            .filter { $0.numberOfTapsRequired == 2 && $0.isEnabled } ?? []
+        XCTAssertEqual(enabledDoubleTaps.count, 1)
+        XCTAssertTrue(enabledDoubleTaps.first === installed,
+            "Repeated editor synchronization must not install another active double-tap recognizer")
+        coordinator.stopObservingDoubleTapZoom()
+        XCTAssertTrue(pdfKitDoubleTap.isEnabled, "PDFKit's original recognizer state is restored on editor exit")
+        XCTAssertFalse(pdf.gestureRecognizers?.contains(installed) ?? true)
+    }
+
+    func testDoubleTapRecognizerRemainsSingleAcrossPDFDocumentReplacement() throws {
+        let pdf = JotPDFView()
+        let coordinator = JotCanvasZoomCoordinator {}
+        coordinator.observeDoubleTapZoom(in: pdf)
+        let installed = try XCTUnwrap(coordinator.doubleTapRecognizer)
+        pdf.document = try XCTUnwrap(PDFDocument(data: makePDF(pageCount: 1)))
+        coordinator.observeDoubleTapZoom(in: pdf)
+        pdf.document = try XCTUnwrap(PDFDocument(data: makePDF(pageCount: 4)))
+        coordinator.observeDoubleTapZoom(in: pdf)
+
+        XCTAssertTrue(coordinator.doubleTapRecognizer === installed)
+        XCTAssertEqual(installed.numberOfTouchesRequired, 1)
+        XCTAssertTrue(doubleTapRecognizers(in: pdf).allSatisfy { $0 === installed || !$0.isEnabled })
+    }
+
+    func testDoubleTapScalePolicyTogglesBetweenFitAndCappedTwoTimesFit() {
+        XCTAssertEqual(JotCanvasZoomCoordinator.targetScale(current: 1, fit: 1, minimum: 0.5, maximum: 5), 2)
+        XCTAssertEqual(JotCanvasZoomCoordinator.targetScale(current: 2, fit: 1, minimum: 0.5, maximum: 5), 1)
+        XCTAssertEqual(JotCanvasZoomCoordinator.targetScale(current: 1, fit: 1, minimum: 0.5, maximum: 1.5), 1.5)
+        XCTAssertEqual(JotCanvasZoomCoordinator.targetScale(current: 1.5, fit: 1, minimum: 0.5, maximum: 1.5), 1)
+        XCTAssertNil(JotCanvasZoomCoordinator.targetScale(current: .nan, fit: 1, minimum: 0, maximum: 5))
+        XCTAssertNil(JotCanvasZoomCoordinator.targetScale(current: 1, fit: 1, minimum: 2, maximum: 1))
+    }
+
+    private func makePDF(pageCount: Int) -> Data {
+        UIGraphicsPDFRenderer(bounds: CGRect(x: 0, y: 0, width: 600, height: 800)).pdfData { context in
+            for _ in 0..<pageCount { context.beginPage() }
+        }
+    }
+
+    private func doubleTapRecognizers(in view: UIView) -> [UITapGestureRecognizer] {
+        let local = (view.gestureRecognizers ?? []).compactMap { $0 as? UITapGestureRecognizer }
+            .filter { $0.numberOfTapsRequired == 2 && $0.numberOfTouchesRequired == 1 }
+        return local + view.subviews.flatMap(doubleTapRecognizers(in:))
     }
 
     func testNativeLassoKeepsPencilInputAndPDFFingerNavigation() throws {
