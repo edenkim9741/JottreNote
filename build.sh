@@ -4,6 +4,7 @@ set -euo pipefail
 DERIVED_DATA="$PWD/build"
 STAGING_DIR="$(mktemp -d)"
 OUTPUT_IPA="$PWD/Jottre.ipa"
+CLOUD_DIR="/Users/eden/Library/CloudStorage/Nextcloud-cloud.edenkim.mywire.org-gunhyeongkim/Documents/Development/apps/Test"
 
 cleanup() {
   rm -rf "$STAGING_DIR"
@@ -16,8 +17,8 @@ xcodebuild \
   -destination 'generic/platform=iOS' \
   -derivedDataPath "$DERIVED_DATA" \
   -allowProvisioningUpdates \
-  MARKETING_VERSION=2.1.2 \
-  CURRENT_PROJECT_VERSION=4 \
+  MARKETING_VERSION=2.1.8 \
+  CURRENT_PROJECT_VERSION=0 \
   build
 
 APP_PATH="$DERIVED_DATA/Build/Products/Release-iphoneos/Jottre.app"
@@ -31,3 +32,5 @@ ditto "$APP_PATH" "$STAGING_DIR/Payload/Jottre.app"
 )
 
 echo "Created: $OUTPUT_IPA"
+
+cp "$OUTPUT_IPA" "$CLOUD_DIR/Jottre.ipa"
