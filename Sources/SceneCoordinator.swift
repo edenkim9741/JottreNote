@@ -13,7 +13,6 @@ final class SceneCoordinator {
     private let onUpdateUserInterfaceStyle: @Sendable (UIUserInterfaceStyle) -> Void
     private var activeEditCoordinator: NavigationCoordinator?
     private var userInterfaceStyleTask: Task<Void, Never>?
-    private var lastActiveURL: URL?
 
     init(
         navigation: Navigation,
@@ -51,7 +50,6 @@ final class SceneCoordinator {
         } else {
             return []
         }
-        lastActiveURL = editURL
         let coordinator = editJotCoordinatorFactory.make(navigation: navigation)
         activeEditCoordinator = coordinator
         return coordinator.handle(url: editURL)
@@ -67,13 +65,6 @@ final class SceneCoordinator {
             modificationDate: nil
         )
         navigation.open(url: EditJotURL(jotFileInfo: info))
-    }
-
-    func makeStateRestorationActivity() -> NSUserActivity? {
-        guard let lastActiveURL else { return nil }
-        let activity = NSUserActivity(activityType: Constants.activityType)
-        activity.userInfo = [Constants.urlKey: lastActiveURL.absoluteString]
-        return activity
     }
 
     deinit { userInterfaceStyleTask?.cancel() }

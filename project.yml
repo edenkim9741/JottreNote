@@ -124,6 +124,21 @@ targets:
         SWIFT_STRICT_CONCURRENCY: complete
         GENERATE_INFOPLIST_FILE: YES
 
+  JottreInteractionUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    deploymentTarget: "18.0"
+    sources:
+      - InteractionUITests
+    dependencies:
+      - target: Jottre
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.edenkim.jottre.InteractionUITests
+        SWIFT_VERSION: "6.0"
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: Jottre
+
 schemes:
   Jottre:
     build:
@@ -154,3 +169,13 @@ schemes:
         - name: JottreTests
     analyze:
       config: Debug
+
+  JottreInteractionUITests:
+    build:
+      targets:
+        Jottre: all
+        JottreInteractionUITests: all
+    test:
+      config: Debug
+      targets:
+        - name: JottreInteractionUITests

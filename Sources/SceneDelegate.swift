@@ -124,14 +124,21 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         zoteroRootViewController = rootController
         navigationController.viewControllers = [rootController]
         self.window?.makeKeyAndVisible()
+        #if DEBUG
+        if EditorInteractionFixture.tool != nil,
+            let info = try? EditorInteractionFixture.makeDocument(using: services.jotFileService) {
+            let controllers = sceneCoordinator.handle(url: EditJotURL(jotFileInfo: info).toURL())
+            navigationController.setViewControllers([rootController] + controllers, animated: false)
+            return
+        }
+        #endif
         let activityURLString = connectionOptions.userActivities
             .first(where: { $0.activityType == SceneCoordinator.Constants.activityType })?
             .userInfo?[SceneCoordinator.Constants.urlKey] as? String
-            ?? session.stateRestorationActivity?.userInfo?[SceneCoordinator.Constants.urlKey] as? String
-        let incomingURL = activityURLString.flatMap(URL.init(string:))
-            ?? connectionOptions.urlContexts.map(\.url).first(where: {
-                $0.isFileURL && $0.pathExtension.lowercased() == JotFile.Info.fileExtension
-            })
+        let incomingURL = SceneLaunchPolicy.documentURL(
+            explicitActivityURL: activityURLString,
+            fileURLs: connectionOptions.urlContexts.map(\.url)
+        )
         if let incomingURL {
             let viewControllers = sceneCoordinator.handle(url: incomingURL)
             guard !viewControllers.isEmpty else { return }
@@ -164,7 +171,7 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     }
 
     func stateRestorationActivity(for scene: UIScene) -> NSUserActivity? {
-        sceneCoordinator?.makeStateRestorationActivity()
+        nil
     }
 }
 

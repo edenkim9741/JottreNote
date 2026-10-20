@@ -9,22 +9,6 @@ private enum ZoteroLibraryLocation: Hashable {
     case trash
 }
 
-private enum ZoteroAttachmentSortOrder: String, CaseIterable, Identifiable {
-    case title
-    case dateAdded
-    case recentlyModified
-
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .title: String(localized: "zotero.sort.title")
-        case .dateAdded: String(localized: "zotero.sort.dateAdded")
-        case .recentlyModified: String(localized: "zotero.sort.recentlyModified")
-        }
-    }
-}
-
 private enum ZoteroNoteOrientation: String, CaseIterable, Identifiable {
     case portrait
     case landscape
@@ -58,8 +42,9 @@ private final class ZoteroLibraryViewModel: ObservableObject {
     @Published private(set) var isSyncing = false
     @Published private(set) var errorMessage: String?
     @Published private(set) var openingAttachmentKey: String?
-    @Published private(set) var sortOrder: ZoteroAttachmentSortOrder = .title
-    @Published private(set) var isSortReversed = false
+    @Published private(set) var sorting: ZoteroLibrarySorting
+    var sortOrder: ZoteroAttachmentSortOrder { sorting.order }
+    var isSortReversed: Bool { sorting.isReversed }
     @Published private(set) var isSelecting = false
     @Published private(set) var selectedItemKeys = Set<String>()
 
@@ -77,6 +62,7 @@ private final class ZoteroLibraryViewModel: ObservableObject {
         self.cacheStore = cacheStore
         self.engine = engine
         self.defaults = defaults
+        sorting = ZoteroLibrarySorting(defaults: defaults)
         userID = defaults.getValue(.zoteroUserID) ?? ""
         apiKey = keychain.value(for: "zotero_api_key") ?? ""
         snapshot = cacheStore.load(userID: userID)
@@ -87,6 +73,8 @@ private final class ZoteroLibraryViewModel: ObservableObject {
         networkMonitor.start(queue: networkQueue)
         if !userID.isEmpty, !apiKey.isEmpty { Task { await synchronize() } }
     }
+
+    deinit { networkMonitor.cancel() }
 
     func synchronize() async {
         guard !userID.isEmpty, !apiKey.isEmpty, !isSyncing else { return }
@@ -332,12 +320,8 @@ private final class ZoteroLibraryViewModel: ObservableObject {
     }
 
     func selectSortOrder(_ order: ZoteroAttachmentSortOrder) {
-        if sortOrder == order {
-            isSortReversed.toggle()
-        } else {
-            sortOrder = order
-            isSortReversed = false
-        }
+        sorting = sorting.selecting(order)
+        sorting.save(to: defaults)
     }
 
     func createDocument(title: String, pageSize: CGSize) async -> String? {
@@ -861,12 +845,15 @@ struct ZoteroLibraryView: View {
                                 Text(order.title)
                             }
                         }
+                        .accessibilityIdentifier("zotero.sort.\(order.rawValue)")
                     }
                 } label: {
                     Image(systemName: "arrow.up.arrow.down")
                 }
                 .buttonStyle(.borderless)
                 .accessibilityLabel(String(localized: "zotero.sort.menu"))
+                .accessibilityIdentifier("zotero.sort")
+                .accessibilityValue(Text(model.sorting.accessibilityDescription))
                 Button {
                     withAnimation {
                         columnVisibility = columnVisibility == .detailOnly ? .all : .detailOnly
