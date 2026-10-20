@@ -50,8 +50,6 @@ final class JotEditorGestureCoordinator: NSObject {
         for (index, overlay) in overlays {
             guard let canvas = overlay.canvas as? JotCanvasView else { continue }
             configure(canvas, overlay: overlay, pageIndex: index)
-            canvas.suppressesStandardEditActions = suppressesEditActions
-            editMenuInteractions.apply(suppressed: suppressesNativeEditMenus, in: overlay)
         }
 
         let input = CanvasTouchRouting.configuration(
@@ -90,12 +88,14 @@ final class JotEditorGestureCoordinator: NSObject {
             ),
             in: overlay
         )
-        canvas.isRulerActive = isEditingEnabled && isRulerActive && pageIndex == activePageIndex
+        let shouldActivateRuler = isEditingEnabled && isRulerActive && pageIndex == activePageIndex
+        if canvas.isRulerActive != shouldActivateRuler {
+            canvas.isRulerActive = shouldActivateRuler
+        }
     }
 
     func detach(_ canvas: JotCanvasView) {
         editMenuInteractions.restore(in: canvas)
-        canvas.isRulerActive = false
         canvas.isUserInteractionEnabled = false
         canvas.delegate = nil
     }

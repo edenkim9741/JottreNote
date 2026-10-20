@@ -105,6 +105,22 @@ final class CanvasTouchRoutingTests: XCTestCase {
     }
 
     @MainActor
+    func testRulerStateSurvivesPageOverlayGeometryUpdates() {
+        let canvas = JotCanvasView()
+        let overlay = JotPDFPageCanvasOverlay(canvas: canvas, pageSize: CGSize(width: 210, height: 297))
+        canvas.isRulerActive = true
+
+        overlay.configure(displayScale: 1.5)
+        overlay.layoutIfNeeded()
+        overlay.configure(displayScale: 2.25)
+        overlay.layoutIfNeeded()
+
+        XCTAssertTrue(canvas.isRulerActive)
+        XCTAssertTrue(canvas.isUserInteractionEnabled)
+        XCTAssertTrue(canvas.drawingGestureRecognizer.isEnabled)
+    }
+
+    @MainActor
     func testPencilOnlyAndViewingModesKeepOneFingerPDFNavigation() {
         let editing = CanvasTouchRouting.configuration(
             isEditingEnabled: true,

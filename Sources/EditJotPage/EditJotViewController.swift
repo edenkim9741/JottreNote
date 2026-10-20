@@ -89,6 +89,7 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
     private var selectedCanvasTool: any PKTool = PKInkingTool(.pen)
     #if !targetEnvironment(macCatalyst)
     private var cachedRulerActive = false
+    private var isApplyingPageInputState = false
     #endif
     private var drawingWidth = CGFloat.zero
     private var currentPageSize = JotPageLayout.defaultSize
@@ -101,7 +102,6 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
     #if !targetEnvironment(macCatalyst)
     private var didSelectInitialPenTool = false
     private var selectedToolUpdateTask: Task<Void, Never>?
-    private weak var toolPickerCanvasObserver: JotCanvasView?
     #endif
 
     private lazy var swipeBackGesture: UIScreenEdgePanGestureRecognizer = {
@@ -288,10 +288,6 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
         saveScrollPosition()
         Task { @MainActor [viewModel] in await viewModel.didDisappear() }
         #if !targetEnvironment(macCatalyst)
-        if let canvas = toolPickerCanvasObserver {
-            toolPicker.removeObserver(canvas)
-            toolPickerCanvasObserver = nil
-        }
         persistentCanvasAnchor.preservesFirstResponder = false
         if isToolPickerObserverAttached {
             toolPicker.removeObserver(self)
@@ -503,7 +499,13 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
 
     private func synchronizePageInputState() {
         zoomCoordinator.observe(gestureCoordinator.pdfNavigationScrollViews())
-        zoomCoordinator.observeDoubleTapZoom(in: pdfView, isEnabled: !cachedRulerActive)
+        // Keep PDF navigation available while the ruler is active. Ruler
+        // manipulation remains PencilKit's responsibility on the active page.
+        zoomCoordinator.observeDoubleTapZoom(in: pdfView)
+        #if !targetEnvironment(macCatalyst)
+        isApplyingPageInputState = true
+        defer { isApplyingPageInputState = false }
+        #endif
         gestureCoordinator.update(
             isEditing: isEditingEnabled,
             tool: selectedToolFromPickerIfAvailable(),
@@ -512,8 +514,16 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
             activePageIndex: currentPDFPageIndex,
             overlays: pageOverlays
         )
-        updateToolPickerCanvasObserver(for: currentPDFPageIndex)
+        #if !targetEnvironment(macCatalyst)
+        // PKCanvasView.isRulerActive can notify the shared picker while the
+        // coordinator deactivates the old page. Restore the picker-owned value
+        // after all page-local canvas states have been applied.
+        if toolPicker.isRulerActive != cachedRulerActive {
+            toolPicker.isRulerActive = cachedRulerActive
+        }
+        #endif
         #if DEBUG
+        EditorInteractionFixture.pickerRulerActive = cachedRulerActive
         if EditorInteractionFixture.tool != nil {
             for (index, canvas) in pageCanvases {
                 EditorInteractionFixture.publish(canvas: canvas, index: index, pdfView: pdfView, host: view)
@@ -781,29 +791,12 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
 extension EditJotViewController: PKToolPickerObserver {
 
     func toolPickerIsRulerActiveDidChange(_ toolPicker: PKToolPicker) {
+        guard !isApplyingPageInputState else { return }
         cachedRulerActive = toolPicker.isRulerActive
+        #if DEBUG
+        EditorInteractionFixture.pickerRulerActive = cachedRulerActive
+        #endif
         synchronizePageInputState()
-    }
-
-    private func updateToolPickerCanvasObserver(for pageIndex: Int?) {
-        let nextCanvas: JotCanvasView?
-        if isEditingEnabled, let pageIndex, let canvas = pageCanvases[pageIndex] {
-            nextCanvas = canvas
-        } else if isEditingEnabled {
-            // PDFKit can briefly report no current page while it lays out a
-            // new overlay. Keep the existing PencilKit observer until the new
-            // page canvas is registered, avoiding a ruler state reset.
-            nextCanvas = toolPickerCanvasObserver
-        } else {
-            nextCanvas = nil
-        }
-
-        guard nextCanvas !== toolPickerCanvasObserver else { return }
-        if let previous = toolPickerCanvasObserver { toolPicker.removeObserver(previous) }
-        toolPickerCanvasObserver = nextCanvas
-        if let nextCanvas {
-            toolPicker.addObserver(nextCanvas)
-        }
     }
 
     @available(iOS, introduced: 13.0, deprecated: 18.0)

@@ -7,6 +7,8 @@ import PDFKit
 /// runner's launch environment; no account or remote document is used.
 @MainActor
 enum EditorInteractionFixture {
+    static var pickerRulerActive = false
+
     static var tool: String? {
         let value = ProcessInfo.processInfo.environment["JOTTRE_INTERACTION_TEST_TOOL"]
         return ["pen", "lasso", "blank-pen"].contains(value ?? "") ? value : nil
@@ -14,6 +16,22 @@ enum EditorInteractionFixture {
 
     static func publish(canvas: PKCanvasView, index: Int, pdfView: PDFView, host: UIView) {
         guard tool != nil else { return }
+        if !host.subviews.contains(where: { $0.accessibilityIdentifier == "editor.test.nextPage" }) {
+            let nextPageButton = UIButton(type: .system)
+            nextPageButton.frame = CGRect(x: 12, y: 112, width: 44, height: 36)
+            nextPageButton.setImage(UIImage(systemName: "arrow.down.page"), for: .normal)
+            nextPageButton.accessibilityLabel = "Next test page"
+            nextPageButton.accessibilityIdentifier = "editor.test.nextPage"
+            nextPageButton.addAction(UIAction { [weak pdfView] _ in
+                guard let pdfView, let document = pdfView.document,
+                    let currentPage = pdfView.currentPage else { return }
+                let currentIndex = document.index(for: currentPage)
+                guard currentIndex != NSNotFound, currentIndex + 1 < document.pageCount,
+                    let nextPage = document.page(at: currentIndex + 1) else { return }
+                pdfView.go(to: nextPage)
+            }, for: .touchUpInside)
+            host.addSubview(nextPageButton)
+        }
         let identifier = "editor.page.\(index)"
         let label = host.subviews.first { $0.accessibilityIdentifier == identifier } as? EditorInteractionProbe ?? EditorInteractionProbe()
         if label.superview == nil {
@@ -30,7 +48,11 @@ enum EditorInteractionFixture {
             guard let canvas, let pdfView, let host, let page = pdfView.document?.page(at: index),
                 let window = host.window else { return nil }
             let rect = pdfView.convert(pdfView.convert(page.bounds(for: .cropBox), from: page), to: window)
+            let viewportRect = pdfView.convert(pdfView.bounds.inset(by: pdfView.safeAreaInsets), to: window)
             let canvasRect = canvas.convert(canvas.bounds, to: window)
+            let currentPageIndex = pdfView.document.flatMap { document in
+                pdfView.currentPage.map { document.index(for: $0) }
+            } ?? NSNotFound
             label.frame = host.convert(rect, from: window)
             let canvasMenuInteractions = editMenuInteractionDescriptions(in: canvas)
             let pdfMenuInteractions = editMenuInteractionDescriptions(in: pdfView)
@@ -43,19 +65,25 @@ enum EditorInteractionFixture {
             } else {
                 toolName = "pen"
             }
-            guard [rect.minX, rect.minY, rect.width, rect.height, canvasRect.minX, canvasRect.minY,
-                   canvasRect.width, canvasRect.height, midX, pdfView.scaleFactor].allSatisfy(\.isFinite),
+            guard [rect.minX, rect.minY, rect.width, rect.height,
+                   viewportRect.minX, viewportRect.minY, viewportRect.width, viewportRect.height,
+                   canvasRect.minX, canvasRect.minY, canvasRect.width, canvasRect.height,
+                   midX, pdfView.scaleFactor].allSatisfy(\.isFinite),
                 rect.width > 0, rect.height > 0 else { return nil }
             let info: [String: Any] = [
                 "midX": midX,
                 "strokes": canvas.drawing.strokes.count,
                 "rect": [rect.minX, rect.minY, rect.width, rect.height],
+                "viewportRect": [viewportRect.minX, viewportRect.minY, viewportRect.width, viewportRect.height],
                 "canvasRect": [canvasRect.minX, canvasRect.minY, canvasRect.width, canvasRect.height],
                 "scaleFactor": pdfView.scaleFactor,
+                "currentPageIndex": currentPageIndex,
                 "tool": toolName,
                 "firstResponder": canvas.isFirstResponder,
                 "markup": pdfView.isInMarkupMode,
                 "input": canvas.isDrawingEnabled,
+                "canvasRulerActive": canvas.isRulerActive,
+                "pickerRulerActive": pickerRulerActive,
                 "drawingPolicy": canvas.drawingPolicy.rawValue,
                 "drawingGesture": canvas.drawingGestureRecognizer.isEnabled,
                 "offset": [canvas.contentOffset.x, canvas.contentOffset.y],

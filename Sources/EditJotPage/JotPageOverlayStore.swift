@@ -36,7 +36,6 @@ final class JotPageOverlayStore {
     func reset() {
         for canvas in canvases.values {
             canvas.delegate = nil
-            canvas.isRulerActive = false
         }
         overlays.removeAll()
         canvases.removeAll()
