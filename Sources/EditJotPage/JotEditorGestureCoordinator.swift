@@ -49,9 +49,8 @@ final class JotEditorGestureCoordinator: NSObject {
 
         for (index, overlay) in overlays {
             guard let canvas = overlay.canvas as? JotCanvasView else { continue }
-            configure(canvas, overlay: overlay)
+            configure(canvas, overlay: overlay, pageIndex: index)
             canvas.suppressesStandardEditActions = suppressesEditActions
-            canvas.isRulerActive = isEditingEnabled && self.isRulerActive && index == self.activePageIndex
             editMenuInteractions.apply(suppressed: suppressesNativeEditMenus, in: overlay)
         }
 
@@ -68,7 +67,7 @@ final class JotEditorGestureCoordinator: NSObject {
         )
     }
 
-    func configure(_ canvas: JotCanvasView, overlay: JotPDFPageCanvasOverlay, pageIndex: Int? = nil) {
+    func configure(_ canvas: JotCanvasView, overlay: JotPDFPageCanvasOverlay, pageIndex: Int?) {
         let nextTool = overlay.toolInDrawingCoordinates(selectedTool)
         if !toolsMatch(canvas.tool, nextTool) { canvas.tool = nextTool }
 

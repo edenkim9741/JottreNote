@@ -54,6 +54,57 @@ final class CanvasTouchRoutingTests: XCTestCase {
     }
 
     @MainActor
+    func testRulerStateIsScopedToActivePageWithoutDisablingMenuOrCanvasInputPolicies() {
+        let pdfView = JotPDFView()
+        let coordinator = JotEditorGestureCoordinator(pdfView: pdfView)
+        let firstCanvas = JotCanvasView()
+        let secondCanvas = JotCanvasView()
+        let firstOverlay = JotPDFPageCanvasOverlay(canvas: firstCanvas, pageSize: CGSize(width: 100, height: 140))
+        let secondOverlay = JotPDFPageCanvasOverlay(canvas: secondCanvas, pageSize: CGSize(width: 100, height: 140))
+
+        coordinator.update(
+            isEditing: true,
+            tool: PKInkingTool(.pen),
+            pickerVisible: true,
+            rulerActive: true,
+            activePageIndex: 1,
+            overlays: [0: firstOverlay, 1: secondOverlay]
+        )
+
+        XCTAssertFalse(firstCanvas.isRulerActive)
+        XCTAssertTrue(secondCanvas.isRulerActive)
+        XCTAssertTrue(secondCanvas.isUserInteractionEnabled)
+        XCTAssertTrue(secondCanvas.drawingGestureRecognizer.isEnabled)
+        XCTAssertTrue(secondCanvas.suppressesStandardEditActions)
+        XCTAssertFalse(CanvasTouchRouting.shouldPassDirectTouchesThroughOverlay(rulerActive: secondCanvas.isRulerActive))
+
+        coordinator.update(
+            isEditing: true,
+            tool: PKInkingTool(.pen),
+            pickerVisible: true,
+            rulerActive: true,
+            activePageIndex: 0,
+            overlays: [0: firstOverlay, 1: secondOverlay]
+        )
+
+        XCTAssertTrue(firstCanvas.isRulerActive)
+        XCTAssertFalse(secondCanvas.isRulerActive)
+
+        coordinator.update(
+            isEditing: true,
+            tool: PKInkingTool(.pen),
+            pickerVisible: true,
+            rulerActive: false,
+            activePageIndex: 0,
+            overlays: [0: firstOverlay, 1: secondOverlay]
+        )
+        XCTAssertFalse(firstCanvas.isRulerActive)
+        XCTAssertFalse(secondCanvas.isRulerActive)
+        XCTAssertTrue(firstCanvas.isUserInteractionEnabled)
+        XCTAssertTrue(firstCanvas.drawingGestureRecognizer.isEnabled)
+    }
+
+    @MainActor
     func testPencilOnlyAndViewingModesKeepOneFingerPDFNavigation() {
         let editing = CanvasTouchRouting.configuration(
             isEditingEnabled: true,

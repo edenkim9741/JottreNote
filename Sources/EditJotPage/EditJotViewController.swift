@@ -803,7 +803,6 @@ extension EditJotViewController: PKToolPickerObserver {
         toolPickerCanvasObserver = nextCanvas
         if let nextCanvas {
             toolPicker.addObserver(nextCanvas)
-            nextCanvas.isRulerActive = cachedRulerActive
         }
     }
 
