@@ -5,15 +5,29 @@ import UIKit
 /// Applies PencilKit's native input policy to visible page overlays and keeps
 /// direct-touch navigation on PDFKit's own scroll views.
 @MainActor
-final class JotEditorGestureCoordinator {
+final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
     private unowned let pdfView: JotPDFView
     private var isEditingEnabled = false
     private var selectedTool: any PKTool = PKInkingTool(.pen)
     private var isRulerActive = false
     private var activePageIndex: Int?
+    private(set) var incidentalEditMenuBlocker: UILongPressGestureRecognizer
+    private let protectedPDFLongPresses = NSHashTable<UILongPressGestureRecognizer>.weakObjects()
 
     init(pdfView: JotPDFView) {
         self.pdfView = pdfView
+        let blocker = UILongPressGestureRecognizer(target: nil, action: nil)
+        blocker.minimumPressDuration = 0.45
+        blocker.cancelsTouchesInView = false
+        blocker.delaysTouchesBegan = false
+        blocker.delaysTouchesEnded = false
+        blocker.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+        blocker.isEnabled = false
+        incidentalEditMenuBlocker = blocker
+        super.init()
+        blocker.delegate = self
+        blocker.addTarget(self, action: #selector(incidentalEditMenuLongPressRecognized(_:)))
+        pdfView.addGestureRecognizer(blocker)
     }
 
     func update(
@@ -34,11 +48,22 @@ final class JotEditorGestureCoordinator {
             self.activePageIndex = nil
         }
         pdfView.isInMarkupMode = isEditing
-        pdfView.suppressesStandardEditActions = isEditing
+        let suppressesEditActions = CanvasTouchRouting.suppressesStandardEditActions(
+            isEditing: isEditing,
+            tool: tool
+        )
+        pdfView.suppressesStandardEditActions = suppressesEditActions
+        incidentalEditMenuBlocker.isEnabled = CanvasTouchRouting.shouldBlockIncidentalEditMenu(
+            isEditing: isEditing,
+            tool: tool,
+            rulerActive: rulerActive
+        )
+        installPDFLongPressFailureDependencies()
 
         for (index, overlay) in overlays {
             guard let canvas = overlay.canvas as? JotCanvasView else { continue }
             configure(canvas, overlay: overlay)
+            canvas.suppressesStandardEditActions = suppressesEditActions
             canvas.isRulerActive = isEditingEnabled && self.isRulerActive && index == self.activePageIndex
         }
 
@@ -67,7 +92,10 @@ final class JotEditorGestureCoordinator {
         if canvas.isDrawingEnabled != isEditingEnabled { canvas.isDrawingEnabled = isEditingEnabled }
         if canvas.isScrollEnabled { canvas.isScrollEnabled = false }
         if let pinch = canvas.pinchGestureRecognizer, pinch.isEnabled { pinch.isEnabled = false }
-        canvas.suppressesStandardEditActions = isEditingEnabled
+        canvas.suppressesStandardEditActions = CanvasTouchRouting.suppressesStandardEditActions(
+            isEditing: isEditingEnabled,
+            tool: selectedTool
+        )
         canvas.isRulerActive = isEditingEnabled && isRulerActive && pageIndex == activePageIndex
     }
 
@@ -75,6 +103,18 @@ final class JotEditorGestureCoordinator {
         canvas.isRulerActive = false
         canvas.isUserInteractionEnabled = false
         canvas.delegate = nil
+    }
+
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+        guard gestureRecognizer === incidentalEditMenuBlocker else { return true }
+        return CanvasTouchRouting.shouldBlockIncidentalEditMenu(for: touch.type)
+    }
+
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+        gestureRecognizer === incidentalEditMenuBlocker || otherGestureRecognizer === incidentalEditMenuBlocker
     }
 
     func pdfNavigationScrollViews() -> [UIScrollView] {
@@ -101,6 +141,30 @@ final class JotEditorGestureCoordinator {
             collectPDFScrollViews(in: child, into: &result)
         }
     }
+
+    private func installPDFLongPressFailureDependencies() {
+        guard incidentalEditMenuBlocker.isEnabled else { return }
+
+        func install(in view: UIView) {
+            guard !(view is PKCanvasView), !(view is JotPDFPageCanvasOverlay) else { return }
+            for recognizer in view.gestureRecognizers ?? [] {
+                guard let longPress = recognizer as? UILongPressGestureRecognizer,
+                    longPress !== incidentalEditMenuBlocker,
+                    !protectedPDFLongPresses.contains(longPress)
+                else { continue }
+                // PDFKit's text-selection long presses wait for this direct-
+                // touch recognizer. A stationary finger press is consumed in
+                // normal ink/eraser mode; moving touches still fail it and
+                // continue through PDFKit's pan and pinch recognizers.
+                longPress.require(toFail: incidentalEditMenuBlocker)
+                protectedPDFLongPresses.add(longPress)
+            }
+            for child in view.subviews { install(in: child) }
+        }
+        install(in: pdfView)
+    }
+
+    @objc private func incidentalEditMenuLongPressRecognized(_ recognizer: UILongPressGestureRecognizer) {}
 
     private func toolsMatch(_ lhs: any PKTool, _ rhs: any PKTool) -> Bool {
         if let left = lhs as? PKInkingTool, let right = rhs as? PKInkingTool {

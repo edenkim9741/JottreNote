@@ -194,7 +194,8 @@ final class ArchitectureRefactoringTests: XCTestCase {
             overlays: [0: first, 1: second]
         )
         XCTAssertEqual(canvas.drawingPolicy, .pencilOnly)
-        XCTAssertTrue(canvas.suppressesStandardEditActions)
+        XCTAssertFalse(canvas.suppressesStandardEditActions)
+        XCTAssertFalse(coordinator.incidentalEditMenuBlocker.isEnabled)
         XCTAssertTrue(first.canvas.isRulerActive)
         XCTAssertFalse(second.canvas.isRulerActive)
     }

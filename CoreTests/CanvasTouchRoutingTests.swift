@@ -19,6 +19,29 @@ final class CanvasTouchRoutingTests: XCTestCase {
     }
 
     @MainActor
+    func testIncidentalEditMenuSuppressionTargetsInkAndEraserButPreservesLassoAndRuler() {
+        XCTAssertTrue(CanvasTouchRouting.suppressesStandardEditActions(isEditing: true, tool: PKInkingTool(.pen)))
+        XCTAssertTrue(CanvasTouchRouting.suppressesStandardEditActions(isEditing: true, tool: PKEraserTool(.bitmap)))
+        XCTAssertFalse(CanvasTouchRouting.suppressesStandardEditActions(isEditing: true, tool: PKLassoTool()))
+        XCTAssertFalse(CanvasTouchRouting.suppressesStandardEditActions(isEditing: false, tool: PKInkingTool(.pen)))
+
+        XCTAssertTrue(CanvasTouchRouting.shouldBlockIncidentalEditMenu(
+            isEditing: true, tool: PKInkingTool(.pen), rulerActive: false))
+        XCTAssertTrue(CanvasTouchRouting.shouldBlockIncidentalEditMenu(
+            isEditing: true, tool: PKEraserTool(.bitmap), rulerActive: false))
+        XCTAssertFalse(CanvasTouchRouting.shouldBlockIncidentalEditMenu(
+            isEditing: true, tool: PKLassoTool(), rulerActive: false))
+        XCTAssertFalse(CanvasTouchRouting.shouldBlockIncidentalEditMenu(
+            isEditing: true, tool: PKInkingTool(.pen), rulerActive: true))
+    }
+
+    @MainActor
+    func testIncidentalEditMenuBlockerOnlyAcceptsFingerTouches() {
+        XCTAssertTrue(CanvasTouchRouting.shouldBlockIncidentalEditMenu(for: .direct))
+        XCTAssertFalse(CanvasTouchRouting.shouldBlockIncidentalEditMenu(for: .pencil))
+    }
+
+    @MainActor
     func testPencilOnlyAndViewingModesKeepOneFingerPDFNavigation() {
         let editing = CanvasTouchRouting.configuration(
             isEditingEnabled: true,

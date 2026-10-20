@@ -25,14 +25,28 @@ final class EditorInteractionUITests: XCTestCase {
         )
     }
 
-    func testFirstTouchAfterScrollingDoesNotShowTextMenu() throws {
+    func testFirstTouchAfterScrollingDoesNotShowTextMenu() async throws {
         let app = launch(tool: "pen")
         let first = app.staticTexts["editor.page.0"]
         XCTAssertTrue(first.waitForExistence(timeout: 15))
         let pen = app.buttons["Pen"]
         XCTAssertTrue(pen.waitForExistence(timeout: 5))
-        if try info(first)["tool"] as? String != "pen" { pen.tap() }
+        if try info(first)["tool"] as? String != "pen" {
+            pen.tap()
+            var selectedTool = try info(first)["tool"] as? String
+            for _ in 0..<20 where selectedTool != "pen" {
+                try await Task.sleep(for: .milliseconds(100))
+                selectedTool = try info(first)["tool"] as? String
+            }
+        }
         XCTAssertEqual(try info(first)["tool"] as? String, "pen")
+        // The fixture contains selectable PDF text at the top-left. Hold there
+        // long enough to exercise PDFKit's text-selection edit menu path.
+        let text = try point(app, info: info(first), x: 0.12, y: 0.07)
+        text.press(forDuration: 1.2)
+        XCTAssertFalse(app.menuItems["Select All"].exists)
+        XCTAssertFalse(app.buttons["Insert Space"].exists)
+
         let geometry = try info(first)
         try point(app, info: geometry, x: 0.6, y: 0.65)
             .press(forDuration: 0.01, thenDragTo: point(app, info: geometry, x: 0.6, y: 0.2))
@@ -49,6 +63,80 @@ final class EditorInteractionUITests: XCTestCase {
         XCTAssertFalse(app.buttons["Insert Space"].exists)
         XCTAssertFalse(app.staticTexts["Select All"].exists)
         XCTAssertFalse(app.staticTexts["Insert Space"].exists)
+    }
+
+    func testFingerPinchStillZoomsWithIncidentalMenuBlocker() async throws {
+        let app = launch(tool: "pen")
+        let page = app.staticTexts["editor.page.0"]
+        XCTAssertTrue(page.waitForExistence(timeout: 15))
+        let before = try XCTUnwrap(try info(page)["scaleFactor"] as? Double)
+
+        page.pinch(withScale: 1.5, velocity: 1)
+
+        var after = try info(page)
+        for _ in 0..<20 where (after["scaleFactor"] as? Double ?? 0) <= before * 1.1 {
+            try await Task.sleep(for: .milliseconds(100))
+            after = try info(page)
+        }
+        XCTAssertGreaterThan(try XCTUnwrap(after["scaleFactor"] as? Double), before * 1.1)
+    }
+
+    func testEraserModeAlsoSuppressesIncidentalFingerMenu() throws {
+        let app = launch(tool: "pen")
+        let page = app.staticTexts["editor.page.0"]
+        XCTAssertTrue(page.waitForExistence(timeout: 15))
+        let eraser = app.buttons["Eraser"]
+        XCTAssertTrue(eraser.waitForExistence(timeout: 10))
+        eraser.tap()
+
+        let geometry = try info(page)
+        XCTAssertEqual(geometry["tool"] as? String, "eraser")
+        try point(app, info: geometry, x: 0.12, y: 0.07).press(forDuration: 1.2)
+        XCTAssertFalse(app.menuItems["Select All"].exists)
+        XCTAssertFalse(app.buttons["Insert Space"].exists)
+    }
+
+    func testFingerDoubleTapZoomsAroundTapAndReturnsToFit() async throws {
+        let app = launch(tool: "pen")
+        let page = app.staticTexts["editor.page.0"]
+        XCTAssertTrue(page.waitForExistence(timeout: 15))
+
+        let initial = try info(page)
+        let initialScale = try XCTUnwrap(initial["scaleFactor"] as? Double)
+        let initialPageRect = try XCTUnwrap(initial["rect"] as? [Double])
+        let anchorX = initialPageRect[0] + initialPageRect[2] * 0.32
+        let anchorY = initialPageRect[1] + initialPageRect[3] * 0.38
+        let zoomTap = app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: anchorX, dy: anchorY))
+        zoomTap.doubleTap()
+
+        var zoomed = try info(page)
+        for _ in 0..<20 where (zoomed["scaleFactor"] as? Double ?? 0) <= initialScale * 1.1 {
+            try await Task.sleep(for: .milliseconds(100))
+            zoomed = try info(page)
+        }
+        let zoomedScale = try XCTUnwrap(zoomed["scaleFactor"] as? Double)
+        XCTAssertGreaterThan(zoomedScale, initialScale * 1.1)
+        let pageRect = try XCTUnwrap(zoomed["rect"] as? [Double])
+        let canvasRect = try XCTUnwrap(zoomed["canvasRect"] as? [Double])
+        XCTAssertEqual(anchorX,
+            pageRect[0] + pageRect[2] * 0.32, accuracy: 8,
+            "The tapped PDF point should remain near its original screen position")
+        XCTAssertEqual(anchorY,
+            pageRect[1] + pageRect[3] * 0.38, accuracy: 8,
+            "The tapped PDF point should remain near its original screen position")
+        for index in 0..<4 {
+            XCTAssertEqual(canvasRect[index], pageRect[index], accuracy: 2,
+                "PDF page and PencilKit canvas must remain registered after zoom")
+        }
+
+        zoomTap.doubleTap()
+        var restored = try info(page)
+        for _ in 0..<20 where (restored["scaleFactor"] as? Double ?? .greatestFiniteMagnitude) >= zoomedScale * 0.9 {
+            try await Task.sleep(for: .milliseconds(100))
+            restored = try info(page)
+        }
+        let restoredScale = try XCTUnwrap(restored["scaleFactor"] as? Double)
+        XCTAssertEqual(restoredScale, initialScale, accuracy: 0.05)
     }
 
     func testColdLaunchAfterEditingReturnsToLibrary() {
