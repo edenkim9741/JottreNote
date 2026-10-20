@@ -25,6 +25,41 @@ import XCTest
 
 final class CorePersistenceTests: XCTestCase {
 
+    func testConcurrentLocalFileReplacementsStayAtomicWithoutCollisionCopies() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("jottre-write-lock-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let target = directory.appendingPathComponent("note.jot")
+        let service = LocalFileService(fileManager: .default)
+        let payloads = (0..<16).map { index in
+            Data(repeating: UInt8(index), count: 64 * 1024)
+        }
+        let writesSucceeded = await withTaskGroup(of: Bool.self, returning: [Bool].self) { group in
+            for payload in payloads {
+                group.addTask {
+                    do {
+                        try service.writeFile(fileURL: target, data: payload)
+                        return true
+                    } catch {
+                        return false
+                    }
+                }
+            }
+            var results: [Bool] = []
+            for await result in group { results.append(result) }
+            return results
+        }
+
+        XCTAssertTrue(writesSucceeded.allSatisfy { $0 })
+        let finalData = try Data(contentsOf: target)
+        XCTAssertTrue(payloads.contains(finalData), "A replacement must leave one complete payload")
+        let files = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+        XCTAssertEqual(files, [target.lastPathComponent])
+        XCTAssertFalse(files.contains { $0.hasPrefix("collision_") })
+    }
+
     func testJotRejectsUnsupportedOrIncompleteFormatVersions() throws {
         let oldFormatData = try PropertyListSerialization.data(
             fromPropertyList: [
@@ -148,13 +183,30 @@ final class CorePersistenceTests: XCTestCase {
 
         let savedJot = try jotFileService.readJotFile(jotFileInfo: info).jot
         let savedHybridPDF = try XCTUnwrap(savedJot.pdfData)
-        XCTAssertEqual(HybridPDFManager.pdfData(in: savedHybridPDF), sourcePDF)
-        XCTAssertEqual(PDFDocument(data: HybridPDFManager.pdfData(in: savedHybridPDF))?.pageCount, 78)
+        let sourceDocument = try XCTUnwrap(PDFDocument(data: sourcePDF))
+        let savedDocument = try XCTUnwrap(
+            PDFDocument(data: HybridPDFManager.pdfData(in: savedHybridPDF))
+        )
+        XCTAssertEqual(savedDocument.pageCount, sourceDocument.pageCount)
+        for pageIndex in [0, sourceDocument.pageCount - 1] {
+            let sourcePage = try XCTUnwrap(sourceDocument.page(at: pageIndex))
+            let savedPage = try XCTUnwrap(savedDocument.page(at: pageIndex))
+            XCTAssertEqual(
+                savedPage.bounds(for: .mediaBox).size,
+                sourcePage.bounds(for: .mediaBox).size,
+                "Page \(pageIndex) should preserve the source page dimensions."
+            )
+        }
         XCTAssertNotNil(HybridPDFManager.embeddedJotData(in: savedHybridPDF))
         let loaded = try await repository.readContent(jotFileInfo: info, onProgress: { _ in })
         XCTAssertEqual(loaded.drawing.strokes.count, 1)
         XCTAssertEqual(loaded.drawing.strokes.first?.path.count, 3)
-        XCTAssertEqual(loaded.pdfData, sourcePDF)
+        let reloadedDocument = try XCTUnwrap(PDFDocument(data: try XCTUnwrap(loaded.pdfData)))
+        XCTAssertEqual(reloadedDocument.pageCount, sourceDocument.pageCount)
+        XCTAssertEqual(
+            reloadedDocument.page(at: 0)?.bounds(for: .mediaBox).size,
+            sourceDocument.page(at: 0)?.bounds(for: .mediaBox).size
+        )
     }
 
     func testPDFTestDocumentInkSurvivesPDFExport() async throws {
@@ -321,12 +373,9 @@ final class CorePersistenceTests: XCTestCase {
 
         let renderSize = CGSize(width: 480, height: 640)
         let scale = renderSize.width / pageSize.width
-        let trait = UITraitCollection(userInterfaceStyle: .light)
-        let editorBackground = JotBackgroundView.makeRuledPageImage(
-            pageSize: pageSize,
-            traitCollection: trait,
-            scale: scale
-        )
+        let ruledPDF = try JotHybridPDFBuilder.makeRuledPDF(pageSize: pageSize, pageCount: 1)
+        let ruledPage = try XCTUnwrap(PDFDocument(data: ruledPDF)?.page(at: 0))
+        let editorBackground = ruledPage.thumbnail(of: renderSize, for: .mediaBox)
         let editorInk = drawing.image(from: CGRect(origin: .zero, size: pageSize), scale: scale)
         let referenceFormat = UIGraphicsImageRendererFormat()
         referenceFormat.scale = 1

@@ -284,7 +284,6 @@ struct ZoteroCollectionSnapshot: Sendable {
 final class ZoteroCacheStore: @unchecked Sendable {
 
     private let rootDirectory: URL
-    private let lock = NSLock()
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
 
@@ -297,8 +296,12 @@ final class ZoteroCacheStore: @unchecked Sendable {
         decoder.dateDecodingStrategy = .iso8601
     }
 
+    private func withCacheAccess<T>(_ operation: () throws -> T) rethrows -> T {
+        try FileAccessCoordinator.shared.withAccess(to: rootDirectory, operation)
+    }
+
     func load(userID: String) -> ZoteroCacheSnapshot {
-        lock.withLock {
+        withCacheAccess {
             guard let data = try? Data(contentsOf: url(for: userID)),
                   let snapshot = try? decoder.decode(ZoteroCacheSnapshot.self, from: data),
                   snapshot.userID == userID else {
@@ -309,7 +312,7 @@ final class ZoteroCacheStore: @unchecked Sendable {
     }
 
     func save(_ snapshot: ZoteroCacheSnapshot) throws {
-        try lock.withLock {
+        try withCacheAccess {
             try FileManager.default.createDirectory(
                 at: rootDirectory,
                 withIntermediateDirectories: true
@@ -320,7 +323,7 @@ final class ZoteroCacheStore: @unchecked Sendable {
     }
 
     func apply(_ delta: ZoteroLibraryDelta, userID: String) throws -> ZoteroCacheSnapshot {
-        try lock.withLock {
+        try withCacheAccess {
             var snapshot = loadUnlocked(userID: userID)
             guard snapshot.lastLibraryVersion == delta.sinceVersion else {
                 throw Failure.cacheAdvancedDuringSync
@@ -429,7 +432,7 @@ final class ZoteroCacheStore: @unchecked Sendable {
         libraryVersion: Int,
         userID: String
     ) throws -> ZoteroCacheSnapshot {
-        try lock.withLock {
+        try withCacheAccess {
             var snapshot = loadUnlocked(userID: userID)
             guard snapshot.lastLibraryVersion == libraryVersion else {
                 throw Failure.cacheAdvancedDuringSync
@@ -463,7 +466,7 @@ final class ZoteroCacheStore: @unchecked Sendable {
     /// are local-only and must never block cleanup on a remote Zotero request.
     @discardableResult
     func forceDeleteConflictCopy(key: String, userID: String) throws -> ZoteroCacheSnapshot {
-        try lock.withLock {
+        try withCacheAccess {
             var snapshot = loadUnlocked(userID: userID)
             guard let attachment = snapshot.attachments[key], attachment.isConflict || attachment.isLocalOnly else {
                 throw Failure.conflictNotFound
@@ -510,7 +513,7 @@ final class ZoteroCacheStore: @unchecked Sendable {
         date: String,
         userID: String
     ) throws -> ZoteroCacheSnapshot {
-        try lock.withLock {
+        try withCacheAccess {
             var snapshot = loadUnlocked(userID: userID)
             guard let item = snapshot.items[key] else { throw Failure.itemNotFound }
             snapshot.items[key] = ZoteroItem(
@@ -538,7 +541,7 @@ final class ZoteroCacheStore: @unchecked Sendable {
         toCollectionKey collectionKey: String?,
         userID: String
     ) throws -> ZoteroCacheSnapshot {
-        try lock.withLock {
+        try withCacheAccess {
             var snapshot = loadUnlocked(userID: userID)
             let collectionKeys = collectionKey.map { [$0] } ?? []
             for key in keys {
@@ -565,7 +568,7 @@ final class ZoteroCacheStore: @unchecked Sendable {
     }
 
     func markItemsTrashed(keys: Set<String>, userID: String) throws -> ZoteroCacheSnapshot {
-        try lock.withLock {
+        try withCacheAccess {
             var snapshot = loadUnlocked(userID: userID)
             for key in keys {
                 guard let item = snapshot.items[key] else { continue }
@@ -592,7 +595,7 @@ final class ZoteroCacheStore: @unchecked Sendable {
     }
 
     func restoreItems(keys: Set<String>, userID: String) throws -> ZoteroCacheSnapshot {
-        try lock.withLock {
+        try withCacheAccess {
             var snapshot = loadUnlocked(userID: userID)
             for key in keys {
                 guard let item = snapshot.items[key] else { continue }
@@ -621,7 +624,7 @@ final class ZoteroCacheStore: @unchecked Sendable {
     /// Removes all cached rows and files belonging to a permanently deleted
     /// top-level item. Soft trash intentionally never calls this method.
     func permanentlyDeleteItems(keys: Set<String>, userID: String) throws -> ZoteroCacheSnapshot {
-        try lock.withLock {
+        try withCacheAccess {
             var snapshot = loadUnlocked(userID: userID)
             let attachmentKeys = Set(snapshot.attachments.values.compactMap { attachment -> String? in
                 if keys.contains(attachment.key) { return attachment.key }
@@ -668,7 +671,7 @@ final class ZoteroCacheStore: @unchecked Sendable {
     /// The cache file and dirty metadata are updated under the same store lock.
     @discardableResult
     func saveEditedPDF(key: String, data: Data, userID: String) throws -> URL {
-        try lock.withLock {
+        try withCacheAccess {
             var snapshot = loadUnlocked(userID: userID)
             let canonicalKey = snapshot.keyAliases[key] ?? key
             guard var attachment = snapshot.attachments[canonicalKey] else { throw Failure.attachmentNotFound }
@@ -694,7 +697,7 @@ final class ZoteroCacheStore: @unchecked Sendable {
     }
 
     func markSynced(key: String, data: Data, userID: String) throws -> ZoteroCacheSnapshot {
-        try lock.withLock {
+        try withCacheAccess {
             var snapshot = loadUnlocked(userID: userID)
             let canonicalKey = snapshot.keyAliases[key] ?? key
             guard var attachment = snapshot.attachments[canonicalKey] else { throw Failure.attachmentNotFound }
@@ -732,7 +735,7 @@ final class ZoteroCacheStore: @unchecked Sendable {
         libraryVersion: Int,
         userID: String
     ) throws -> URL {
-        try lock.withLock {
+        try withCacheAccess {
             var snapshot = loadUnlocked(userID: userID)
             let fileURL = defaultPDFCacheURL(for: attachment.key)
             try FileManager.default.createDirectory(
@@ -804,7 +807,7 @@ final class ZoteroCacheStore: @unchecked Sendable {
         version: Int,
         userID: String
     ) throws {
-        try lock.withLock {
+        try withCacheAccess {
             var snapshot = loadUnlocked(userID: userID)
             guard let oldItem = snapshot.items[temporaryParentKey],
                   var oldAttachment = snapshot.attachments[temporaryAttachmentKey],
@@ -881,7 +884,7 @@ final class ZoteroCacheStore: @unchecked Sendable {
     }
 
     func recordPendingSyncError(key: String, message: String, userID: String) throws {
-        try lock.withLock {
+        try withCacheAccess {
             var snapshot = loadUnlocked(userID: userID)
             guard var attachment = snapshot.attachments[key] else { throw Failure.attachmentNotFound }
             attachment.syncError = message
@@ -895,7 +898,7 @@ final class ZoteroCacheStore: @unchecked Sendable {
     }
 
     func installRemoteVersion(key: String, data: Data, userID: String) throws {
-        try lock.withLock {
+        try withCacheAccess {
             var snapshot = loadUnlocked(userID: userID)
             guard var attachment = snapshot.attachments[key] else { throw Failure.attachmentNotFound }
             guard !attachment.isConflict && !attachment.isLocalOnly else { return }
@@ -913,7 +916,7 @@ final class ZoteroCacheStore: @unchecked Sendable {
     }
 
     func resolveConflictKeepingLocal(key: String, userID: String) throws -> ZoteroCacheSnapshot {
-        try lock.withLock {
+        try withCacheAccess {
             var snapshot = loadUnlocked(userID: userID)
             guard let conflict = snapshot.attachments[key], conflict.isConflict,
                   let originalKey = originalAttachmentKey(for: conflict, snapshot: snapshot),
@@ -945,7 +948,7 @@ final class ZoteroCacheStore: @unchecked Sendable {
     }
 
     func resolveConflictKeepingServer(key: String, serverData: Data, userID: String) throws -> ZoteroCacheSnapshot {
-        try lock.withLock {
+        try withCacheAccess {
             var snapshot = loadUnlocked(userID: userID)
             guard let conflict = snapshot.attachments[key], conflict.isConflict,
                   let originalKey = originalAttachmentKey(for: conflict, snapshot: snapshot),
@@ -982,7 +985,7 @@ final class ZoteroCacheStore: @unchecked Sendable {
         created: CreatedZoteroDocumentKeys,
         userID: String
     ) throws -> ZoteroCacheSnapshot {
-        try lock.withLock {
+        try withCacheAccess {
             var snapshot = loadUnlocked(userID: userID)
             guard let conflict = snapshot.attachments[key], conflict.isConflict,
                   let sourcePath = conflict.conflictLocalPath ?? conflict.localCachePath,
@@ -1140,7 +1143,7 @@ final class ZoteroCacheStore: @unchecked Sendable {
     /// Removes local PDF copies and returns their attachment records to cloud-only state.
     /// Unsynced edits are rejected so an offload can never discard the only current copy.
     func offload(keys: Set<String>, userID: String) throws -> ZoteroCacheSnapshot {
-        try lock.withLock {
+        try withCacheAccess {
             var snapshot = loadUnlocked(userID: userID)
             let attachments = keys.compactMap { snapshot.attachments[$0] }
             guard !attachments.contains(where: { $0.syncStatus == .dirty }) else {
@@ -1168,7 +1171,7 @@ final class ZoteroCacheStore: @unchecked Sendable {
         userID: String,
         update: (inout ZoteroAttachment) -> Void
     ) throws -> ZoteroCacheSnapshot {
-        try lock.withLock {
+        try withCacheAccess {
             var snapshot = loadUnlocked(userID: userID)
             guard var attachment = snapshot.attachments[key] else { throw Failure.attachmentNotFound }
             update(&attachment)

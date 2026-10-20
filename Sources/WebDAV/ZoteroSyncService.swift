@@ -1,5 +1,5 @@
-import CryptoKit
 import Compression
+import CryptoKit
 import Foundation
 import PDFKit
 
@@ -24,25 +24,32 @@ struct ZoteroSyncService: Sendable {
     }
 
     func download(documentID: String) async throws -> Data {
-        guard Self.isValidKey(documentID) else { throw Failure.invalidKey }
-        let archiveData = try await service.download(remotePath: zipPath(for: documentID))
-        let extractedDirectory = cacheDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try FileManager.default.createDirectory(
-            at: extractedDirectory,
-            withIntermediateDirectories: true
-        )
-        defer { try? FileManager.default.removeItem(at: extractedDirectory) }
-        let entries = try ZoteroZIPArchive.extract(archiveData, to: extractedDirectory)
-        guard let pdfURL = entries.first(where: { $0.pathExtension.lowercased() == "pdf" }) ?? entries.first else {
-            throw Failure.pdfNotFound
+        try await AsyncResourceAccessCoordinator.shared.withAccess(to: resourceKey(for: documentID)) {
+
+            guard Self.isValidKey(documentID) else { throw Failure.invalidKey }
+            let archiveData = try await service.download(remotePath: zipPath(for: documentID))
+            return try await Task.detached(priority: .utility) {
+                try TemporaryFileWorkspace.withDirectory(in: cacheDirectory) { extractedDirectory in
+                    let entries = try ZoteroZIPArchive.extract(archiveData, to: extractedDirectory)
+                    guard let pdfURL = entries.first(where: { $0.pathExtension.lowercased() == "pdf" }) ?? entries.first
+                    else {
+                        throw Failure.pdfNotFound
+                    }
+                    return try Self.restoreHybridPDF(fromPDFAt: pdfURL, extractedFiles: entries)
+                }
+            }.value
+
         }
-        return try Self.restoreHybridPDF(fromPDFAt: pdfURL, extractedFiles: entries)
     }
 
     func deleteRemoteAttachment(documentID: String) async throws {
-        guard Self.isValidKey(documentID) else { throw Failure.invalidKey }
-        _ = try await service.delete(remotePath: zipPath(for: documentID))
-        _ = try await service.delete(remotePath: propPath(for: documentID))
+        try await AsyncResourceAccessCoordinator.shared.withAccess(to: resourceKey(for: documentID)) {
+
+            guard Self.isValidKey(documentID) else { throw Failure.invalidKey }
+            _ = try await service.delete(remotePath: zipPath(for: documentID))
+            _ = try await service.delete(remotePath: propPath(for: documentID))
+
+        }
     }
 
     func upload(
@@ -50,41 +57,49 @@ struct ZoteroSyncService: Sendable {
         data: Data,
         metadata: ZoteroUploadMetadata
     ) async throws {
-        guard Self.isValidKey(documentID) else { throw Failure.invalidKey }
-        let package = try await Task.detached(priority: .utility) {
-            try Self.makeUploadPackage(documentID: documentID, data: data, metadata: metadata)
-        }.value
-        let filename = package.filename
-        let archiveData = package.archiveData
-        let checksum = package.archiveMD5
-        let pdfChecksum = package.pdfMD5
-        let mtime = package.mtime
-        let modificationDate = metadata.modificationDate ?? Date()
-        let zipRemotePath = zipPath(for: documentID)
-        let zipURL = service.baseURL.appendingPathComponent(zipRemotePath)
-        print("[ZoteroUpload] Uploading [\(documentID)].zip (\(archiveData.count) bytes) to \(zipURL)...")
-        let zipStatus = try await service.upload(
-            data: archiveData,
-            remotePath: zipRemotePath,
-            metadata: ZoteroUploadMetadata(
-                modificationDate: modificationDate,
-                md5: checksum,
-                modificationTimeMilliseconds: mtime
+        try await AsyncResourceAccessCoordinator.shared.withAccess(to: resourceKey(for: documentID)) {
+
+            guard Self.isValidKey(documentID) else { throw Failure.invalidKey }
+            let package = try await Task.detached(priority: .utility) {
+                try Self.makeUploadPackage(documentID: documentID, data: data, metadata: metadata)
+            }.value
+            let filename = package.filename
+            let archiveData = package.archiveData
+            let checksum = package.archiveMD5
+            let pdfChecksum = package.pdfMD5
+            let mtime = package.mtime
+            let modificationDate = metadata.modificationDate ?? Date()
+            let zipRemotePath = zipPath(for: documentID)
+            let zipURL = service.baseURL.appendingPathComponent(zipRemotePath)
+            print("[ZoteroUpload] Uploading [\(documentID)].zip (\(archiveData.count) bytes) to \(zipURL)...")
+            let zipStatus = try await service.upload(
+                data: archiveData,
+                remotePath: zipRemotePath,
+                metadata: ZoteroUploadMetadata(
+                    modificationDate: modificationDate,
+                    md5: checksum,
+                    modificationTimeMilliseconds: mtime
+                )
             )
-        )
-        print("[ZoteroUpload] HTTP Response: \(zipStatus)")
-        let properties = Self.propData(mtime: mtime, md5: pdfChecksum)
-        let propRemotePath = propPath(for: documentID)
-        let propURL = service.baseURL.appendingPathComponent(propRemotePath)
-        print("[ZoteroUpload] Uploading [\(documentID)].prop (\(properties.count) bytes) to \(propURL)...")
-        let propStatus = try await service.upload(data: properties, remotePath: propRemotePath)
-        print("[ZoteroUpload] [\(documentID)].prop HTTP Response: \(propStatus)")
-        try await apiClient.updateWebDAVAttachment(
-            key: documentID,
-            filename: filename,
-            md5: pdfChecksum,
-            mtime: mtime
-        )
+            print("[ZoteroUpload] HTTP Response: \(zipStatus)")
+            let properties = Self.propData(mtime: mtime, md5: pdfChecksum)
+            let propRemotePath = propPath(for: documentID)
+            let propURL = service.baseURL.appendingPathComponent(propRemotePath)
+            print("[ZoteroUpload] Uploading [\(documentID)].prop (\(properties.count) bytes) to \(propURL)...")
+            let propStatus = try await service.upload(data: properties, remotePath: propRemotePath)
+            print("[ZoteroUpload] [\(documentID)].prop HTTP Response: \(propStatus)")
+            try await apiClient.updateWebDAVAttachment(
+                key: documentID,
+                filename: filename,
+                md5: pdfChecksum,
+                mtime: mtime
+            )
+
+        }
+    }
+
+    private func resourceKey(for key: String) -> String {
+        service.baseURL.appendingPathComponent(zipPath(for: key)).absoluteString + "|" + service.username
     }
 
     private struct UploadPackage: Sendable {
@@ -113,9 +128,12 @@ struct ZoteroSyncService: Sendable {
             // follow %%EOF, so Jottre's edit state travels as a ZIP sidecar.
             entries.append(ZoteroZIPArchive.Entry(path: "\(filename).jot", data: jotPayload))
         }
-        print("[ZoteroUpload] Packaging standard PDF: pages=\(pdf.pageCount), bytes=\(pdfData.count), Jot sidecar bytes=\(jotPayload?.count ?? 0)")
+        print(
+            "[ZoteroUpload] Packaging standard PDF: pages=\(pdf.pageCount), bytes=\(pdfData.count), Jot sidecar bytes=\(jotPayload?.count ?? 0)"
+        )
         let archiveData = try ZoteroZIPArchive.archive(files: entries)
-        let mtime = metadata.modificationTimeMilliseconds
+        let mtime =
+            metadata.modificationTimeMilliseconds
             ?? Int64(((metadata.modificationDate ?? Date()).timeIntervalSince1970 * 1_000).rounded())
         return UploadPackage(
             filename: filename,
@@ -185,7 +203,8 @@ struct ZoteroSyncService: Sendable {
 
     private static func safePDFFileName(_ requested: String?, fallback: String) -> String {
         let candidate = requested?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let leaf = (candidate?.isEmpty == false ? candidate! : fallback)
+        let leaf =
+            (candidate?.isEmpty == false ? candidate! : fallback)
             .replacingOccurrences(of: "\\", with: "/")
             .components(separatedBy: "/").last ?? fallback
         return leaf.isEmpty ? fallback : leaf
@@ -224,7 +243,7 @@ enum ZoteroZIPArchive {
         for file in files {
             let name = Data(file.path.utf8)
             let crc = crc32(file.data)
-            appendUInt32(0x04034b50, to: &local)
+            appendUInt32(0x0403_4b50, to: &local)
             appendUInt16(20, to: &local)
             appendUInt16(0x0800, to: &local)
             appendUInt16(0, to: &local)
@@ -238,7 +257,7 @@ enum ZoteroZIPArchive {
             local.append(name)
             local.append(file.data)
 
-            appendUInt32(0x02014b50, to: &central)
+            appendUInt32(0x0201_4b50, to: &central)
             appendUInt16(20, to: &central)
             appendUInt16(20, to: &central)
             appendUInt16(0x0800, to: &central)
@@ -263,7 +282,7 @@ enum ZoteroZIPArchive {
         var result = local
         let centralOffset = result.count
         result.append(central)
-        appendUInt32(0x06054b50, to: &result)
+        appendUInt32(0x0605_4b50, to: &result)
         appendUInt16(0, to: &result)
         appendUInt16(0, to: &result)
         appendUInt16(UInt16(files.count), to: &result)
@@ -278,7 +297,7 @@ enum ZoteroZIPArchive {
         var cursor = 0
         var urls: [URL] = []
         while cursor + 30 <= archive.count {
-            guard readUInt32(archive, at: cursor) == 0x04034b50 else { break }
+            guard readUInt32(archive, at: cursor) == 0x0403_4b50 else { break }
             let flags = readUInt16(archive, at: cursor + 6)
             let method = readUInt16(archive, at: cursor + 8)
             let compressedSize = Int(readUInt32(archive, at: cursor + 18))
@@ -288,10 +307,10 @@ enum ZoteroZIPArchive {
             let nameEnd = nameStart + nameLength
             guard nameEnd <= archive.count else { throw Failure.invalidArchive }
             guard flags & 0x08 == 0,
-                  let name = String(
+                let name = String(
                     data: archive.subdata(in: nameStart..<nameEnd),
                     encoding: .utf8
-                  )
+                )
             else { throw Failure.invalidArchive }
             let dataStart = cursor + 30 + nameLength + extraLength
             let dataEnd = dataStart + compressedSize
@@ -308,7 +327,8 @@ enum ZoteroZIPArchive {
             }
             let normalizedName = name.replacingOccurrences(of: "\\", with: "/")
             guard !normalizedName.hasPrefix("/"),
-                  !normalizedName.split(separator: "/").contains("..") else {
+                !normalizedName.split(separator: "/").contains("..")
+            else {
                 throw Failure.invalidArchive
             }
             let outputURL = directory.appendingPathComponent(normalizedName)
@@ -350,14 +370,14 @@ enum ZoteroZIPArchive {
     }
 
     private static func crc32(_ data: Data) -> UInt32 {
-        var crc: UInt32 = 0xffffffff
+        var crc: UInt32 = 0xffff_ffff
         for byte in data {
             crc ^= UInt32(byte)
             for _ in 0..<8 {
-                crc = (crc >> 1) ^ ((crc & 1) == 1 ? 0xedb88320 : 0)
+                crc = (crc >> 1) ^ ((crc & 1) == 1 ? 0xedb8_8320 : 0)
             }
         }
-        return crc ^ 0xffffffff
+        return crc ^ 0xffff_ffff
     }
 
     private static func appendUInt16(_ value: UInt16, to data: inout Data) {

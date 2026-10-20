@@ -27,18 +27,39 @@ struct ZoteroDocumentSyncService: Sendable {
             return "Zotero User ID is not configured."
         }
         let canonicalKey = cacheStore.canonicalAttachmentKey(key, userID: userID)
+        do {
+            return try await AsyncResourceAccessCoordinator.shared.withAccess(
+                to: "zotero-cache-upload:" + userID + ":" + canonicalKey
+            ) {
+                await uploadCurrentCache(
+                    key: canonicalKey,
+                    userID: userID,
+                    fallbackModificationDate: fallbackModificationDate
+                )
+            }
+        } catch { return error.localizedDescription }
+    }
+
+    private func uploadCurrentCache(
+        key canonicalKey: String,
+        userID: String,
+        fallbackModificationDate: Date?
+    ) async -> String? {
+        let key = canonicalKey
         let attachment = cacheStore.load(userID: userID).attachments[canonicalKey]
         if attachment?.isLocalOnly == true || attachment?.isConflict == true { return nil }
         guard attachment?.syncStatus == .dirty else { return nil }
         guard let path = attachment?.localCachePath,
-              FileManager.default.fileExists(atPath: path),
-              let pdf = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
+            FileManager.default.fileExists(atPath: path),
+            let pdf = try? Data(contentsOf: URL(fileURLWithPath: path))
+        else {
             print("[ZoteroUpload] Skipped \(key): local hybrid PDF cache is missing.")
             return "The local PDF cache is missing for attachment \(key)."
         }
         guard let urlString = defaultsService.getValue(DefaultsKey<String>.webDAVURL),
-              let baseURL = URL(string: urlString),
-              let apiKey = keychain.value(for: "zotero_api_key") else {
+            let baseURL = URL(string: urlString),
+            let apiKey = keychain.value(for: "zotero_api_key")
+        else {
             print("[ZoteroUpload] Skipped \(key): WebDAV or Zotero API credentials are missing.")
             return "WebDAV URL or Zotero API credentials are missing. Check account settings."
         }

@@ -105,83 +105,92 @@ struct LocalFileService: FileServiceProtocol {
     }
 
     func readFile(fileURL: URL) throws -> Data {
-        let coordinator = NSFileCoordinator()
-        var error: NSError?
-        var result: Result<Data, Error>?
+        try FileAccessCoordinator.shared.withAccess(to: fileURL) {
+            let coordinator = NSFileCoordinator()
+            var error: NSError?
+            var result: Result<Data, Error>?
 
-        coordinator.coordinate(
-            readingItemAt: fileURL,
-            options: [],
-            error: &error
-        ) { url in
-            result = Result(catching: {
-                try Data(contentsOf: url, options: .mappedIfSafe)
-            })
+            coordinator.coordinate(
+                readingItemAt: fileURL,
+                options: [],
+                error: &error
+            ) { url in
+                result = Result(catching: {
+                    try Data(contentsOf: url, options: .mappedIfSafe)
+                })
+            }
+
+            if let error {
+                throw error
+            }
+
+            guard let result else {
+                throw Failure.couldNotReadFileContents
+            }
+
+            return try result.get()
+
         }
-
-        if let error {
-            throw error
-        }
-
-        guard let result else {
-            throw Failure.couldNotReadFileContents
-        }
-
-        return try result.get()
     }
 
     func writeFile(fileURL: URL, data: Data) throws {
-        let coordinator = NSFileCoordinator()
-        var error: NSError?
-        var result: Result<Void, Error>?
+        try FileAccessCoordinator.shared.withAccess(to: fileURL) {
+            let coordinator = NSFileCoordinator()
+            var error: NSError?
+            var result: Result<Void, Error>?
 
-        coordinator.coordinate(
-            writingItemAt: fileURL,
-            options: .forReplacing,
-            error: &error
-        ) { url in
-            result = Result(catching: {
-                try data.write(to: url, options: .atomic)
-            })
+            coordinator.coordinate(
+                writingItemAt: fileURL,
+                options: .forReplacing,
+                error: &error
+            ) { url in
+                result = Result(catching: {
+                    try data.write(to: url, options: .atomic)
+                })
+            }
+
+            if let error {
+                throw error
+            }
+
+            guard let result else {
+                throw Failure.couldNotWriteFileContents
+            }
+
+            try result.get()
+
         }
-
-        if let error {
-            throw error
-        }
-
-        guard let result else {
-            throw Failure.couldNotWriteFileContents
-        }
-
-        try result.get()
     }
 
     func createFile(fileURL: URL, data: Data) throws {
-        let coordinator = NSFileCoordinator()
-        var error: NSError?
-        var result: Result<Void, Error>?
+        try FileAccessCoordinator.shared.withAccess(to: fileURL) {
+            let coordinator = NSFileCoordinator()
+            var error: NSError?
+            var result: Result<Void, Error>?
 
-        coordinator.coordinate(
-            writingItemAt: fileURL,
-            options: [],
-            error: &error
-        ) { url in
-            result = Result(catching: {
-                // `.withoutOverwriting` makes collision handling atomic. Do
-                // not combine it with `.atomic`; Foundation rejects that pair.
-                try data.write(to: url, options: .withoutOverwriting)
-            })
+            coordinator.coordinate(
+                writingItemAt: fileURL,
+                options: [],
+                error: &error
+            ) { url in
+                result = Result(catching: {
+                    // `.withoutOverwriting` makes collision handling atomic. Do
+                    // not combine it with `.atomic`; Foundation rejects that pair.
+                    try data.write(to: url, options: .withoutOverwriting)
+                })
+            }
+
+            if let error {
+                throw error
+            }
+
+            guard let result else {
+                throw Failure.couldNotWriteFileContents
+            }
+
+            try result.get()
+
         }
-
-        if let error {
-            throw error
-        }
-
-        guard let result else {
-            throw Failure.couldNotWriteFileContents
-        }
-
-        try result.get()
     }
 
     func fileExists(fileURL: URL) -> Bool {
@@ -190,72 +199,81 @@ struct LocalFileService: FileServiceProtocol {
     }
 
     func removeFile(fileURL: URL) throws {
-        let coordinator = NSFileCoordinator()
-        var error: NSError?
-        var result: Result<Void, Error>?
-        coordinator.coordinate(
-            writingItemAt: fileURL,
-            options: .forDeleting,
-            error: &error
-        ) { coordinatedURL in
-            result = Result(catching: {
-                try fileManager.removeItem(at: coordinatedURL)
-            })
+        try FileAccessCoordinator.shared.withAccess(to: fileURL) {
+            let coordinator = NSFileCoordinator()
+            var error: NSError?
+            var result: Result<Void, Error>?
+            coordinator.coordinate(
+                writingItemAt: fileURL,
+                options: .forDeleting,
+                error: &error
+            ) { coordinatedURL in
+                result = Result(catching: {
+                    try fileManager.removeItem(at: coordinatedURL)
+                })
+            }
+            if let error { throw error }
+            guard let result else { throw Failure.couldNotWriteFileContents }
+            try result.get()
+
         }
-        if let error { throw error }
-        guard let result else { throw Failure.couldNotWriteFileContents }
-        try result.get()
     }
 
     func moveFile(fileURL: URL, newFileURL: URL) throws {
-        let coordinator = NSFileCoordinator()
-        var error: NSError?
-        var result: Result<Void, Error>?
-        coordinator.coordinate(
-            writingItemAt: fileURL,
-            options: .forMoving,
-            writingItemAt: newFileURL,
-            options: [],
-            error: &error
-        ) { coordinatedSourceURL, coordinatedDestinationURL in
-            result = Result(catching: {
-                try fileManager.moveItem(
-                    at: coordinatedSourceURL,
-                    to: coordinatedDestinationURL
-                )
-            })
+        try FileAccessCoordinator.shared.withAccess(to: [fileURL, newFileURL]) {
+            let coordinator = NSFileCoordinator()
+            var error: NSError?
+            var result: Result<Void, Error>?
+            coordinator.coordinate(
+                writingItemAt: fileURL,
+                options: .forMoving,
+                writingItemAt: newFileURL,
+                options: [],
+                error: &error
+            ) { coordinatedSourceURL, coordinatedDestinationURL in
+                result = Result(catching: {
+                    try fileManager.moveItem(
+                        at: coordinatedSourceURL,
+                        to: coordinatedDestinationURL
+                    )
+                })
+            }
+            if let error { throw error }
+            guard let result else { throw Failure.couldNotWriteFileContents }
+            try result.get()
+
         }
-        if let error { throw error }
-        guard let result else { throw Failure.couldNotWriteFileContents }
-        try result.get()
     }
 
     func duplicateFile(fileURL: URL) throws -> URL {
-        var duplicateCount = 0
-        let fileName = fileURL.deletingPathExtension().lastPathComponent
+        try FileAccessCoordinator.shared.withAccess(to: fileURL) {
+            var duplicateCount = 0
+            let fileName = fileURL.deletingPathExtension().lastPathComponent
 
-        while true {
-            let destinationFileName =
-                if duplicateCount == 0 {
-                    L10n.FileSystem.Duplicate.FileName.plain(fileName)
-                } else {
-                    L10n.FileSystem.Duplicate.FileName.multi(fileName, duplicateCount)
+            while true {
+                let destinationFileName =
+                    if duplicateCount == 0 {
+                        L10n.FileSystem.Duplicate.FileName.plain(fileName)
+                    } else {
+                        L10n.FileSystem.Duplicate.FileName.multi(fileName, duplicateCount)
+                    }
+                duplicateCount += 1
+
+                let destinationFileURL =
+                    fileURL
+                    .deletingPathExtension()
+                    .deletingLastPathComponent()
+                    .appendingPathComponent(destinationFileName)
+                    .appendingPathExtension(fileURL.pathExtension)
+
+                do {
+                    try fileManager.copyItem(at: fileURL, to: destinationFileURL)
+                    return destinationFileURL
+                } catch CocoaError.fileWriteFileExists {
+                    continue
                 }
-            duplicateCount += 1
-
-            let destinationFileURL =
-                fileURL
-                .deletingPathExtension()
-                .deletingLastPathComponent()
-                .appendingPathComponent(destinationFileName)
-                .appendingPathExtension(fileURL.pathExtension)
-
-            do {
-                try fileManager.copyItem(at: fileURL, to: destinationFileURL)
-                return destinationFileURL
-            } catch CocoaError.fileWriteFileExists {
-                continue
             }
+
         }
     }
 
