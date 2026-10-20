@@ -47,32 +47,7 @@ private final class PersistentToolPickerAnchorView: UIView {
 #endif
 
 @MainActor
-final class EditJotViewController: UIViewController, @preconcurrency PDFPageOverlayViewProvider, PDFViewDelegate {
-
-    private enum Constants {
-
-        enum CanvasView {
-            static let maximumZoomScale = CGFloat(8)
-            static let bottomFreespace = CGFloat(500)
-            /// Viewport-only breathing room above the first page. This is a
-            /// scroll inset, so it never changes document or export coordinates.
-            static let topWritingFreespace = CGFloat(64)
-            static let shapeHoldDuration = TimeInterval(0.42)
-            static let shapeHoldMovementTolerance = CGFloat(5)
-        }
-
-        enum Page {
-            static let width = CGFloat(1200)
-            static let height = CGFloat(1600)
-        }
-    }
-
-    private struct ShapeHoldState {
-        let initialStrokeCount: Int
-        let beforeDrawing: EditJotViewModel.Drawing
-        var detector: EndpointHoldDetector
-        var didProvideHoldFeedback = false
-    }
+final class EditJotViewController: UIViewController, @preconcurrency PDFPageOverlayViewProvider {
 
     #if !targetEnvironment(macCatalyst)
     private lazy var toolPicker = PKToolPicker()
@@ -82,11 +57,11 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
     private var previousSelectedTool: (any PKTool)?
     private var isToolPickerObserverAttached = false
     private var isRestoringToolPicker = false
-    private var originalPDFLongPressStates: [ObjectIdentifier: Bool] = [:]
+    private weak var activeLassoCanvas: JotCanvasView?
     #endif
 
-    private let pdfView: PDFView = {
-        let view = PDFView()
+    private let pdfView: JotPDFView = {
+        let view = JotPDFView()
         view.translatesAutoresizingMaskIntoConstraints = false
         view.displayMode = .singlePageContinuous
         view.displayDirection = .vertical
@@ -96,110 +71,37 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
         view.autoScales = true
         return view
     }()
-    private var pageCanvases: [Int: JotCanvasView] = [:]
-    private var pageIndexByCanvas: [ObjectIdentifier: Int] = [:]
-    /// PDFKit asks for overlays as pages enter and leave the viewport. Keep a
-    /// small pool so fast scrolling does not repeatedly allocate PencilKit's
-    /// relatively expensive canvas/recognizer stack.
-    private var reusablePageCanvases: [JotCanvasView] = []
+    private lazy var zoomCoordinator = JotCanvasZoomCoordinator { [weak self] in self?.updatePageOverlayRendererZoom() }
+    private lazy var gestureCoordinator: JotEditorGestureCoordinator = {
+        let coordinator = JotEditorGestureCoordinator(pdfView: pdfView)
+        return coordinator
+    }()
+
+    private let overlayStore = JotPageOverlayStore()
+    private var pageCanvases: [Int: JotCanvasView] { overlayStore.canvases }
+    private var pageOverlays: [Int: JotPDFPageCanvasOverlay] { overlayStore.overlays }
+    private var pageIndexByCanvas: [ObjectIdentifier: Int] { overlayStore.indices }
     private var isApplyingOverlayDrawing = false
-    private var activePDFDocument: PDFDocument?
-
-    /// Non-visible PencilKit storage plane retained by the undo/layer coordinator.
-    /// User input and rendering live only in the per-page PDFView overlays.
-    private lazy var canvasView: JotCanvasView = {
-        let canvasView = JotCanvasView()
-        canvasView.delegate = self
-        canvasView.drawingPolicy = .default
-        canvasView.bounces = false
-        canvasView.bouncesZoom = true
-        canvasView.contentInsetAdjustmentBehavior = .never
-        canvasView.automaticallyAdjustsScrollIndicatorInsets = false
-        canvasView.backgroundColor = .clear
-        canvasView.isOpaque = false
-        canvasView.layer.shouldRasterize = false
-        return canvasView
-    }()
-
-    /// Non-visible marker ordering plane used only by the canonical drawing
-    /// coordinator. Visible strokes are rendered by the page-local overlays.
-    private lazy var highlighterCanvasView: JotCanvasView = {
-        let canvasView = JotCanvasView()
-        canvasView.delegate = self
-        canvasView.isUserInteractionEnabled = false
-        canvasView.isScrollEnabled = false
-        canvasView.drawingPolicy = .default
-        canvasView.bounces = false
-        canvasView.contentInsetAdjustmentBehavior = .never
-        canvasView.backgroundColor = .clear
-        canvasView.isOpaque = false
-        canvasView.layer.shouldRasterize = false
-        return canvasView
-    }()
-
-    private lazy var inkCanvasCoordinator = JotInkCanvasCoordinator(
-        highlighterCanvas: highlighterCanvasView,
-        foregroundCanvas: canvasView
-    )
-
-    /// The foreground canvas is the document's scroll and zoom owner. Keeping
-    /// the old name as an alias lets the geometry code below stay expressed in
-    /// document terms.
-    private var documentScrollView: JotCanvasView { canvasView }
-
-    private let backgroundView: JotBackgroundView = {
-        let view = JotBackgroundView()
-        view.backgroundColor = .clear
-        view.isUserInteractionEnabled = false
-        return view
-    }()
-
-    /// Mirrors the canvas's zoom and content offset so the PDF stays locked to
-    /// the ink. PencilKit only transforms its own internal content view, so a
-    /// background nested inside the canvas would not follow the zoom at all.
-    private let backgroundContainerView: UIView = {
-        let view = UIView(frame: .zero)
-        view.backgroundColor = .clear
-        view.isUserInteractionEnabled = false
-        view.layer.anchorPoint = .zero
-        view.layer.position = .zero
-        return view
-    }()
-
+    private var isInstallingPDFDocument = false
+    private let shapeCoordinator = JotPageShapeCoordinator()
+    private let inkCanvasCoordinator = JotEditorDrawingState()
+    private var canvasAppearance: UIUserInterfaceStyle = .unspecified
+    private var selectedCanvasTool: any PKTool = PKInkingTool(.pen)
+    #if !targetEnvironment(macCatalyst)
+    private var cachedRulerActive = false
+    #endif
     private var drawingWidth = CGFloat.zero
-    private var backgroundContentHeight = CGFloat.zero
-    private var currentPageSize = CGSize(width: Constants.Page.width, height: Constants.Page.height)
-    private var previousCanvasBoundsSize = CGSize.zero
-    private var fittedPageSize = CGSize.zero
-    private var hasInitializedZoomScale = false
-    private var isUpdatingCanvasGeometry = false
-    private var isUsingDrawingTool = false
-    private var hasPendingDrawingChange = false
-    private var documentContentSize = CGSize.zero
-    /// Last unscaled size written to the canvas's `contentSize`.
-    private var appliedCanvasContentSize = CGSize.zero
-    private var isZoomInteractionActive = false
-    private var zoomSettleTask: Task<Void, Never>?
-    private var blankEditMenuDismissTask: Task<Void, Never>?
+    private var currentPageSize = JotPageLayout.defaultSize
     private var applicationBackgroundFlushTask: Task<Void, Never>?
     private var applicationBackgroundTaskIdentifier = UIBackgroundTaskIdentifier.invalid
     private var applicationBackgroundTaskGeneration: UUID?
     private var isEditingEnabled = false
-    private var drawingBeforeToolUse: EditJotViewModel.Drawing?
-    private var ownsToolUndoGrouping = false
     private var toolUndoManager: UndoManager?
-    private var shapeHoldState: ShapeHoldState?
-    private var shapeHoldTask: Task<Void, Never>?
-    private var shapeCommitWatchdogTask: Task<Void, Never>?
-    private var toolUndoCleanupTask: Task<Void, Never>?
-
-    private let pdfLoadService = PDFLoadService()
-    private var cachedPDFData: Data?
-    private var cachedPDFLoadResult: PDFLoadService.Result?
 
     #if !targetEnvironment(macCatalyst)
     private var didSelectInitialPenTool = false
     private var selectedToolUpdateTask: Task<Void, Never>?
+    private weak var toolPickerCanvasObserver: JotCanvasView?
     #endif
 
     private lazy var swipeBackGesture: UIScreenEdgePanGestureRecognizer = {
@@ -209,35 +111,6 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
         )
         gesture.edges = .left
         gesture.isEnabled = false
-        return gesture
-    }()
-
-    /// Prevents PencilKit's internal blank-canvas tap recognizer from creating
-    /// Select All / Insert Space outside lasso mode. Continuous drawing and
-    /// document-navigation gestures always retain priority.
-    private lazy var blankCanvasEditMenuTapGesture: CanvasEditMenuBlockingTapGestureRecognizer = {
-        let gesture = CanvasEditMenuBlockingTapGestureRecognizer(
-            target: self,
-            action: #selector(handleBlankCanvasEditMenuTap(_:))
-        )
-        gesture.name = "Jottre.BlankCanvasEditMenuTapBlocker"
-        gesture.numberOfTapsRequired = 1
-        gesture.numberOfTouchesRequired = 1
-        gesture.cancelsTouchesInView = true
-        gesture.delaysTouchesBegan = false
-        gesture.delaysTouchesEnded = false
-        gesture.requiresExclusiveTouchType = true
-        gesture.delegate = self
-        gesture.canvasRootViews = [canvasView]
-        gesture.pencilKitDrawingGestureRecognizers = [
-            canvasView.drawingGestureRecognizer,
-            highlighterCanvasView.drawingGestureRecognizer,
-        ]
-        #if !targetEnvironment(macCatalyst)
-        gesture.allowedTouchTypes = [
-            NSNumber(value: UITouch.TouchType.direct.rawValue)
-        ]
-        #endif
         return gesture
     }()
 
@@ -325,11 +198,6 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
                 UIApplication.shared.endBackgroundTask(identifier)
             }
         }
-        zoomSettleTask?.cancel()
-        blankEditMenuDismissTask?.cancel()
-        shapeHoldTask?.cancel()
-        shapeCommitWatchdogTask?.cancel()
-        toolUndoCleanupTask?.cancel()
         isEditingTask?.cancel()
         drawingTask?.cancel()
         scribbleEraseTask?.cancel()
@@ -349,17 +217,10 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        registerForTraitChanges([UITraitUserInterfaceStyle.self]) {
-            (self: EditJotViewController, _: UITraitCollection) in
-            self.backgroundView.sync(
-                scrollOffset: self.documentScrollView.contentOffset,
-                zoomScale: self.documentScrollView.zoomScale,
-                viewportSize: self.documentScrollView.bounds.size
-            )
-        }
         setUpNavigationBar()
         setUpViews()
         restorePenTool()
+        shapeCoordinator.isEnabled = isDrawAndHoldShapeConversionEnabled
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(applicationDidEnterBackground),
@@ -394,8 +255,11 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
             toolPicker.addObserver(self)
             isToolPickerObserverAttached = true
         }
-        persistentCanvasAnchor.preservesFirstResponder = isEditingEnabled
-        guard persistentCanvasAnchor.becomeFirstResponder() else { return }
+        cachedRulerActive = toolPicker.isRulerActive
+        synchronizePageInputState()
+        persistentCanvasAnchor.preservesFirstResponder = CanvasTouchRouting.usesPersistentResponder(
+            isEditing: isEditingEnabled, tool: selectedToolFromPickerIfAvailable())
+        guard isEditingEnabled, persistentCanvasAnchor.becomeFirstResponder() else { return }
         toolPicker.setVisible(true, forFirstResponder: persistentCanvasAnchor)
         #endif
     }
@@ -404,30 +268,42 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
         super.viewWillAppear(animated)
         (navigationController?.navigationBar as? JottreNavigationBar)?
             .passesThroughBackgroundTouches = true
-        updateCanvasTouchRouting()
+        synchronizePageInputState()
     }
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
         (navigationController?.navigationBar as? JottreNavigationBar)?
             .passesThroughBackgroundTouches = false
+        gestureCoordinator.update(
+            isEditing: false,
+            tool: selectedCanvasTool,
+            pickerVisible: false,
+            rulerActive: false,
+            activePageIndex: nil,
+            overlays: pageOverlays
+        )
         flushPendingDrawingChange()
         saveScrollPosition()
         Task { @MainActor [viewModel] in await viewModel.didDisappear() }
         #if !targetEnvironment(macCatalyst)
+        if let canvas = toolPickerCanvasObserver {
+            toolPicker.removeObserver(canvas)
+            toolPickerCanvasObserver = nil
+        }
         persistentCanvasAnchor.preservesFirstResponder = false
         if isToolPickerObserverAttached {
             toolPicker.removeObserver(self)
             isToolPickerObserverAttached = false
         }
+        if let canvas = activeLassoCanvas {
+            toolPicker.setVisible(false, forFirstResponder: canvas)
+            _ = canvas.resignFirstResponder()
+        }
+        activeLassoCanvas = nil
         toolPicker.setVisible(false, forFirstResponder: persistentCanvasAnchor)
         _ = persistentCanvasAnchor.resignFirstResponder()
         #endif
-    }
-
-    override func viewDidLayoutSubviews() {
-        super.viewDidLayoutSubviews()
-        if pdfView.document == nil { layoutCanvasContent() }
     }
 
     private func setUpNavigationBar() {
@@ -468,7 +344,6 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
         view.backgroundColor = .adaptiveBlackWhite
         view.addGestureRecognizer(swipeBackGesture)
         pdfView.pageOverlayViewProvider = self
-        pdfView.delegate = self
         view.addSubview(pdfView)
         NSLayoutConstraint.activate([
             pdfView.topAnchor.constraint(equalTo: view.topAnchor),
@@ -479,7 +354,6 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
         #if !targetEnvironment(macCatalyst)
         view.addInteraction(pencilInteraction)
         persistentCanvasAnchor.translatesAutoresizingMaskIntoConstraints = false
-        persistentCanvasAnchor.alpha = 0.01
         persistentCanvasAnchor.backgroundColor = .clear
         persistentCanvasAnchor.isAccessibilityElement = false
         persistentCanvasAnchor.accessibilityElementsHidden = true
@@ -500,41 +374,48 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
     }
 
     func pdfView(_ pdfView: PDFView, overlayViewFor page: PDFPage) -> UIView? {
+        synchronizePageInputState()
         guard let document = pdfView.document else { return nil }
         let pageIndex = document.index(for: page)
         guard pageIndex != NSNotFound else { return nil }
         if let canvas = pageCanvases[pageIndex],
-           pageIndexByCanvas[ObjectIdentifier(canvas)] == pageIndex {
-            return canvas
+            pageIndexByCanvas[ObjectIdentifier(canvas)] == pageIndex,
+            let overlay = pageOverlays[pageIndex]
+        {
+            gestureCoordinator.configure(canvas, overlay: overlay, pageIndex: pageIndex)
+            return overlay
         }
 
-        let canvas = reusablePageCanvases.popLast() ?? JotCanvasView(frame: .zero)
+        let pageSize = PDFAnnotationConverter.displaySize(
+            for: page.bounds(for: .cropBox),
+            rotation: page.rotation
+        )
+        let overlay =
+            overlayStore.overlay(for: page)
+            ?? JotPDFPageCanvasOverlay(
+                canvas: JotCanvasView(frame: .zero),
+                pageSize: pageSize,
+                drawingWidth: currentPageSize.width
+            )
+        guard let canvas = overlay.canvas as? JotCanvasView else { return nil }
+        gestureCoordinator.configure(canvas, overlay: overlay, pageIndex: pageIndex)
+        overlay.bounds = CGRect(origin: .zero, size: pageSize)
+        overlay.prepareForPage(size: pageSize, drawingWidth: currentPageSize.width)
+        overlay.configure(in: pdfView, pdfScaleFactor: pdfView.scaleFactor)
         canvas.delegate = self
-        canvas.backgroundColor = pencilDiagnosticBackgroundColor
+        shapeCoordinator.attach(canvas)
+        canvas.backgroundColor = .clear
         canvas.isOpaque = false
         canvas.clipsToBounds = true
-        canvas.overrideUserInterfaceStyle = canvasView.overrideUserInterfaceStyle
+        canvas.overrideUserInterfaceStyle = canvasAppearance
         canvas.isScrollEnabled = false
         canvas.bounces = false
         canvas.contentInset = .zero
-        canvas.tool = canvasView.tool
-        if #available(iOS 18.0, *) {
-            canvas.isDrawingEnabled = isEditingEnabled
-        } else {
-            canvas.drawingGestureRecognizer.isEnabled = isEditingEnabled
-        }
-        #if !targetEnvironment(macCatalyst)
-        canvas.isRulerActive = toolPicker.isRulerActive
-        #endif
-        pageCanvases[pageIndex] = canvas
-        pageIndexByCanvas[ObjectIdentifier(canvas)] = pageIndex
-        configurePencilInput(on: canvas)
-        #if !targetEnvironment(macCatalyst)
-        canvas.tool = selectedToolFromPicker()
-        #endif
-        updateCanvasContentScaleFactor(for: canvas)
-        logCanvasDiagnostic(canvas, stage: "created", pageIndex: pageIndex)
-        return canvas
+        overlayStore.register(overlay, page: page, index: pageIndex)
+        updatePageCanvasRenderer(for: canvas)
+        synchronizePageInputState()
+
+        return overlay
     }
 
     func pdfView(
@@ -542,25 +423,51 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
         willDisplayOverlayView overlayView: UIView,
         for page: PDFPage
     ) {
-        guard let canvas = overlayView as? JotCanvasView,
-              let document = pdfView.document else { return }
+        guard let overlay = overlayView as? JotPDFPageCanvasOverlay,
+            let canvas = overlay.canvas as? JotCanvasView,
+            let document = pdfView.document
+        else { return }
         let pageIndex = document.index(for: page)
-        canvas.backgroundColor = pencilDiagnosticBackgroundColor
-        pageIndexByCanvas[ObjectIdentifier(canvas)] = pageIndex
+        guard pageIndex != NSNotFound else { return }
+        synchronizePageInputState()
+        gestureCoordinator.configure(canvas, overlay: overlay, pageIndex: pageIndex)
+        canvas.backgroundColor = .clear
+        canvas.delegate = self
+        shapeCoordinator.attach(canvas)
+        overlayStore.register(overlay, page: page, index: pageIndex)
+        if overlay.bounds.width > 0, overlay.bounds.height > 0 {
+            overlay.prepareForPage(size: overlay.bounds.size, drawingWidth: currentPageSize.width)
+        }
+        updatePageCanvasRenderer(for: canvas)
         isApplyingOverlayDrawing = true
         canvas.drawing = localDrawing(
             from: inkCanvasCoordinator.committedDrawing,
             pageIndices: inkCanvasCoordinator.committedStrokePageIndices,
             pageIndex: pageIndex,
-            overlaySize: canvas.bounds.size
+            overlaySize: overlay.drawingSize
         )
         isApplyingOverlayDrawing = false
-        canvas.tool = selectedToolFromPickerIfAvailable()
-        #if !targetEnvironment(macCatalyst)
-        canvas.isRulerActive = toolPicker.isRulerActive
+        #if DEBUG
+        EditorInteractionFixture.publish(canvas: canvas, index: pageIndex, pdfView: pdfView, host: view)
         #endif
-        updateCanvasContentScaleFactor(for: canvas)
-        logCanvasDiagnostic(canvas, stage: "displayed", pageIndex: pageIndex)
+        updatePageCanvasRenderer(for: canvas)
+        synchronizePageInputState()
+
+        // PDFKit may finish applying the page transform immediately after
+        // willDisplayOverlayView. Re-measure once the overlay has its settled
+        // frame so the initial fit scale cannot remain cached on the canvas.
+        Task { @MainActor [weak self, weak canvas] in
+            await Task.yield()
+            guard let self, let canvas,
+                pageIndexByCanvas[ObjectIdentifier(canvas)] == pageIndex
+            else { return }
+            canvas.layoutIfNeeded()
+            updatePageCanvasRenderer(for: canvas)
+            #if DEBUG
+            EditorInteractionFixture.publish(canvas: canvas, index: pageIndex, pdfView: pdfView, host: view)
+            #endif
+
+        }
     }
 
     func pdfView(
@@ -571,26 +478,54 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
         // PDFKit recycles overlay views as pages leave the viewport. Remove
         // the old page mapping so a reused canvas cannot remain registered
         // under both its former and its current page index.
-        guard let canvas = overlayView as? JotCanvasView else { return }
-        let identifier = ObjectIdentifier(canvas)
-        if let oldPageIndex = pageIndexByCanvas.removeValue(forKey: identifier),
-           pageCanvases[oldPageIndex] === canvas {
-            pageCanvases.removeValue(forKey: oldPageIndex)
+        guard let overlay = overlayView as? JotPDFPageCanvasOverlay,
+            let canvas = overlay.canvas as? JotCanvasView
+        else { return }
+        guard overlayStore.overlay(for: page) === overlay else { return }
+        // Capture any final sample before detaching the page delegate.
+        canvasViewDrawingDidChange(canvas)
+        #if DEBUG
+        if EditorInteractionFixture.tool != nil, let index = pageIndexByCanvas[ObjectIdentifier(canvas)] {
+            view.subviews.first { $0.accessibilityIdentifier == "editor.page.\(index)" }?.removeFromSuperview()
         }
-        canvas.delegate = nil
-        isApplyingOverlayDrawing = true
-        canvas.drawing = PKDrawing()
-        isApplyingOverlayDrawing = false
-        if reusablePageCanvases.count < 4 {
-            reusablePageCanvases.append(canvas)
+        #endif
+        guard overlayStore.remove(overlay, page: page) else { return }
+        if activeLassoCanvas === canvas {
+            _ = canvas.resignFirstResponder()
+            activeLassoCanvas = nil
+            restorePersistentToolPickerIfNeeded()
         }
+        gestureCoordinator.detach(canvas)
+        shapeCoordinator.detach(canvas)
+        synchronizePageInputState()
+    }
+
+    private func synchronizePageInputState() {
+        zoomCoordinator.observe(gestureCoordinator.pdfNavigationScrollViews())
+        zoomCoordinator.observeDoubleTapZoom(in: pdfView)
+        gestureCoordinator.update(
+            isEditing: isEditingEnabled,
+            tool: selectedToolFromPickerIfAvailable(),
+            pickerVisible: toolPicker.isVisible,
+            rulerActive: cachedRulerActive,
+            activePageIndex: currentPDFPageIndex,
+            overlays: pageOverlays
+        )
+        updateToolPickerCanvasObserver(for: currentPDFPageIndex)
+        #if DEBUG
+        if EditorInteractionFixture.tool != nil {
+            for (index, canvas) in pageCanvases {
+                EditorInteractionFixture.publish(canvas: canvas, index: index, pdfView: pdfView, host: view)
+            }
+        }
+        #endif
     }
 
     private func selectedToolFromPickerIfAvailable() -> any PKTool {
         #if !targetEnvironment(macCatalyst)
         return selectedToolFromPicker()
         #else
-        return canvasView.tool
+        return selectedCanvasTool
         #endif
     }
 
@@ -604,7 +539,7 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
             pageIndex: pageIndex,
             overlaySize: overlaySize,
             normalizedPageSize: currentPageSize,
-            pageSpacing: JotBackgroundView.pageSpacing
+            pageSpacing: JotPageLayout.pageSpacing
         )
     }
 
@@ -620,7 +555,7 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
             pageIndex: pageIndex,
             overlaySize: overlaySize,
             normalizedPageSize: currentPageSize,
-            pageSpacing: JotBackgroundView.pageSpacing
+            pageSpacing: JotPageLayout.pageSpacing
         )
     }
 
@@ -631,8 +566,7 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
         if let width = defaultsService.getValue(widthKey) {
             let color = defaultsService.getValue(colorKey).flatMap { UIColor(hex: $0) } ?? .label
             let pen = PKInkingTool(.pen, color: color, width: CGFloat(width))
-            canvasView.tool = pen
-            highlighterCanvasView.tool = pen
+            selectedCanvasTool = pen
             lastSelectedNonEraserTool = pen
             previousSelectedTool = pen
             selectToolInPicker(pen)
@@ -641,61 +575,10 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
         #endif
     }
 
-    @discardableResult
-    private func updateCanvasTouchRouting() -> Bool {
-        #if !targetEnvironment(macCatalyst)
-        let configuration = CanvasTouchRouting.configuration(
-            isEditingEnabled: isEditingEnabled,
-            drawingPolicy: pageCanvases[currentPDFPageIndex ?? -1]?.drawingPolicy ?? .default,
-            isToolPickerVisible: toolPicker.isVisible,
-            prefersPencilOnlyDrawing: UIPencilInteraction.prefersPencilOnlyDrawing
-        )
-        // PencilKit rebuilds parts of its scroll and selection interaction
-        // state while lasso content is moved. Reapply these idempotent
-        // invariants for every new direct-touch sequence, even when the policy
-        // itself did not change.
-        return configuration.routesDirectTouchesToDocumentScroll
-        #else
-        return false
-        #endif
-    }
-
     @objc
     private func handleSwipeBack(_ gesture: UIScreenEdgePanGestureRecognizer) {
         guard gesture.state == .ended else { return }
         viewModel.didTapBackButton()
-    }
-
-    @objc
-    private func handleBlankCanvasEditMenuTap(_ gesture: UITapGestureRecognizer) {
-        guard gesture.state == .ended else { return }
-
-        blankEditMenuDismissTask?.cancel()
-        dismissPencilKitEditMenus()
-        blankEditMenuDismissTask = Task { @MainActor [weak self] in
-            // Prevention is the primary path. These passes also close a menu
-            // that an older PencilKit implementation may schedule after the
-            // gesture arbitration callback has returned.
-            // Incremental delays put the third pass just after PencilKit's
-            // deferred single-tap callback on systems that schedule it.
-            for delay in [0, 80, 300, 120, 200] {
-                if delay == 0 {
-                    await Task.yield()
-                } else {
-                    try? await Task.sleep(for: .milliseconds(delay))
-                }
-                guard !Task.isCancelled, let self else { return }
-                dismissPencilKitEditMenus()
-            }
-        }
-    }
-
-    private func dismissPencilKitEditMenus() {
-        inkCanvasCoordinator.activeCanvas.forEachViewInHierarchy { view in
-            for case let interaction as UIEditMenuInteraction in view.interactions {
-                interaction.dismissMenu()
-            }
-        }
     }
 
     @objc
@@ -730,7 +613,7 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
     private func applicationDidBecomeActive() {
         // The system Pencil-only preference can change while Jottre is
         // suspended. Refresh document navigation before the next gesture.
-        updateCanvasTouchRouting()
+        synchronizePageInputState()
     }
 
     @discardableResult
@@ -743,172 +626,22 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
         return true
     }
 
-    private func layoutCanvasContent() {
-        guard
-            pdfView.document == nil,
-            !isUsingDrawingTool,
-            drawingWidth > 0,
-            currentPageSize.width > 0,
-            currentPageSize.height > 0,
-            documentScrollView.bounds.width > 0,
-            documentScrollView.bounds.height > 0
-        else { return }
-
-        let boundsSize = documentScrollView.bounds.size
-        let widthScale = boundsSize.width / currentPageSize.width
-        let heightScale = boundsSize.height / currentPageSize.height
-        let pageFitScale = min(widthScale, heightScale)
-        guard pageFitScale.isFinite, pageFitScale > 0 else { return }
-
-        let wasAtMinimum = abs(documentScrollView.zoomScale - documentScrollView.minimumZoomScale) < 0.001
-        let pageSizeChanged = currentPageSize != fittedPageSize
-        let viewportSizeChanged = boundsSize != previousCanvasBoundsSize
-        documentScrollView.minimumZoomScale = pageFitScale
-        // The zoom ceiling is expressed relative to page-fit so the reachable
-        // magnification is the same regardless of viewport size or page format.
-        documentScrollView.maximumZoomScale =
-            pageFitScale * Constants.CanvasView.maximumZoomScale
-
-        if !hasInitializedZoomScale || pageSizeChanged || (viewportSizeChanged && wasAtMinimum) {
-            hasInitializedZoomScale = true
-            documentScrollView.zoomScale = pageFitScale
-        } else if documentScrollView.zoomScale < pageFitScale {
-            documentScrollView.zoomScale = pageFitScale
-        }
-        previousCanvasBoundsSize = boundsSize
-        fittedPageSize = currentPageSize
-
-        updateCanvasGeometry()
-    }
-
-    private func updateCanvasGeometry() {
-        guard !isUpdatingCanvasGeometry, drawingWidth > 0 else { return }
-        isUpdatingCanvasGeometry = true
-        defer { isUpdatingCanvasGeometry = false }
-
-        let drawingMaxY: CGFloat
-        if inkCanvasCoordinator.committedDrawing.bounds.isNull {
-            drawingMaxY = backgroundContentHeight + Constants.CanvasView.bottomFreespace
-        } else {
-            let contentMaxY = max(
-                inkCanvasCoordinator.committedDrawing.bounds.maxY,
-                backgroundContentHeight
-            )
-            drawingMaxY = contentMaxY + Constants.CanvasView.bottomFreespace
-        }
-
-        let scale = documentScrollView.zoomScale
-        updateCanvasContentScaleFactors()
-        // Pages are laid out at `currentPageSize.width`, which a PDF can define
-        // differently from the stored drawing width. Sizing the document to the
-        // page keeps the note centred and stops the canvas from accepting ink in
-        // the empty margin beside it.
-        let documentWidth = currentPageSize.width
-        let scaledWidth = documentWidth * scale
-        let nextDocumentContentSize = CGSize(width: documentWidth, height: drawingMaxY)
-        let documentGeometryChanged = documentContentSize != nextDocumentContentSize
-        documentContentSize = nextDocumentContentSize
-
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        let documentBounds = CGRect(origin: .zero, size: documentContentSize)
-        if backgroundContainerView.bounds != documentBounds {
-            backgroundContainerView.bounds = documentBounds
-        }
-        if backgroundView.frame != documentBounds {
-            backgroundView.frame = documentBounds
-        }
-        CATransaction.commit()
-
-        // `contentSize` describes the content at the current zoom, so writing
-        // unscaled document units while zoomed out would make the scroll view
-        // infer a much wider document. That is what pushed the page off centre
-        // and left a writable margin beside it. Scale the assignment, and track
-        // the unscaled value separately because the getter reports zoomed size.
-        let zoomedContentSize = CGSize(
-            width: documentContentSize.width * scale,
-            height: documentContentSize.height * scale
-        )
-        if documentGeometryChanged
-            || appliedCanvasContentSize == .zero
-            || abs(documentScrollView.contentSize.width - zoomedContentSize.width) > 0.5
-            || abs(documentScrollView.contentSize.height - zoomedContentSize.height) > 0.5
-        {
-            appliedCanvasContentSize = documentContentSize
-            documentScrollView.contentSize = zoomedContentSize
-        }
-
-        let horizontalInset = max(0, (documentScrollView.bounds.width - scaledWidth) / 2)
-        // The canvas extends below the transparent navigation controls, but its
-        // resting top position must leave the first part of the document visible.
-        // A manual inset is required because automatic adjustment is disabled so
-        // the document and ink can continue beneath the controls while scrolling.
-        // The safe-area top includes the entire navigation bar and would create
-        // too much unusable space. Reserve the status bar plus a small viewport
-        // margin, while keeping document and ink coordinates rooted at zero.
-        let statusBarHeight = max(
-            0,
-            view.window?.windowScene?.statusBarManager?.statusBarFrame.height ?? 0
-        )
-        let topInset = statusBarHeight + Constants.CanvasView.topWritingFreespace
-        let previousInsets = documentScrollView.contentInset
-        let wasAtTop =
-            documentScrollView.contentOffset.y
-            <= -previousInsets.top + 0.5
-        let wasAtLeadingEdge =
-            documentScrollView.contentOffset.x
-            <= -previousInsets.left + 0.5
-        let insets = UIEdgeInsets(
-            top: topInset,
-            left: horizontalInset,
-            bottom: 0,
-            right: horizontalInset
-        )
-        if documentScrollView.contentInset != insets {
-            documentScrollView.contentInset = insets
-        }
-        // The page needs a viewport inset for writing space, but the scroll
-        // indicator should still use the full track and sit at its true top.
-        documentScrollView.verticalScrollIndicatorInsets.top = 0
-        if wasAtTop, abs(documentScrollView.contentOffset.y + topInset) > 0.5 {
-            documentScrollView.contentOffset.y = -topInset
-        }
-        if wasAtLeadingEdge,
-            abs(documentScrollView.contentOffset.x + horizontalInset) > 0.5
-        {
-            documentScrollView.contentOffset.x = -horizontalInset
-        }
-        syncDocumentPlanes()
-    }
-
     @objc private func pdfScaleDidChange() {
-        // PDFView can publish scale changes during a pinch. Let the system
-        // transform the existing layers while the gesture is active; only
-        // rerasterize PencilKit overlays once zoom settling has completed.
-        updateCanvasContentScaleFactors()
+        zoomCoordinator.scaleChanged()
     }
 
-    private func updateCanvasContentScaleFactors() {
-        guard !isZoomInteractionActive else { return }
-        let targetScale = currentOverlayTargetScale
-        guard targetScale.isFinite, targetScale > 0 else { return }
-        for canvas in pageCanvases.values where abs(canvas.contentScaleFactor - targetScale) > 0.01 {
-            canvas.contentScaleFactor = targetScale
-            canvas.layer.contentsScale = targetScale
+    private func updatePageOverlayRendererZoom() {
+        for canvas in pageCanvases.values {
+            updatePageCanvasRenderer(for: canvas)
+
         }
     }
 
-    private func updateCanvasContentScaleFactor(for canvas: PKCanvasView) {
-        let targetScale = currentOverlayTargetScale
-        guard targetScale.isFinite, targetScale > 0,
-              abs(canvas.contentScaleFactor - targetScale) > 0.01 else { return }
-        canvas.contentScaleFactor = targetScale
-        canvas.layer.contentsScale = targetScale
-    }
-
-    private var currentOverlayTargetScale: CGFloat {
-        let screenScale = view.window?.screen.nativeScale ?? UIScreen.main.scale
-        return screenScale * pdfView.scaleFactor
+    private func updatePageCanvasRenderer(for canvas: PKCanvasView) {
+        guard let pageIndex = pageIndexByCanvas[ObjectIdentifier(canvas)],
+            let overlay = pageOverlays[pageIndex]
+        else { return }
+        overlay.configure(in: pdfView, pdfScaleFactor: pdfView.scaleFactor)
     }
 
     private func applyViewModelDrawing(_ drawing: EditJotViewModel.Drawing) {
@@ -922,38 +655,10 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
                 from: drawing.value,
                 pageIndices: drawing.strokePageIndices,
                 pageIndex: pageIndex,
-                overlaySize: canvas.bounds.size
+                overlaySize: pageOverlays[pageIndex]?.drawingSize ?? currentPageSize
             )
         }
         isApplyingOverlayDrawing = false
-    }
-
-    private func combinedCanvasDrawing() -> PKDrawing {
-        inkCanvasCoordinator.liveCombinedDrawing()
-    }
-
-    private func commitCanvasDrawing(detectsScribbleErase: Bool = true) {
-        hasPendingDrawingChange = false
-        let previousExtent = contentExtent(for: inkCanvasCoordinator.committedDrawing)
-        let liveDrawing = combinedCanvasDrawing()
-        let indices = reconciledPageIndices(for: liveDrawing)
-        let combined = inkCanvasCoordinator.commitLiveDrawing(
-            liveDrawing,
-            strokePageIndices: indices
-        )
-        // Scribble-erase is a pen behaviour, so suppress it while the marker is
-        // selected. The canvas mode no longer distinguishes the two.
-        let isMarkerSelected = (canvasView.tool as? PKInkingTool)?.inkType == .marker
-        viewModel.didChangeDrawing(
-            combined,
-            strokePageIndices: inkCanvasCoordinator.committedStrokePageIndices,
-            detectsScribbleErase: detectsScribbleErase && !isMarkerSelected,
-            changedPageIndices: [currentPDFPageIndex ?? 0]
-        )
-        finishToolUndoGrouping()
-        if contentExtent(for: combined) != previousExtent {
-            updateCanvasGeometry()
-        }
     }
 
     private func reconciledPageIndices(for drawing: PKDrawing) -> [Int] {
@@ -976,188 +681,10 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
         }
     }
 
-    private func contentExtent(for drawing: PKDrawing) -> CGFloat {
-        guard !drawing.bounds.isNull else { return backgroundContentHeight }
-        return max(backgroundContentHeight, drawing.bounds.maxY)
-    }
-
     private func pageIndex(for stroke: PKStroke) -> Int {
-        let stride = currentPageSize.height + JotBackgroundView.pageSpacing
+        let stride = currentPageSize.height + JotPageLayout.pageSpacing
         guard stride.isFinite, stride > 0 else { return 0 }
         return max(0, Int(floor(max(0, stroke.renderBounds.midY) / stride)))
-    }
-
-    @objc
-    private func handleDrawingGesture(_ gestureRecognizer: UIGestureRecognizer) {
-        let timestamp = ProcessInfo.processInfo.systemUptime
-        let location = gestureRecognizer.location(in: view)
-
-        switch gestureRecognizer.state {
-        case .began:
-            // All tools share one canvas now, so the selected tool, rather than
-            // a canvas mode, decides whether a hold may snap to a shape.
-            guard isDrawAndHoldShapeConversionEnabled,
-                isEditingEnabled,
-                let inkingTool = canvasView.tool as? PKInkingTool,
-                inkingTool.inkType != .marker
-            else {
-                cancelShapeHold()
-                return
-            }
-            var detector = EndpointHoldDetector(
-                configuration: .init(
-                    holdDuration: Constants.CanvasView.shapeHoldDuration,
-                    movementTolerance: Constants.CanvasView.shapeHoldMovementTolerance
-                )
-            )
-            detector.begin(at: location, timestamp: timestamp)
-            let before =
-                drawingBeforeToolUse
-                ?? EditJotViewModel.Drawing(
-                    value: inkCanvasCoordinator.committedDrawing,
-                    width: drawingWidth,
-                    strokePageIndices: inkCanvasCoordinator.committedStrokePageIndices
-                )
-            shapeHoldState = ShapeHoldState(
-                initialStrokeCount: canvasView.drawing.strokes.count,
-                beforeDrawing: before,
-                detector: detector
-            )
-            scheduleShapeHoldDeadline()
-
-        case .changed:
-            guard var state = shapeHoldState else { return }
-            let resetDeadline = state.detector.move(to: location, timestamp: timestamp)
-            shapeHoldState = state
-            if resetDeadline {
-                scheduleShapeHoldDeadline()
-            }
-
-        case .ended:
-            shapeHoldTask?.cancel()
-            guard var state = shapeHoldState else { return }
-            let shouldSnap = state.detector.end(at: timestamp)
-            shapeHoldState = state
-            guard shouldSnap else {
-                cancelShapeHold()
-                if !isUsingDrawingTool { flushPendingDrawingChange() }
-                return
-            }
-            if !attemptShapeSnapIfReady() {
-                scheduleShapeCommitWatchdog()
-            }
-
-        case .cancelled, .failed:
-            cancelShapeHold()
-            if !isUsingDrawingTool { flushPendingDrawingChange() }
-
-        default:
-            break
-        }
-    }
-
-    private func scheduleShapeHoldDeadline() {
-        shapeHoldTask?.cancel()
-        guard let state = shapeHoldState,
-            let deadline = state.detector.deadline
-        else { return }
-        let generation = state.detector.generation
-        let delay = max(0, deadline - ProcessInfo.processInfo.systemUptime)
-        shapeHoldTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .seconds(delay))
-            guard !Task.isCancelled, let self, var state = shapeHoldState else { return }
-            guard
-                state.detector.update(
-                    at: ProcessInfo.processInfo.systemUptime,
-                    generation: generation
-                )
-            else { return }
-            if !state.didProvideHoldFeedback {
-                state.didProvideHoldFeedback = true
-                UIImpactFeedbackGenerator(style: .light).impactOccurred(intensity: 0.7)
-            }
-            shapeHoldState = state
-        }
-    }
-
-    /// PencilKit may publish its final pressure samples after both the touch and
-    /// `canvasViewDidEndUsingTool`. Keep the qualified hold alive until exactly
-    /// one committed stroke is available, then replace only that stroke.
-    @discardableResult
-    private func attemptShapeSnapIfReady() -> Bool {
-        guard !isUsingDrawingTool,
-            let state = shapeHoldState,
-            state.detector.shouldSnapAfterStrokeCommit
-        else { return false }
-
-        let strokes = canvasView.drawing.strokes
-        guard strokes.count == state.initialStrokeCount + 1 else {
-            if strokes.count > state.initialStrokeCount + 1 {
-                cancelShapeHold()
-                hasPendingDrawingChange = true
-                flushPendingDrawingChange()
-                finishToolUndoGrouping()
-                return true
-            }
-            return false
-        }
-
-        guard let sourceStroke = strokes.last,
-            let snapped = PencilStrokeShapeSnapper.snap(sourceStroke)
-        else {
-            cancelShapeHold()
-            hasPendingDrawingChange = true
-            flushPendingDrawingChange()
-            return true
-        }
-
-        var snappedStrokes = strokes
-        snappedStrokes[snappedStrokes.count - 1] = snapped.stroke
-        let snappedCanvasDrawing = PKDrawing(strokes: snappedStrokes)
-
-        // Replacing the completed stroke directly avoids cross-fading every
-        // existing ink tile. The localized haptic below provides snap feedback.
-        inkCanvasCoordinator.replaceDrawing(snappedCanvasDrawing, on: canvasView)
-
-        let partition = JotDrawingLayerPartition(drawing: combinedCanvasDrawing())
-        let snappedCombined = partition.combined
-        let snappedIndices = reconciledPageIndices(for: snappedCombined)
-        let after = EditJotViewModel.Drawing(
-            value: snappedCombined,
-            width: drawingWidth,
-            strokePageIndices: snappedIndices
-        )
-        registerDrawingUndo(snapshot: state.beforeDrawing, inverse: after)
-        toolUndoManager?.setActionName("Snap to Shape")
-        shapeHoldState = nil
-        shapeHoldTask?.cancel()
-        shapeCommitWatchdogTask?.cancel()
-        hasPendingDrawingChange = false
-        commitCanvasDrawing(detectsScribbleErase: false)
-        UIImpactFeedbackGenerator(style: .medium).impactOccurred(intensity: 0.85)
-        return true
-    }
-
-    private func scheduleShapeCommitWatchdog() {
-        shapeCommitWatchdogTask?.cancel()
-        shapeCommitWatchdogTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .seconds(1))
-            guard !Task.isCancelled, let self else { return }
-            if !attemptShapeSnapIfReady() {
-                cancelShapeHold()
-                if inkCanvasCoordinator.hasUncommittedChanges {
-                    commitCanvasDrawing()
-                } else {
-                    finishToolUndoGrouping()
-                }
-            }
-        }
-    }
-
-    private func cancelShapeHold() {
-        shapeHoldTask?.cancel()
-        shapeHoldTask = nil
-        shapeHoldState = nil
     }
 
     private func registerDrawingUndo(before: PKDrawing, after: PKDrawing) {
@@ -1204,112 +731,10 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
         registerDrawingUndo(snapshot: inverse, inverse: snapshot)
     }
 
-    private func finishToolUndoGrouping() {
-        if ownsToolUndoGrouping {
-            toolUndoManager?.endUndoGrouping()
-            ownsToolUndoGrouping = false
-        }
-        toolUndoManager = nil
-        drawingBeforeToolUse = nil
-    }
-
     private var inkUndoManager: UndoManager? {
         toolUndoManager
             ?? currentPDFPageIndex.flatMap { pageCanvases[$0]?.undoManager }
-            ?? inkCanvasCoordinator.activeCanvas.undoManager
-            ?? canvasView.undoManager
-    }
 
-    @objc
-    private func handleDoubleTap(_ gesture: UITapGestureRecognizer) {
-        guard gesture.state == .ended, let scales = pageZoomScales() else { return }
-
-        // `fillShortEdge` fills either the viewport width or height, whichever
-        // requires more magnification. `fitLongEdge` keeps the entire page visible.
-        let isAtOrBeyondShortEdgeFill =
-            documentScrollView.zoomScale
-            >= scales.fillShortEdge * (1 - 0.02)
-        let targetScale =
-            isAtOrBeyondShortEdgeFill
-            ? scales.fitLongEdge
-            : scales.fillShortEdge
-
-        isZoomInteractionActive = true
-        backgroundView.setZoomInteractionActive(true)
-        documentScrollView.setZoomScale(targetScale, animated: true)
-        scheduleZoomSettling()
-    }
-
-    private func pageZoomScales() -> (fitLongEdge: CGFloat, fillShortEdge: CGFloat)? {
-        guard
-            currentPageSize.width.isFinite,
-            currentPageSize.height.isFinite,
-            currentPageSize.width > 0,
-            currentPageSize.height > 0,
-            documentScrollView.bounds.width > 0,
-            documentScrollView.bounds.height > 0
-        else { return nil }
-
-        let widthScale = documentScrollView.bounds.width / currentPageSize.width
-        let heightScale = documentScrollView.bounds.height / currentPageSize.height
-        let fitLongEdge = max(
-            documentScrollView.minimumZoomScale,
-            min(widthScale, heightScale)
-        )
-        let fillShortEdge = min(
-            documentScrollView.maximumZoomScale,
-            max(widthScale, heightScale)
-        )
-        return (fitLongEdge, max(fitLongEdge, fillShortEdge))
-    }
-
-    /// Projects the canvas's zoom onto the background plane.
-    ///
-    /// PencilKit applies the zoom as a transform on its own internal content
-    /// view, so a view the app adds has to be scaled explicitly. Doing it with a
-    /// layer transform keeps the PDF page re-render and the ink perfectly
-    /// registered without re-laying out the page views on every frame.
-    private func syncDocumentPlanes() {
-        guard documentContentSize.width > 0, documentContentSize.height > 0 else { return }
-
-        let scale = canvasView.zoomScale
-        let offset = canvasView.contentOffset
-
-        // No CATransaction override here. During an animated zoom PencilKit
-        // animates its own content, so the background has to inherit the very
-        // same animation to stay visually locked to the ink. Suppressing actions
-        // would make the background snap while the ink glides.
-        //
-        // The plane is a subview of the canvas, so it already scrolls with it
-        // and only the zoom has to be reproduced. Anchoring at the layer origin
-        // scales the document about its top-left corner, matching how the canvas
-        // scales its own content.
-        backgroundContainerView.layer.anchorPoint = .zero
-        backgroundContainerView.layer.position = .zero
-        backgroundContainerView.layer.transform = CATransform3DMakeScale(scale, scale, 1)
-
-        backgroundView.sync(
-            scrollOffset: offset,
-            zoomScale: scale,
-            viewportSize: canvasView.bounds.size
-        )
-    }
-
-    private func finishZoomInteraction() {
-        zoomSettleTask?.cancel()
-        isZoomInteractionActive = false
-        syncDocumentPlanes()
-        backgroundView.setZoomInteractionActive(false)
-        updateCanvasContentScaleFactors()
-    }
-
-    private func scheduleZoomSettling() {
-        zoomSettleTask?.cancel()
-        zoomSettleTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .milliseconds(400))
-            guard !Task.isCancelled, let self else { return }
-            finishZoomInteraction()
-        }
     }
 
     private func handleLoadingProgress(_ progress: Double?) {
@@ -1331,84 +756,54 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
 
     private var currentPDFPageIndex: Int? {
         guard let page = pdfView.currentPage,
-              let document = pdfView.document else { return nil }
+            let document = pdfView.document
+        else { return nil }
         let index = document.index(for: page)
         return index == NSNotFound ? nil : index
     }
 
     @objc private func pdfPageChanged() {
+        guard !isInstallingPDFDocument else { return }
         guard let pageIndex = currentPDFPageIndex else { return }
         pendingScrollPage = pageIndex
         defaultsService.set(lastPageKey, value: pageIndex)
+        #if !targetEnvironment(macCatalyst)
+        synchronizePageInputState()
+        #endif
     }
 
-    private func restoreScrollPositionIfNeeded() {
-        guard let page = pendingScrollPage, page > 0, drawingWidth > 0 else { return }
-        let zoomScale = documentScrollView.zoomScale
-        let maxOffsetY = max(
-            0,
-            documentContentSize.height * zoomScale - documentScrollView.bounds.height
-        )
-        guard maxOffsetY > 0 else { return }
-        pendingScrollPage = nil
-        let pageFullHeight =
-            (currentPageSize.height + JotBackgroundView.pageSpacing) * zoomScale
-        let targetOffsetY = CGFloat(page) * pageFullHeight - documentScrollView.contentInset.top
-        documentScrollView.contentOffset = CGPoint(
-            x: -documentScrollView.contentInset.left,
-            y: min(targetOffsetY, maxOffsetY)
-        )
-    }
-
-}
-
-// MARK: - Blank Canvas Menu Suppression
-
-extension EditJotViewController: UIGestureRecognizerDelegate {
-
-    func gestureRecognizer(
-        _ gestureRecognizer: UIGestureRecognizer,
-        shouldReceive touch: UITouch
-    ) -> Bool {
-        guard gestureRecognizer === blankCanvasEditMenuTapGesture else { return true }
-        let activeCanvas = inkCanvasCoordinator.activeCanvas
-        guard let touchedView = touch.view,
-            touchedView === activeCanvas || touchedView.isDescendant(of: activeCanvas)
-        else { return false }
-
-        blankCanvasEditMenuTapGesture.canvasRootViews = [activeCanvas]
-        return CanvasEditMenuSuppressionPolicy.blocksDirectTouch(
-            isEditingEnabled: isEditingEnabled,
-            isLassoTool: activeCanvas.tool is PKLassoTool,
-            routesDirectTouchesToDocumentScroll: updateCanvasTouchRouting()
-        )
-    }
-
-    func gestureRecognizer(
-        _ gestureRecognizer: UIGestureRecognizer,
-        shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
-    ) -> Bool {
-        guard
-            gestureRecognizer === blankCanvasEditMenuTapGesture
-                || otherGestureRecognizer === blankCanvasEditMenuTapGesture
-        else { return false }
-
-        let companion =
-            gestureRecognizer === blankCanvasEditMenuTapGesture
-            ? otherGestureRecognizer : gestureRecognizer
-        guard let tapGesture = companion as? UITapGestureRecognizer else { return false }
-        return tapGesture.numberOfTapsRequired > 1
-    }
 }
 
 #if !targetEnvironment(macCatalyst)
-// MARK: - PKToolPickerObserver
+// MARK: - PencilKit tool picker
 
 extension EditJotViewController: PKToolPickerObserver {
 
     func toolPickerIsRulerActiveDidChange(_ toolPicker: PKToolPicker) {
-        let isActive = toolPicker.isRulerActive
-        pageCanvases.values.forEach { $0.isRulerActive = isActive }
+        cachedRulerActive = toolPicker.isRulerActive
+        synchronizePageInputState()
+    }
+
+    private func updateToolPickerCanvasObserver(for pageIndex: Int?) {
+        let nextCanvas: JotCanvasView?
+        if isEditingEnabled, let pageIndex, let canvas = pageCanvases[pageIndex] {
+            nextCanvas = canvas
+        } else if isEditingEnabled {
+            // PDFKit can briefly report no current page while it lays out a
+            // new overlay. Keep the existing PencilKit observer until the new
+            // page canvas is registered, avoiding a ruler state reset.
+            nextCanvas = toolPickerCanvasObserver
+        } else {
+            nextCanvas = nil
+        }
+
+        guard nextCanvas !== toolPickerCanvasObserver else { return }
+        if let previous = toolPickerCanvasObserver { toolPicker.removeObserver(previous) }
+        toolPickerCanvasObserver = nextCanvas
+        if let nextCanvas {
+            toolPicker.addObserver(nextCanvas)
+            nextCanvas.isRulerActive = cachedRulerActive
+        }
     }
 
     @available(iOS, introduced: 13.0, deprecated: 18.0)
@@ -1422,7 +817,7 @@ extension EditJotViewController: PKToolPickerObserver {
     }
 
     func toolPickerVisibilityDidChange(_ toolPicker: PKToolPicker) {
-        updateCanvasTouchRouting()
+        synchronizePageInputState()
         if isEditingEnabled && !toolPicker.isVisible {
             Task { @MainActor [weak self] in
                 await Task.yield()
@@ -1432,10 +827,9 @@ extension EditJotViewController: PKToolPickerObserver {
     }
 
     private func scheduleSelectedCanvasToolUpdate() {
-        // PencilKit's observer callback can precede propagation of the selected
-        // tool to PKCanvasView. Inspect it on the next main-actor turn.
         selectedToolUpdateTask?.cancel()
         selectedToolUpdateTask = Task { @MainActor [weak self] in
+            // PencilKit publishes the item selection after its observer callback.
             await Task.yield()
             guard !Task.isCancelled else { return }
             self?.selectedCanvasToolDidChange()
@@ -1443,39 +837,15 @@ extension EditJotViewController: PKToolPickerObserver {
     }
 
     private func selectedCanvasToolDidChange() {
-        let wasLassoTool = inkCanvasCoordinator.activeCanvas.tool is PKLassoTool
-        let previousCanvasTool = canvasView.tool
+        let previousCanvasTool = selectedCanvasTool
         let selectedTool = selectedToolFromPicker()
         previousSelectedTool = previousCanvasTool
         if !(selectedTool is PKEraserTool) {
             lastSelectedNonEraserTool = selectedTool
         }
-        canvasView.tool = selectedTool
-        highlighterCanvasView.tool = selectedTool
-        pageCanvases.values.forEach { $0.tool = selectedTool }
+        selectedCanvasTool = selectedTool
 
-        blankEditMenuDismissTask?.cancel()
-        if !isEditingEnabled || !wasLassoTool || !(selectedTool is PKLassoTool) {
-            dismissPencilKitEditMenus()
-        }
-
-        // Every tool draws on the canvas that owns scrolling. PencilKit's own
-        // gesture view covers the whole viewport, and a gesture recognizer only
-        // sees touches whose hit-test view is itself or a descendant, so a
-        // nested sibling canvas can never receive input. Marker ordering is
-        // preserved by JotDrawingLayerPartition, which always stores marker
-        // strokes first, so a single canvas still composites ink correctly.
-        let nextMode = JotInkCanvasCoordinator.Mode.combined
-
-        if inkCanvasCoordinator.mode != nextMode,
-            hasPendingDrawingChange || inkCanvasCoordinator.hasUncommittedChanges
-        {
-            commitCanvasDrawing()
-        }
-        inkCanvasCoordinator.transition(to: nextMode)
-        blankCanvasEditMenuTapGesture.canvasRootViews = [inkCanvasCoordinator.activeCanvas]
         updateCanvasInteraction()
-        updateCanvasTouchRouting()
     }
 
     private func selectedToolFromPicker() -> any PKTool {
@@ -1492,22 +862,20 @@ extension EditJotViewController: PKToolPickerObserver {
     }
 
     private func selectToolInPicker(_ tool: any PKTool) {
-        if #available(iOS 18.0, *) {
-            if let inkingTool = tool as? PKInkingTool {
-                toolPicker.selectedToolItemIdentifier = PKToolPickerInkingItem(
-                    type: inkingTool.ink.inkType
-                ).identifier
-            } else if let eraserTool = tool as? PKEraserTool {
-                toolPicker.selectedToolItemIdentifier = PKToolPickerEraserItem(
-                    type: eraserTool.eraserType
-                ).identifier
-            } else if tool is PKLassoTool {
-                toolPicker.selectedToolItemIdentifier = PKToolPickerLassoItem().identifier
+        // Identifiers belong to the items installed in this picker. A newly
+        // constructed item can have a different identifier and select nothing.
+        let item = toolPicker.toolItems.first { item in
+            if let desired = tool as? PKInkingTool, let existing = item as? PKToolPickerInkingItem {
+                return existing.inkingTool.inkType == desired.inkType
             }
-        } else {
-            toolPicker.selectedTool = tool
+            if let desired = tool as? PKEraserTool, let existing = item as? PKToolPickerEraserItem {
+                return existing.eraserTool.eraserType == desired.eraserType
+            }
+            return tool is PKLassoTool && item is PKToolPickerLassoItem
         }
+        if let item { toolPicker.selectedToolItemIdentifier = item.identifier }
     }
+
 }
 
 // MARK: - Apple Pencil double-tap
@@ -1555,10 +923,9 @@ extension EditJotViewController {
             #if !targetEnvironment(macCatalyst)
             if !didSelectInitialPenTool {
                 didSelectInitialPenTool = true
-                if !(canvasView.tool is PKInkingTool) {
+                if !(selectedCanvasTool is PKInkingTool) {
                     let pen = PKInkingTool(.pen, color: .label, width: 5)
-                    canvasView.tool = pen
-                    highlighterCanvasView.tool = pen
+                    selectedCanvasTool = pen
                     selectToolInPicker(pen)
                 }
             }
@@ -1566,7 +933,7 @@ extension EditJotViewController {
         } else {
             swipeBackGesture.isEnabled = true
             #if !targetEnvironment(macCatalyst)
-            if let inking = inkCanvasCoordinator.activeCanvas.tool as? PKInkingTool {
+            if let inking = selectedCanvasTool as? PKInkingTool {
                 let widthKey = DefaultsKey<Double>("editor.penWidth")
                 let colorKey = DefaultsKey<String>("editor.penColorHex")
                 defaultsService.set(widthKey, value: Double(inking.width))
@@ -1579,7 +946,6 @@ extension EditJotViewController {
         selectedCanvasToolDidChange()
         #else
         updateCanvasInteraction()
-        updateCanvasTouchRouting()
         #endif
 
         if let firstItem = rightNavigationBarButtonItems.first,
@@ -1592,163 +958,57 @@ extension EditJotViewController {
     }
 
     private func updateCanvasInteraction() {
-        // PDFView owns page scrolling and zoom. PencilKit input is enabled only
-        // on the page overlays, whose frames are clipped to individual pages.
-        highlighterCanvasView.isUserInteractionEnabled = false
-        if #available(iOS 18.0, *) {
-            highlighterCanvasView.isDrawingEnabled = false
-        }
-        highlighterCanvasView.resignFirstResponder()
-
-        canvasView.isUserInteractionEnabled = false
-        if #available(iOS 18.0, *) {
-            canvasView.isDrawingEnabled = false
-        } else {
-            canvasView.drawingGestureRecognizer.isEnabled = false
-        }
-        for canvas in pageCanvases.values {
-            configurePencilInput(on: canvas)
-            if #available(iOS 18.0, *) {
-                canvas.isDrawingEnabled = isEditingEnabled
-            } else {
-                canvas.drawingGestureRecognizer.isEnabled = isEditingEnabled
-            }
-        }
-        updatePDFLongPressGesturePolicy()
+        synchronizePageInputState()
         #if !targetEnvironment(macCatalyst)
-        persistentCanvasAnchor.preservesFirstResponder = isEditingEnabled
+        persistentCanvasAnchor.preservesFirstResponder = CanvasTouchRouting.usesPersistentResponder(
+            isEditing: isEditingEnabled, tool: selectedToolFromPickerIfAvailable())
         if isEditingEnabled { restorePersistentToolPickerIfNeeded() }
         #endif
     }
 
-    private func updatePDFLongPressGesturePolicy() {
-        #if !targetEnvironment(macCatalyst)
-        var recognizers: [UILongPressGestureRecognizer] = []
-        collectPDFLongPressRecognizers(in: pdfView, into: &recognizers)
-        if isEditingEnabled {
-            for recognizer in recognizers {
-                let identifier = ObjectIdentifier(recognizer)
-                if originalPDFLongPressStates[identifier] == nil {
-                    originalPDFLongPressStates[identifier] = recognizer.isEnabled
-                }
-                recognizer.isEnabled = false
-            }
-        } else {
-            for recognizer in recognizers {
-                guard let wasEnabled = originalPDFLongPressStates[ObjectIdentifier(recognizer)] else { continue }
-                recognizer.isEnabled = wasEnabled
-            }
-            originalPDFLongPressStates.removeAll()
-        }
-        #endif
-    }
 
-    private func configurePencilInput(on canvas: JotCanvasView) {
-        #if !targetEnvironment(macCatalyst)
-        // Pencil is the editor's ink input; finger drags remain available to
-        // PDFKit navigation even when the system's default Pencil policy varies.
-        canvas.drawingPolicy = .pencilOnly
-        #endif
-        canvas.isUserInteractionEnabled = isEditingEnabled
-        prioritizePencilGesture(on: canvas)
-    }
-
-    private func logCanvasDiagnostic(_ canvas: JotCanvasView, stage: String, pageIndex: Int) {
-        #if DEBUG
-        let recognizerStates = (canvas.gestureRecognizers ?? []).map { recognizer in
-            "\(type(of: recognizer))(enabled:\(recognizer.isEnabled), state:\(recognizer.state.rawValue))"
-        }.joined(separator: ", ")
-        let pdfScrollViews = pdfNavigationScrollViews()
-        let pdfScrollStates = pdfScrollViews.map { scrollView in
-            "\(type(of: scrollView))(frame:\(scrollView.frame), scrolling:\(scrollView.isScrollEnabled), "
-                + "panEnabled:\(scrollView.panGestureRecognizer.isEnabled), "
-                + "panState:\(scrollView.panGestureRecognizer.state.rawValue))"
-        }.joined(separator: ", ")
-        let message =
-            "[PencilDiag][Overlay] stage:\(stage) page:\(pageIndex) "
-                + "frame:\(canvas.frame) interaction:\(canvas.isUserInteractionEnabled) "
-                + "drawingPolicy:\(canvas.drawingPolicy.rawValue) "
-                + "gestures[\(canvas.gestureRecognizers?.count ?? 0)]:\(recognizerStates) "
-                + "pdfViewInteraction:\(pdfView.isUserInteractionEnabled) "
-                + "pdfScrollViews[\(pdfScrollViews.count)]:\(pdfScrollStates) "
-                + "pencilPanLinks:\(canvas.prioritizedPDFPanRecognizers.count)"
-        print(message)
-        NSLog("%@", message)
-        #endif
-    }
-
-    private var pencilDiagnosticBackgroundColor: UIColor {
-        #if DEBUG
-        return UIColor.red.withAlphaComponent(0.2)
-        #else
-        return .clear
-        #endif
-    }
-
-    private func prioritizePencilGesture(on canvas: JotCanvasView) {
-        #if !targetEnvironment(macCatalyst)
-        let drawingGesture = canvas.drawingGestureRecognizer
-        for scrollView in pdfNavigationScrollViews() {
-            let panIdentifier = ObjectIdentifier(scrollView.panGestureRecognizer)
-            guard canvas.prioritizedPDFPanRecognizers.insert(panIdentifier).inserted else { continue }
-            scrollView.panGestureRecognizer.require(toFail: drawingGesture)
-        }
-        #endif
-    }
-
-    private func pdfNavigationScrollViews() -> [UIScrollView] {
-        var candidates: [UIScrollView] = []
-        if let documentView = pdfView.documentView {
-            var ancestor = documentView.superview
-            while let view = ancestor {
-                if let scrollView = view as? UIScrollView { candidates.append(scrollView) }
-                ancestor = view.superview
-            }
-        }
-        collectPDFScrollViews(in: pdfView, into: &candidates)
-        var seen = Set<ObjectIdentifier>()
-        return candidates.filter { seen.insert(ObjectIdentifier($0)).inserted }
-    }
-
-    private func collectPDFScrollViews(in view: UIView, into result: inout [UIScrollView]) {
-        // Page overlay canvases have their own PencilKit pan recognizers, which
-        // are disabled for navigation and must not be treated as PDF scrollers.
-        guard !(view is PKCanvasView) else { return }
-        for child in view.subviews {
-            if let scrollView = child as? UIScrollView, scrollView.isScrollEnabled {
-                result.append(scrollView)
-            }
-            collectPDFScrollViews(in: child, into: &result)
-        }
-    }
 
     #if !targetEnvironment(macCatalyst)
-    private func collectPDFLongPressRecognizers(
-        in view: UIView,
-        into recognizers: inout [UILongPressGestureRecognizer]
-    ) {
-        // Leave PencilKit's own long-press/shape gestures intact; only PDFKit's
-        // text selection recognizers interfere with the persistent picker.
-        guard !(view is PKCanvasView) else { return }
-        recognizers.append(contentsOf: (view.gestureRecognizers ?? []).compactMap { $0 as? UILongPressGestureRecognizer })
-        for subview in view.subviews {
-            collectPDFLongPressRecognizers(in: subview, into: &recognizers)
+
+    private func activateLassoCanvas(_ canvas: JotCanvasView) {
+        guard isEditingEnabled, selectedToolFromPickerIfAvailable() is PKLassoTool,
+            canvas.window != nil, pageIndexByCanvas[ObjectIdentifier(canvas)] != nil else { return }
+        // PencilKit can move focus into its native selection responder. Once
+        // this page owns the lasso session, preserve that internal focus.
+        if activeLassoCanvas === canvas { return }
+        persistentCanvasAnchor.preservesFirstResponder = false
+        _ = persistentCanvasAnchor.resignFirstResponder()
+        if activeLassoCanvas !== canvas { _ = activeLassoCanvas?.resignFirstResponder() }
+        activeLassoCanvas = canvas
+        if canvas.becomeFirstResponder() {
+            toolPicker.setVisible(true, forFirstResponder: canvas)
         }
+        #if DEBUG
+        if let index = pageIndexByCanvas[ObjectIdentifier(canvas)] {
+            EditorInteractionFixture.publish(canvas: canvas, index: index, pdfView: pdfView, host: view)
+        }
+        #endif
     }
 
     private func restorePersistentToolPickerIfNeeded() {
-        guard isEditingEnabled,
-              isToolPickerObserverAttached,
-              persistentCanvasAnchor.window != nil,
-              !isRestoringToolPicker else { return }
+        guard isEditingEnabled, isToolPickerObserverAttached,
+            persistentCanvasAnchor.window != nil, !isRestoringToolPicker else { return }
         isRestoringToolPicker = true
         defer { isRestoringToolPicker = false }
-        if !persistentCanvasAnchor.isFirstResponder {
-            _ = persistentCanvasAnchor.becomeFirstResponder()
+        if selectedToolFromPickerIfAvailable() is PKLassoTool, let canvas = activeLassoCanvas,
+            canvas.window != nil {
+            if let responder = canvas.firstResponderInHierarchy {
+                if !toolPicker.isVisible { toolPicker.setVisible(true, forFirstResponder: responder) }
+            } else if !toolPicker.isVisible {
+                _ = canvas.becomeFirstResponder()
+                toolPicker.setVisible(true, forFirstResponder: canvas)
+            }
+            return
         }
-        if !toolPicker.isVisible {
-            toolPicker.setVisible(true, forFirstResponder: persistentCanvasAnchor)
-        }
+        _ = activeLassoCanvas?.resignFirstResponder()
+        activeLassoCanvas = nil
+        if !persistentCanvasAnchor.isFirstResponder { _ = persistentCanvasAnchor.becomeFirstResponder() }
+        if !toolPicker.isVisible { toolPicker.setVisible(true, forFirstResponder: persistentCanvasAnchor) }
     }
     #endif
 
@@ -1760,16 +1020,7 @@ extension EditJotViewController {
     private func toggleDrawAndHoldShapeConversion() -> Bool {
         let isEnabled = !isDrawAndHoldShapeConversionEnabled
         defaultsService.set(.drawAndHoldShapeConversionEnabled, value: isEnabled)
-
-        if !isEnabled {
-            cancelShapeHold()
-            shapeCommitWatchdogTask?.cancel()
-            shapeCommitWatchdogTask = nil
-            if !isUsingDrawingTool {
-                flushPendingDrawingChange()
-                finishToolUndoGrouping()
-            }
-        }
+        shapeCoordinator.isEnabled = isEnabled
 
         return isEnabled
     }
@@ -1825,7 +1076,9 @@ extension EditJotViewController {
                 primaryAction: .action(
                     UIAction(title: L10n.EditJot.PDF.Action.addPage) { [weak self] _ in
                         guard let self else { return }
-                        viewModel.addPage(afterPageIndex: viewModel.visiblePageProvider?())
+                        let visiblePage = viewModel.visiblePageProvider?()
+                        pendingScrollPage = visiblePage
+                        viewModel.addPage(afterPageIndex: visiblePage)
                     }
                 )
             )
@@ -1879,10 +1132,12 @@ private struct PageTrashSheet: View {
                     ForEach(pages.sorted { $0.deletedAt > $1.deletedAt }) { page in
                         HStack {
                             VStack(alignment: .leading, spacing: 4) {
-                                Text(String.localizedStringWithFormat(
-                                    String(localized: "editJot.pages.trashedPage"),
-                                    page.originalIndex + 1
-                                ))
+                                Text(
+                                    String.localizedStringWithFormat(
+                                        String(localized: "editJot.pages.trashedPage"),
+                                        page.originalIndex + 1
+                                    )
+                                )
                                 Text(page.deletedAt.formatted(date: .abbreviated, time: .shortened))
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
@@ -1912,91 +1167,75 @@ private struct PageTrashSheet: View {
 extension EditJotViewController {
 
     fileprivate func applyBackground(_ background: EditJotViewModel.Background) async {
-        let pageSize = CGSize(width: Constants.Page.width, height: Constants.Page.height)
-        currentPageSize = pageSize
-        let spacing = JotBackgroundView.pageSpacing
-
-        switch background {
-        case let .ruled(extraPages):
-            cachedPDFData = nil
-            cachedPDFLoadResult = nil
-            applyDocumentAppearance(isPDFBacked: false)
-            let totalPageCount = 1 + extraPages
-            backgroundContentHeight =
-                CGFloat(totalPageCount) * pageSize.height
-                + max(0, CGFloat(totalPageCount - 1)) * spacing
-            do {
-                let data = try JotHybridPDFBuilder.makeRuledPDF(
-                    pageSize: pageSize,
-                    pageCount: totalPageCount
-                )
-                installPDFDocument(data)
-            } catch {
-                viewModel.logger.error("Failed to create ruled PDF for PDFView: \(error)")
-            }
-
-        case let .pdf(data, _, insertedPageSlots):
-            applyDocumentAppearance(isPDFBacked: true)
-            do {
-                let result: PDFLoadService.Result
-                if cachedPDFData == data, let cachedPDFLoadResult {
-                    result = cachedPDFLoadResult
-                } else {
-                    let loadService = pdfLoadService
-                    result = try await Task.detached(priority: .userInitiated) {
-                        try loadService.load(data: data, normalizedPageSize: pageSize)
-                    }.value
-                    guard !Task.isCancelled else { return }
-                    cachedPDFData = data
-                    cachedPDFLoadResult = result
+        let defaultSize = JotPageLayout.defaultSize
+        do {
+            let prepared: (Data, CGSize) = try await Task.detached(priority: .utility) {
+                switch background {
+                case let .ruled(extraPages):
+                    return (
+                        try JotHybridPDFBuilder.makeRuledPDF(pageSize: defaultSize, pageCount: 1 + extraPages),
+                        defaultSize
+                    )
+                case let .pdf(data, _, slots):
+                    guard let metadata = JotPDFMetadata(pdfData: data) else {
+                        throw PDFLoadService.Failure.couldNotParse
+                    }
+                    let size = CGSize(
+                        width: defaultSize.width,
+                        height: defaultSize.width * metadata.pageAspectRatio
+                    )
+                    return (
+                        try HybridPDFManager.materializePages(
+                            pdfData: data,
+                            insertedPageSlots: slots,
+                            blankPageCount: 0,
+                            pageSize: size
+                        ), size
+                    )
                 }
-                let pdfPageSize = result.pageSize
-                currentPageSize = pdfPageSize
-                let totalPages = CGFloat(result.pageCount + insertedPageSlots.count)
-                backgroundContentHeight =
-                    totalPages * pdfPageSize.height
-                    + max(0, totalPages - 1) * spacing
-                let materialized = try HybridPDFManager.materializePages(
-                    pdfData: data,
-                    insertedPageSlots: insertedPageSlots,
-                    blankPageCount: 0,
-                    pageSize: pdfPageSize
-                )
-                installPDFDocument(materialized)
-            } catch {
-                cachedPDFData = nil
-                cachedPDFLoadResult = nil
-                // A malformed/empty PDF must not take down the editor. Keep the
-                // handwriting available over a plain page so it can still be saved.
-                backgroundContentHeight = pageSize.height
-                if let fallback = try? JotHybridPDFBuilder.makeRuledPDF(pageSize: pageSize, pageCount: 1) {
-                    installPDFDocument(fallback)
-                }
+            }.value
+            guard !Task.isCancelled else { return }
+            currentPageSize = prepared.1
+            if case .pdf = background {
+                applyDocumentAppearance(isPDFBacked: true)
+            } else {
+                applyDocumentAppearance(isPDFBacked: false)
             }
+            installPDFDocument(prepared.0)
+        } catch {
+            viewModel.logger.error("Failed to prepare editor PDF: \(error)")
         }
-        layoutCanvasContent()
     }
 
     private func installPDFDocument(_ data: Data) {
         guard let document = PDFDocument(data: data), document.pageCount > 0 else { return }
+        // Setting a fresh PDF makes PDFView briefly report page zero. Preserve
+        // the pre-install page before that notification can replace the saved
+        // index, then restore it after the new document is attached.
+        let preservedPageIndex =
+            JotPDFPageRestorationPolicy.targetIndex(
+                pendingIndex: pendingScrollPage,
+                currentIndex: currentPDFPageIndex,
+                pageCount: document.pageCount
+            ) ?? 0
         for pageIndex in 0..<document.pageCount {
             guard let page = document.page(at: pageIndex) else { continue }
             page.annotations
                 .filter { $0.contents == PDFAnnotationConverter.marker }
                 .forEach(page.removeAnnotation)
         }
-        pageCanvases.removeAll()
-        pageIndexByCanvas.removeAll()
-        reusablePageCanvases.removeAll()
-        activePDFDocument = document
+        overlayStore.reset()
+        isInstallingPDFDocument = true
         pdfView.document = document
         pdfView.autoScales = true
-        if let page = document.page(at: pendingScrollPage ?? 0) {
+        if let page = document.page(at: preservedPageIndex) {
             pdfView.go(to: page)
         }
+        pendingScrollPage = preservedPageIndex
+        isInstallingPDFDocument = false
         Task { @MainActor [weak self] in
             await Task.yield()
-            self?.updatePDFLongPressGesturePolicy()
+            self?.synchronizePageInputState()
         }
     }
 
@@ -2006,26 +1245,11 @@ extension EditJotViewController {
     /// dark. Plain notes keep PencilKit's normal adaptive appearance.
     fileprivate func applyDocumentAppearance(isPDFBacked: Bool) {
         let canvasStyle: UIUserInterfaceStyle = isPDFBacked ? .light : .unspecified
-        canvasView.overrideUserInterfaceStyle = canvasStyle
-        highlighterCanvasView.overrideUserInterfaceStyle = canvasStyle
+        canvasAppearance = canvasStyle
         pageCanvases.values.forEach { $0.overrideUserInterfaceStyle = canvasStyle }
-        pageCanvases.values.forEach { $0.overrideUserInterfaceStyle = canvasStyle }
-        backgroundView.overrideUserInterfaceStyle = canvasStyle
         #if !targetEnvironment(macCatalyst)
         toolPicker.colorUserInterfaceStyle = canvasStyle
         #endif
-    }
-}
-
-extension UIView {
-
-    /// PencilKit installs edit-menu interactions on internal subviews, so the
-    /// editor has to walk the subtree to dismiss them.
-    fileprivate func forEachViewInHierarchy(_ operation: (UIView) -> Void) {
-        operation(self)
-        for subview in subviews {
-            subview.forEachViewInHierarchy(operation)
-        }
     }
 }
 
@@ -2077,290 +1301,61 @@ extension EditJotViewController: PKCanvasViewDelegate {
     func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
         if let pageIndex = pageIndexByCanvas[ObjectIdentifier(canvasView)] {
             guard !isApplyingOverlayDrawing else { return }
-            let prior = inkCanvasCoordinator.committedDrawing
-            let priorIndices = inkCanvasCoordinator.committedStrokePageIndices
-            var strokes: [PKStroke] = []
-            var indices: [Int] = []
-            for (index, stroke) in prior.strokes.enumerated() {
-                let owner = priorIndices.indices.contains(index) ? priorIndices[index] : 0
-                if owner != pageIndex {
-                    strokes.append(stroke)
-                    indices.append(owner)
-                }
-            }
+            shapeCoordinator.drawingDidChange(canvasView)
+            #if DEBUG
+            EditorInteractionFixture.publish(canvas: canvasView, index: pageIndex, pdfView: pdfView, host: view)
+            #endif
             let converted = canonicalDrawing(
                 from: canvasView.drawing,
                 pageIndex: pageIndex,
-                overlaySize: canvasView.bounds.size
+                overlaySize: pageOverlays[pageIndex]?.drawingSize ?? currentPageSize
             )
-            strokes.append(contentsOf: converted.strokes)
-            indices.append(contentsOf: repeatElement(pageIndex, count: converted.strokes.count))
-            let combined = PKDrawing(strokes: strokes)
-            inkCanvasCoordinator.load(drawing: combined, strokePageIndices: indices)
+            guard inkCanvasCoordinator.replacePage(converted, at: pageIndex) else { return }
             viewModel.didChangeDrawing(
-                combined,
-                strokePageIndices: indices,
+                inkCanvasCoordinator.committedDrawing,
+                strokePageIndices: inkCanvasCoordinator.committedStrokePageIndices,
                 changedPageIndices: [pageIndex]
             )
             return
         }
-        guard inkCanvasCoordinator.noteDrawingDidChange(from: canvasView) else { return }
-        guard !isUsingDrawingTool else {
-            hasPendingDrawingChange = true
-            return
-        }
-        updateCanvasTouchRouting()
-        if canvasView === self.canvasView, attemptShapeSnapIfReady() { return }
-        if canvasView === self.canvasView, shapeHoldState != nil {
-            hasPendingDrawingChange = true
-            scheduleShapeCommitWatchdog()
-            return
-        }
-        commitCanvasDrawing()
     }
 
     func canvasViewDidBeginUsingTool(_ canvasView: PKCanvasView) {
-        if pageIndexByCanvas[ObjectIdentifier(canvasView)] != nil {
-            drawingBeforeToolUse = EditJotViewModel.Drawing(
-                value: inkCanvasCoordinator.committedDrawing,
-                width: drawingWidth,
-                strokePageIndices: inkCanvasCoordinator.committedStrokePageIndices
-            )
+        if let canvas = canvasView as? JotCanvasView,
+            pageIndexByCanvas[ObjectIdentifier(canvas)] != nil
+        {
+            if canvas.tool is PKLassoTool { activateLassoCanvas(canvas) }
+            #if DEBUG
+            if let index = pageIndexByCanvas[ObjectIdentifier(canvas)] {
+                EditorInteractionFixture.publish(canvas: canvas, index: index, pdfView: pdfView, host: view)
+            }
+            #endif
             toolUndoManager = canvasView.undoManager
             return
-        }
-        guard inkCanvasCoordinator.role(of: canvasView) != nil,
-            canvasView === inkCanvasCoordinator.activeCanvas
-        else { return }
-        isUsingDrawingTool = true
-        zoomSettleTask?.cancel()
-        isZoomInteractionActive = false
-        backgroundView.setZoomInteractionActive(false)
-        shapeCommitWatchdogTask?.cancel()
-        toolUndoCleanupTask?.cancel()
-        if ownsToolUndoGrouping {
-            finishToolUndoGrouping()
-        }
-        drawingBeforeToolUse = EditJotViewModel.Drawing(
-            value: inkCanvasCoordinator.committedDrawing,
-            width: drawingWidth,
-            strokePageIndices: inkCanvasCoordinator.committedStrokePageIndices
-        )
-        if canvasView.tool is PKInkingTool, let undoManager = canvasView.undoManager {
-            undoManager.beginUndoGrouping()
-            toolUndoManager = undoManager
-            ownsToolUndoGrouping = true
         }
     }
 
     func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) {
-        if pageIndexByCanvas[ObjectIdentifier(canvasView)] != nil {
-            drawingBeforeToolUse = nil
+        if let canvas = canvasView as? JotCanvasView,
+            pageIndexByCanvas[ObjectIdentifier(canvas)] != nil
+        {
             toolUndoManager = nil
             return
-        }
-        guard inkCanvasCoordinator.role(of: canvasView) != nil,
-            canvasView === inkCanvasCoordinator.activeCanvas
-        else { return }
-        isUsingDrawingTool = false
-        updateCanvasTouchRouting()
-        if canvasView === self.canvasView, attemptShapeSnapIfReady() { return }
-        if canvasView === self.canvasView, shapeHoldState != nil {
-            hasPendingDrawingChange = true
-            scheduleShapeCommitWatchdog()
-            return
-        }
-        flushPendingDrawingChange()
-        if ownsToolUndoGrouping {
-            toolUndoCleanupTask?.cancel()
-            toolUndoCleanupTask = Task { @MainActor [weak self] in
-                try? await Task.sleep(for: .seconds(1))
-                guard !Task.isCancelled, let self else { return }
-                if inkCanvasCoordinator.hasUncommittedChanges {
-                    commitCanvasDrawing()
-                } else {
-                    finishToolUndoGrouping()
-                }
-            }
         }
     }
 
     private func flushPendingDrawingChange() {
-        guard hasPendingDrawingChange || inkCanvasCoordinator.hasUncommittedChanges else { return }
-        commitCanvasDrawing()
-    }
-
-    // MARK: Document scrolling
-
-    // `PKCanvasViewDelegate` refines `UIScrollViewDelegate`, so the canvas that
-    // owns the document zoom reports its scrolling here directly.
-
-    func scrollViewDidScroll(_ scrollView: UIScrollView) {
-        guard scrollView === canvasView else { return }
-        syncDocumentPlanes()
-    }
-
-    func scrollViewDidZoom(_ scrollView: UIScrollView) {
-        guard scrollView === canvasView else { return }
-        updateCanvasGeometry()
-    }
-
-    func scrollViewWillBeginZooming(_ scrollView: UIScrollView, with view: UIView?) {
-        guard scrollView === canvasView else { return }
-        zoomSettleTask?.cancel()
-        isZoomInteractionActive = true
-        backgroundView.setZoomInteractionActive(true)
-    }
-
-    func scrollViewDidEndZooming(
-        _ scrollView: UIScrollView,
-        with view: UIView?,
-        atScale scale: CGFloat
-    ) {
-        guard scrollView === canvasView else { return }
-        finishZoomInteraction()
-    }
-
-    func scrollViewWillEndDragging(
-        _ scrollView: UIScrollView,
-        withVelocity velocity: CGPoint,
-        targetContentOffset: UnsafeMutablePointer<CGPoint>
-    ) {
-        guard scrollView === canvasView else { return }
-        backgroundView.prefetch(toward: targetContentOffset.pointee)
-    }
-
-    func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
-        guard scrollView === canvasView, !decelerate else { return }
-        backgroundView.finishScrollPrefetch()
-    }
-
-    func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
-        guard scrollView === canvasView else { return }
-        backgroundView.finishScrollPrefetch()
-    }
-}
-
-// MARK: - JotCanvasView
-
-/// Wins only against PencilKit's transient single-tap recognizers. Continuous
-/// drawing, lasso, scroll, and zoom gestures retain priority and can make this
-/// recognizer fail as soon as a touch starts moving.
-@MainActor
-private final class CanvasEditMenuBlockingTapGestureRecognizer: UITapGestureRecognizer {
-
-    var canvasRootViews: [UIView] = []
-    var pencilKitDrawingGestureRecognizers: [UIGestureRecognizer] = []
-
-    override func canPrevent(_ preventedGestureRecognizer: UIGestureRecognizer) -> Bool {
-        if isContinuousGesture(preventedGestureRecognizer) {
-            return false
-        }
-        if isSingleTap(preventedGestureRecognizer)
-            && belongsToCanvasHierarchy(preventedGestureRecognizer)
-        {
-            return true
-        }
-        return super.canPrevent(preventedGestureRecognizer)
-    }
-
-    override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool {
-        if isContinuousGesture(preventingGestureRecognizer) {
-            return true
-        }
-        if isSingleTap(preventingGestureRecognizer)
-            && belongsToCanvasHierarchy(preventingGestureRecognizer)
-        {
-            return false
-        }
-        return super.canBePrevented(by: preventingGestureRecognizer)
-    }
-
-    override func shouldBeRequiredToFail(
-        by otherGestureRecognizer: UIGestureRecognizer
-    ) -> Bool {
-        super.shouldBeRequiredToFail(by: otherGestureRecognizer)
-            || (isSingleTap(otherGestureRecognizer)
-                && belongsToCanvasHierarchy(otherGestureRecognizer))
-    }
-
-    private func isContinuousGesture(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
-        CanvasEditMenuGestureArbitration.isContinuous(
-            gestureRecognizer,
-            drawingGestureRecognizers: pencilKitDrawingGestureRecognizers
-        )
-    }
-
-    private func isSingleTap(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
-        guard let tapGesture = gestureRecognizer as? UITapGestureRecognizer else { return false }
-        return tapGesture.numberOfTapsRequired == 1
-            && tapGesture.numberOfTouchesRequired == 1
-    }
-
-    private func belongsToCanvasHierarchy(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
-        CanvasEditMenuGestureArbitration.belongsToCanvasHierarchy(
-            gestureRecognizer,
-            roots: canvasRootViews
-        )
-    }
-}
-
-@MainActor
-private enum CanvasEditMenuGestureArbitration {
-
-    static func isContinuous(
-        _ gestureRecognizer: UIGestureRecognizer,
-        drawingGestureRecognizers: [UIGestureRecognizer]
-    ) -> Bool {
-        drawingGestureRecognizers.contains { $0 === gestureRecognizer }
-            || gestureRecognizer is UIPanGestureRecognizer
-            || gestureRecognizer is UIPinchGestureRecognizer
-    }
-
-    static func belongsToCanvasHierarchy(
-        _ gestureRecognizer: UIGestureRecognizer,
-        roots: [UIView]
-    ) -> Bool {
-        guard let gestureView = gestureRecognizer.view else { return false }
-        return roots.contains { rootView in
-            gestureView === rootView || gestureView.isDescendant(of: rootView)
+        // Page callbacks commit synchronously to the model. Capture a final
+        // snapshot only if PencilKit has delivered an unreported last sample.
+        for (index, canvas) in pageCanvases {
+            let expected = localDrawing(
+                from: inkCanvasCoordinator.committedDrawing,
+                pageIndices: inkCanvasCoordinator.committedStrokePageIndices,
+                pageIndex: index,
+                overlaySize: pageOverlays[index]?.drawingSize ?? currentPageSize
+            )
+            if !JotEditorDrawingState.drawingsMatch(canvas.drawing, expected) { canvasViewDrawingDidChange(canvas) }
         }
     }
-}
 
-private final class JotCanvasView: PKCanvasView {
-    // Keep PencilKit's selection interaction lifecycle intact. In particular,
-    // do not remove the transient interactions installed by the lasso tool.
-    fileprivate var prioritizedPDFPanRecognizers = Set<ObjectIdentifier>()
-
-    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
-        let result = super.hitTest(point, with: event)
-        let containsPencilTouch = event?.allTouches?.contains { $0.type == .pencil } == true
-        let target = isUserInteractionEnabled && containsPencilTouch && bounds.contains(point)
-            ? self
-            : result
-        #if DEBUG
-        let touchTypes = event?.allTouches?.map { $0.type.rawValue.description }.joined(separator: ",") ?? "none"
-        let message =
-            "🔍 [HitTest] Point: \(point), TouchTypes: \(touchTypes), "
-                + "TargetView: \(target.map { String(describing: type(of: $0)) } ?? "nil"), "
-                + "CanvasFrame: \(frame)"
-        print(message)
-        NSLog("%@", message)
-        #endif
-        return target
-    }
-
-    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-        super.touchesBegan(touches, with: event)
-        #if DEBUG
-        if let touch = touches.first {
-            let message =
-                "✏️ [TouchBegan] Type: \(touch.type.rawValue) "
-                    + "(0: direct/finger, 2: pencil), Force: \(touch.force)"
-            print(message)
-            NSLog("%@", message)
-        }
-        #endif
-    }
 }

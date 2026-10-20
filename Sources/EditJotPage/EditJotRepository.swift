@@ -169,6 +169,7 @@ struct EditJotRepository: EditJotRepositoryProtocol {
         jotFileInfo: JotFile.Info,
         content: JotContent
     ) async throws {
+        let drawingData = content.drawing.dataRepresentation()
         let strokes = content.drawing.strokes
         let strokePageIndices = content.strokePageIndices.count == strokes.count
             ? content.strokePageIndices.map { max(0, $0) }
@@ -178,7 +179,7 @@ struct EditJotRepository: EditJotRepositoryProtocol {
         ).sorted()
         let jot = Jot(
             version: Jot.currentVersion,
-            drawing: content.drawing.dataRepresentation(),
+            drawing: drawingData,
             width: content.width,
             pdfData: content.pdfData,
             extraPages: max(0, content.extraPages),
@@ -207,7 +208,7 @@ struct EditJotRepository: EditJotRepositoryProtocol {
             info: jotFileInfo,
             jot: Jot(
                 version: Jot.currentVersion,
-                drawing: content.drawing.dataRepresentation(),
+                drawing: drawingData,
                 width: content.width,
                 pdfData: savedPDF,
                 extraPages: max(0, content.extraPages),

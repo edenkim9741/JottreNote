@@ -161,8 +161,16 @@ enum HybridPDFManager {
         drawing: PKDrawing,
         strokePageIndices: [Int],
         canvasPageSize: CGSize,
+        canvasPageSpacing: CGFloat = 0,
         dirtyPageIndices: Set<Int>? = nil
     ) throws -> Data {
+        guard canvasPageSize.width.isFinite, canvasPageSize.width > 0,
+              canvasPageSize.height.isFinite, canvasPageSize.height > 0,
+              canvasPageSpacing.isFinite, canvasPageSpacing >= 0 else {
+            throw Failure.invalidDrawing
+        }
+        let canvasPageStride = canvasPageSize.height + canvasPageSpacing
+        guard canvasPageStride.isFinite, canvasPageStride > 0 else { throw Failure.invalidDrawing }
         let cleanPDF = try EmbeddedFileStore.pdfData(from: pdfData)
         guard var document = PDFDocument(data: cleanPDF), document.pageCount > 0 else {
             throw Failure.invalidPDF
@@ -182,7 +190,7 @@ enum HybridPDFManager {
             for (strokeIndex, stroke) in drawing.strokes.enumerated() {
                 let pageIndex = strokePageIndices.indices.contains(strokeIndex)
                     ? strokePageIndices[strokeIndex]
-                    : Int(floor(stroke.renderBounds.midY / canvasPageSize.height))
+                    : Int(floor(stroke.renderBounds.midY / canvasPageStride))
                 pagesWithDrawing.insert(pageIndex)
             }
             // Older/base PDFs may not yet contain any Jottre annotations.
@@ -207,6 +215,7 @@ enum HybridPDFManager {
                 drawing: drawing,
                 strokePageIndices: strokePageIndices,
                 canvasPageSize: canvasPageSize,
+                canvasPageSpacing: canvasPageSpacing,
                 page: page,
                 pageIndex: pageIndex
             )

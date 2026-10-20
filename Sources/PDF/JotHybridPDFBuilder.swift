@@ -31,6 +31,7 @@ enum JotHybridPDFBuilder {
             drawing: drawing,
             strokePageIndices: jot.strokePageIndices,
             canvasPageSize: canvasPageSize,
+            canvasPageSpacing: JotPageLayout.pageSpacing,
             dirtyPageIndices: dirtyPageIndices
         )
     }
@@ -52,12 +53,12 @@ enum JotHybridPDFBuilder {
                 context.fill(pageBounds)
                 context.setStrokeColor(gray: 0.62, alpha: 0.55)
                 context.setLineWidth(0.5)
-                var lineY = pageBounds.minY + 32
+                var lineY = pageBounds.minY + JotPageLayout.ruledLineSpacing
                 while lineY < pageBounds.maxY {
                     context.move(to: CGPoint(x: pageBounds.minX, y: lineY))
                     context.addLine(to: CGPoint(x: pageBounds.maxX, y: lineY))
                     context.strokePath()
-                    lineY += 32
+                    lineY += JotPageLayout.ruledLineSpacing
                 }
             }
         }

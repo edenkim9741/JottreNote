@@ -1,21 +1,3 @@
-/*
- Jottre: Minimalistic jotting for iPhone, iPad and Mac.
- Copyright (C) 2021-2026 Anton Lorani
-
- This program is free software: you can redistribute it and/or modify
- it under the terms of the GNU General Public License as published by
- the Free Software Foundation, either version 3 of the License, or
- (at your option) any later version.
-
- This program is distributed in the hope that it will be useful,
- but WITHOUT ANY WARRANTY; without even the implied warranty of
- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- GNU General Public License for more details.
-
- You should have received a copy of the GNU General Public License
- along with this program.  If not, see <https://www.gnu.org/licenses/>.
-*/
-
 @preconcurrency import PencilKit
 import UIKit
 import XCTest
@@ -23,170 +5,92 @@ import XCTest
 @testable import Jottre
 
 final class CanvasTouchRoutingTests: XCTestCase {
-
-    func testNonLassoDirectTouchIsBlockedFromPencilKitMenu() {
-        XCTAssertTrue(
-            CanvasEditMenuSuppressionPolicy.blocksDirectTouch(
-                isEditingEnabled: true,
-                isLassoTool: false,
-                routesDirectTouchesToDocumentScroll: true
-            )
-        )
-    }
-
-    func testLassoDirectTouchRemainsNative() {
-        XCTAssertFalse(
-            CanvasEditMenuSuppressionPolicy.blocksDirectTouch(
-                isEditingEnabled: true,
-                isLassoTool: true,
-                routesDirectTouchesToDocumentScroll: true
-            )
-        )
-    }
-
-    func testViewOnlyDirectTouchDoesNotNeedMenuBlocker() {
-        XCTAssertFalse(
-            CanvasEditMenuSuppressionPolicy.blocksDirectTouch(
-                isEditingEnabled: false,
-                isLassoTool: false,
-                routesDirectTouchesToDocumentScroll: true
-            )
-        )
-    }
-
-    func testFingerDrawingDirectTouchDoesNotUseMenuBlocker() {
-        XCTAssertFalse(
-            CanvasEditMenuSuppressionPolicy.blocksDirectTouch(
-                isEditingEnabled: true,
-                isLassoTool: false,
-                routesDirectTouchesToDocumentScroll: false
-            )
-        )
+    @MainActor
+    func testAllPencilKitToolsUseNativePencilOnlyInput() {
+        XCTAssertEqual(CanvasTouchRouting.drawingPolicy(for: PKLassoTool()), .pencilOnly)
+        XCTAssertEqual(CanvasTouchRouting.drawingPolicy(for: PKInkingTool(.pen)), .pencilOnly)
+        XCTAssertEqual(CanvasTouchRouting.drawingPolicy(for: PKEraserTool(.bitmap)), .pencilOnly)
     }
 
     @MainActor
-    func testPencilOnlyEditingRoutesOneFingerToDocumentPan() {
-        let configuration = CanvasTouchRouting.configuration(
+    func testDirectTouchesPassThroughOverlayUnlessRulerNeedsFingerInteraction() {
+        XCTAssertTrue(CanvasTouchRouting.shouldPassDirectTouchesThroughOverlay(rulerActive: false))
+        XCTAssertFalse(CanvasTouchRouting.shouldPassDirectTouchesThroughOverlay(rulerActive: true))
+    }
+
+    @MainActor
+    func testPencilOnlyAndViewingModesKeepOneFingerPDFNavigation() {
+        let editing = CanvasTouchRouting.configuration(
             isEditingEnabled: true,
-            drawingPolicy: .pencilOnly,
+            drawingPolicy: CanvasTouchRouting.drawingPolicy(for: PKLassoTool()),
             isToolPickerVisible: true,
             prefersPencilOnlyDrawing: false
         )
-
-        XCTAssertFalse(configuration.isFingerDrawingEnabled)
-        XCTAssertEqual(configuration.documentPanMinimumNumberOfTouches, 1)
-        XCTAssertTrue(configuration.routesDirectTouchesToDocumentScroll)
-    }
-
-    @MainActor
-    func testAnyInputEditingReservesOneFingerForDrawing() {
-        let configuration = CanvasTouchRouting.configuration(
-            isEditingEnabled: true,
-            drawingPolicy: .anyInput,
-            isToolPickerVisible: false,
-            prefersPencilOnlyDrawing: true
-        )
-
-        XCTAssertTrue(configuration.isFingerDrawingEnabled)
-        XCTAssertEqual(configuration.documentPanMinimumNumberOfTouches, 2)
-        XCTAssertFalse(configuration.routesDirectTouchesToDocumentScroll)
-    }
-
-    @MainActor
-    func testDefaultPolicyFollowsVisibleToolPickerPreference() {
-        let anyInput = CanvasTouchRouting.configuration(
-            isEditingEnabled: true,
-            drawingPolicy: .default,
-            isToolPickerVisible: true,
-            prefersPencilOnlyDrawing: false
-        )
-        let pencilOnly = CanvasTouchRouting.configuration(
-            isEditingEnabled: true,
-            drawingPolicy: .default,
-            isToolPickerVisible: true,
-            prefersPencilOnlyDrawing: true
-        )
-
-        XCTAssertTrue(anyInput.isFingerDrawingEnabled)
-        XCTAssertFalse(pencilOnly.isFingerDrawingEnabled)
-    }
-
-    @MainActor
-    func testDefaultPolicyIsPencilOnlyWithoutVisibleToolPicker() {
-        let configuration = CanvasTouchRouting.configuration(
-            isEditingEnabled: true,
-            drawingPolicy: .default,
-            isToolPickerVisible: false,
-            prefersPencilOnlyDrawing: false
-        )
-
-        XCTAssertFalse(configuration.isFingerDrawingEnabled)
-        XCTAssertEqual(configuration.documentPanMinimumNumberOfTouches, 1)
-    }
-
-    @MainActor
-    func testViewOnlyModeAlwaysRoutesOneFingerToDocumentPan() {
-        let configuration = CanvasTouchRouting.configuration(
+        let viewing = CanvasTouchRouting.configuration(
             isEditingEnabled: false,
             drawingPolicy: .anyInput,
             isToolPickerVisible: true,
             prefersPencilOnlyDrawing: false
         )
 
-        XCTAssertFalse(configuration.isFingerDrawingEnabled)
-        XCTAssertEqual(configuration.documentPanMinimumNumberOfTouches, 1)
+        XCTAssertFalse(editing.isFingerDrawingEnabled)
+        XCTAssertEqual(editing.documentPanMinimumNumberOfTouches, 1)
+        XCTAssertEqual(viewing.documentPanMinimumNumberOfTouches, 1)
     }
 
     @MainActor
-    func testApplyingPencilOnlyRoutingDoesNotRewritePencilKitTouchTypes() throws {
-        #if targetEnvironment(macCatalyst)
-        throw XCTSkip("Direct-touch and Apple Pencil routing is unavailable on Mac Catalyst")
-        #else
-        let documentCanvas = PKCanvasView()
-        let directTouch = NSNumber(value: UITouch.TouchType.direct.rawValue)
-        let pencilTouch = NSNumber(value: UITouch.TouchType.pencil.rawValue)
-        documentCanvas.tool = PKLassoTool()
-
-        // PencilKit owns this recognizer and may reconfigure it while lasso is active.
-        documentCanvas.drawingGestureRecognizer.allowedTouchTypes = [directTouch, pencilTouch]
-        let configuration = CanvasTouchRouting.Configuration(isFingerDrawingEnabled: false)
-
-        CanvasTouchRouting.apply(configuration, to: documentCanvas)
-
-        // The canvas owns document navigation, so a single finger pans.
-        XCTAssertTrue(documentCanvas.isScrollEnabled)
-        XCTAssertTrue(documentCanvas.panGestureRecognizer.isEnabled)
-        XCTAssertEqual(documentCanvas.panGestureRecognizer.minimumNumberOfTouches, 1)
-        XCTAssertEqual(documentCanvas.panGestureRecognizer.maximumNumberOfTouches, 2)
-        XCTAssertEqual(
-            documentCanvas.drawingGestureRecognizer.allowedTouchTypes,
-            [directTouch, pencilTouch]
+    func testAnyInputAndDefaultPoliciesSetDocumentPanTouchCount() {
+        let anyInput = CanvasTouchRouting.configuration(
+            isEditingEnabled: true,
+            drawingPolicy: .anyInput,
+            isToolPickerVisible: false,
+            prefersPencilOnlyDrawing: true
         )
+        let systemDefault = CanvasTouchRouting.configuration(
+            isEditingEnabled: true,
+            drawingPolicy: .default,
+            isToolPickerVisible: true,
+            prefersPencilOnlyDrawing: false
+        )
+
+        XCTAssertEqual(anyInput.documentPanMinimumNumberOfTouches, 2)
+        XCTAssertEqual(systemDefault.documentPanMinimumNumberOfTouches, 2)
+    }
+
+    @MainActor
+    func testPDFPanAcceptsFingerOnlyDuringEditingAndRestoresOriginalTypes() throws {
+        #if targetEnvironment(macCatalyst)
+        throw XCTSkip("Touch-type routing is unavailable on Mac Catalyst")
+        #else
+        let pan = UIPanGestureRecognizer()
+        pan.minimumNumberOfTouches = 1
+        let originalTypes = pan.allowedTouchTypes
+        let input = CanvasTouchRouting.Configuration(isFingerDrawingEnabled: false)
+
+        CanvasTouchRouting.apply(input, to: [pan], pencilInputHasPriority: true)
+
+        XCTAssertEqual(pan.allowedTouchTypes, [NSNumber(value: UITouch.TouchType.direct.rawValue)])
+        XCTAssertEqual(pan.minimumNumberOfTouches, 1)
+
+        CanvasTouchRouting.apply(input, to: [pan], pencilInputHasPriority: false)
+        XCTAssertEqual(pan.allowedTouchTypes, originalTypes)
         #endif
     }
 
     @MainActor
-    func testApplyingAnyInputRoutingPreservesFingerLassoAndTwoFingerNavigation() throws {
-        #if targetEnvironment(macCatalyst)
-        throw XCTSkip("Direct-touch and Apple Pencil routing is unavailable on Mac Catalyst")
-        #else
-        let documentCanvas = PKCanvasView()
-        let directTouch = NSNumber(value: UITouch.TouchType.direct.rawValue)
-        let pencilTouch = NSNumber(value: UITouch.TouchType.pencil.rawValue)
-        documentCanvas.tool = PKLassoTool()
-        documentCanvas.drawingGestureRecognizer.allowedTouchTypes = [directTouch, pencilTouch]
-        let configuration = CanvasTouchRouting.Configuration(isFingerDrawingEnabled: true)
+    func testResponderActionsAreUnavailableFromEditorViewsWhileEditing() {
+        let selectAll = #selector(UIResponderStandardEditActions.selectAll(_:))
+        let canvas = JotCanvasView()
+        let pdf = JotPDFView()
+        canvas.suppressesStandardEditActions = true
+        pdf.suppressesStandardEditActions = true
 
-        CanvasTouchRouting.apply(configuration, to: documentCanvas)
+        XCTAssertFalse(canvas.canPerformAction(selectAll, withSender: nil))
+        XCTAssertFalse(pdf.canPerformAction(selectAll, withSender: nil))
 
-        // A finger draws, so navigation needs two touches to stay unambiguous.
-        XCTAssertTrue(documentCanvas.isScrollEnabled)
-        XCTAssertEqual(documentCanvas.panGestureRecognizer.minimumNumberOfTouches, 2)
-        XCTAssertEqual(documentCanvas.panGestureRecognizer.maximumNumberOfTouches, 2)
-        XCTAssertEqual(
-            documentCanvas.drawingGestureRecognizer.allowedTouchTypes,
-            [directTouch, pencilTouch]
-        )
-        #endif
+        canvas.suppressesStandardEditActions = false
+        pdf.suppressesStandardEditActions = false
+        XCTAssertEqual(canvas.suppressesStandardEditActions, false)
+        XCTAssertEqual(pdf.suppressesStandardEditActions, false)
     }
 }

@@ -101,7 +101,7 @@ final class HybridPDFTests: XCTestCase {
     func testPageOverlayDrawingRoundTripsThroughDocumentCoordinates() throws {
         let normalizedPageSize = CGSize(width: 1200, height: 1600)
         let overlaySize = CGSize(width: 640, height: 360)
-        let spacing = JotBackgroundView.pageSpacing
+        let spacing = JotPageLayout.pageSpacing
         let sourceStroke = makeStroke()
         let pageIndex = 2
         let documentStroke = PKStroke(
@@ -463,6 +463,99 @@ final class HybridPDFTests: XCTestCase {
         }
     }
 
+    func testFifteenPagePDFExportKeepsInkInPageLocalCoordinates() throws {
+        let pageCount = 15
+        let sourcePDF = try makePDF(pageSize: CGSize(width: 240, height: 320), pageCount: pageCount)
+        let sourceStroke = makeStroke()
+        let canvasPageSize = CGSize(width: 1200, height: 1600)
+        let pageSpacing = JotPageLayout.pageSpacing
+        let pageStride = canvasPageSize.height + pageSpacing
+        let strokes = (0..<pageCount).map { pageIndex in
+            PKStroke(
+                ink: sourceStroke.ink,
+                path: sourceStroke.path,
+                transform: CGAffineTransform(translationX: 0, y: CGFloat(pageIndex) * pageStride),
+                mask: sourceStroke.mask
+            )
+        }
+        let drawing = PKDrawing(strokes: strokes)
+        let jot = Jot(
+            drawing: drawing.dataRepresentation(),
+            width: canvasPageSize.width,
+            pdfData: sourcePDF,
+            strokePageIndices: Array(0..<pageCount)
+        )
+
+        let exportedData = try JotHybridPDFBuilder.buildHybridPDF(jot: jot)
+        let exported = try XCTUnwrap(PDFDocument(data: HybridPDFManager.pdfData(in: exportedData)))
+        XCTAssertEqual(exported.pageCount, pageCount)
+
+        let renderSize = CGSize(width: 240, height: 320)
+        let firstPagePixels = try pixels(in: XCTUnwrap(exported.page(at: 0)).thumbnail(
+            of: renderSize,
+            for: .mediaBox
+        ))
+        var expectedAnnotationBounds: CGRect?
+        for pageIndex in 0..<pageCount {
+            let page = try XCTUnwrap(exported.page(at: pageIndex))
+            let pageBounds = page.bounds(for: .mediaBox)
+            let annotations = page.annotations.filter {
+                $0.type == "Ink" && $0.contents == PDFAnnotationConverter.marker
+            }
+            XCTAssertEqual(annotations.count, 1, "Page \(pageIndex) should have one vector ink annotation")
+            let bounds = try XCTUnwrap(annotations.first).bounds
+            XCTAssertGreaterThanOrEqual(bounds.minX, pageBounds.minX)
+            XCTAssertGreaterThanOrEqual(bounds.minY, pageBounds.minY)
+            XCTAssertLessThanOrEqual(bounds.maxX, pageBounds.maxX)
+            XCTAssertLessThanOrEqual(bounds.maxY, pageBounds.maxY)
+            if let expectedAnnotationBounds {
+                XCTAssertEqual(bounds.minX, expectedAnnotationBounds.minX, accuracy: 0.01)
+                XCTAssertEqual(bounds.minY, expectedAnnotationBounds.minY, accuracy: 0.01)
+                XCTAssertEqual(bounds.maxX, expectedAnnotationBounds.maxX, accuracy: 0.01)
+                XCTAssertEqual(bounds.maxY, expectedAnnotationBounds.maxY, accuracy: 0.01)
+            } else {
+                expectedAnnotationBounds = bounds
+            }
+
+            let pagePixels = try pixels(in: page.thumbnail(of: renderSize, for: .mediaBox))
+            XCTAssertEqual(pagePixels, firstPagePixels, "Page \(pageIndex) ink should render at the same local position")
+        }
+    }
+
+    @MainActor
+    func testLowResolutionPDFCanDisplayLiveInkAsVectorAtZoomResolution() throws {
+        let fixtureURL = try XCTUnwrap(
+            Bundle(for: Self.self).url(forResource: "pdf-test", withExtension: "pdf")
+        )
+        let sourcePDF = try Data(contentsOf: fixtureURL)
+        let document = try XCTUnwrap(PDFDocument(data: sourcePDF))
+        let page = try XCTUnwrap(document.page(at: 0))
+        let normalizedSize = try PDFLoadService().load(data: sourcePDF).pageSize
+        let renderSize = CGSize(width: 1200, height: 1600)
+        let before = page.thumbnail(of: renderSize, for: .cropBox)
+        let drawing = PKDrawing(strokes: [makeStroke()])
+        let annotations = PDFAnnotationConverter.annotations(
+            drawing: drawing,
+            strokePageIndices: [0],
+            canvasPageSize: normalizedSize,
+            page: page,
+            pageIndex: 0
+        )
+
+        XCTAssertEqual(annotations.count, 1)
+        XCTAssertEqual(annotations[0].type, "Ink")
+        page.addAnnotation(try XCTUnwrap(annotations.first))
+        let annotatedPDF = try XCTUnwrap(document.dataRepresentation())
+        let renderedPage = try XCTUnwrap(PDFDocument(data: annotatedPDF)?.page(at: 0))
+        let after = renderedPage.thumbnail(of: renderSize, for: .cropBox)
+
+        XCTAssertGreaterThan(
+            differingPixelCount(try pixels(in: before), try pixels(in: after)),
+            0,
+            "Live vector ink must render over the low-resolution PDF at the requested zoom resolution."
+        )
+    }
+
     func testStaleUploadCompletionCannotOverwriteNewerEditedPDF() throws {
         let userID = "test-\(UUID().uuidString)"
         let keyAlphabet = Set("23456789ABCDEFGHIJKLMNPQRSTUVWXYZ")
@@ -585,6 +678,9 @@ final class HybridPDFTests: XCTestCase {
             let body: Data
             if request.url?.path.hasSuffix("/deleted") == true {
                 body = try JSONSerialization.data(withJSONObject: ["collections": [], "items": []])
+            } else if request.url?.path.hasSuffix("/collections") == true,
+                      requestHasStartParameter(request) {
+                body = Data("[]".utf8)
             } else {
                 body = Data("{}".utf8)
             }
@@ -907,6 +1003,10 @@ final class HybridPDFTests: XCTestCase {
         try cache.save(snapshot)
 
         ZoteroCreationURLProtocol.configure { request, _ in
+            if request.url?.path.hasSuffix("/collections") == true,
+               requestHasStartParameter(request) {
+                return (200, Data("[]".utf8))
+            }
             if request.url?.path.hasSuffix("/collections") == true {
                 return (304, Data())
             }
@@ -1397,6 +1497,17 @@ final class HybridPDFTests: XCTestCase {
         return try XCTUnwrap(document.dataRepresentation())
     }
 
+    private func makePDF(pageSize: CGSize, pageCount: Int) throws -> Data {
+        let renderer = UIGraphicsPDFRenderer(bounds: CGRect(origin: .zero, size: pageSize))
+        return renderer.pdfData { context in
+            for _ in 0..<pageCount {
+                context.beginPage()
+                UIColor.white.setFill()
+                context.cgContext.fill(CGRect(origin: .zero, size: pageSize))
+            }
+        }
+    }
+
     private func makeTwoPagePDF() throws -> Data {
         let size = CGSize(width: 240, height: 320)
         let renderer = UIGraphicsPDFRenderer(bounds: CGRect(origin: .zero, size: size))
@@ -1509,6 +1620,14 @@ private actor SyncQueueCounter {
     func recordUpload() { uploads += 1 }
     func recordDownload() { downloads += 1 }
     var counts: (uploads: Int, downloads: Int) { (uploads, downloads) }
+}
+
+private func requestHasStartParameter(_ request: URLRequest) -> Bool {
+    guard let url = request.url,
+          let queryItems = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems else {
+        return false
+    }
+    return queryItems.contains { $0.name == "start" }
 }
 
 private final class ZoteroCreationURLProtocol: URLProtocol, @unchecked Sendable {

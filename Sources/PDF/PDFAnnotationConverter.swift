@@ -13,22 +13,26 @@ enum PDFAnnotationConverter {
         drawing: PKDrawing,
         strokePageIndices: [Int],
         canvasPageSize: CGSize,
+        canvasPageSpacing: CGFloat = 0,
         page: PDFPage,
         pageIndex: Int
     ) -> [PDFAnnotation] {
-        guard canvasPageSize.width > 0, canvasPageSize.height > 0 else { return [] }
+        guard canvasPageSize.width > 0, canvasPageSize.height > 0,
+              canvasPageSpacing.isFinite, canvasPageSpacing >= 0 else { return [] }
         let pageBounds = page.bounds(for: .cropBox)
         guard pageBounds.width > 0, pageBounds.height > 0 else { return [] }
 
         let pageDisplaySize = displaySize(for: pageBounds, rotation: page.rotation)
         let scaleX = pageDisplaySize.width / canvasPageSize.width
         let scaleY = pageDisplaySize.height / canvasPageSize.height
-        guard scaleX.isFinite, scaleY.isFinite, scaleX > 0, scaleY > 0 else { return [] }
+        let pageStride = canvasPageSize.height + canvasPageSpacing
+        guard pageStride.isFinite, pageStride > 0,
+              scaleX.isFinite, scaleY.isFinite, scaleX > 0, scaleY > 0 else { return [] }
 
         return drawing.strokes.enumerated().compactMap { index, stroke -> PDFAnnotation? in
             let resolvedPageIndex = index < strokePageIndices.count
                 ? strokePageIndices[index]
-                : Int(floor(stroke.renderBounds.midY / canvasPageSize.height))
+                : Int(floor(stroke.renderBounds.midY / pageStride))
             guard resolvedPageIndex == pageIndex else { return nil }
 
             let path = UIBezierPath()
@@ -36,10 +40,12 @@ enum PDFAnnotationConverter {
             path.lineJoinStyle = .round
             let points = stroke.path.map { point in
                 let location = point.location.applying(stroke.transform)
+                let localX = min(max(location.x, 0), canvasPageSize.width)
+                let localY = min(max(location.y - CGFloat(pageIndex) * pageStride, 0), canvasPageSize.height)
                 return pdfPoint(
                     fromCanvasPoint: CGPoint(
-                        x: location.x * scaleX,
-                        y: (location.y - CGFloat(pageIndex) * canvasPageSize.height) * scaleY
+                        x: localX * scaleX,
+                        y: localY * scaleY
                     ),
                     pageBounds: pageBounds,
                     rotation: page.rotation,

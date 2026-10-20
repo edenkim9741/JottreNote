@@ -405,7 +405,7 @@ extension EditJotViewModel {
     func addPage(afterPageIndex: Int?) {
         guard isPersistenceReady else { return }
         let pageHeight = normalizedPageHeight()
-        let pageStride = pageHeight + JotBackgroundView.pageSpacing
+        let pageStride = pageHeight + JotPageLayout.pageSpacing
         let totalPages = logicalPageCount()
         guard totalPages < Self.maximumPageCount else { return }
 
@@ -527,7 +527,7 @@ extension EditJotViewModel {
         guard totalPages > 1 else { return }
 
         let pageHeight = normalizedPageHeight()
-        let pageStride = pageHeight + JotBackgroundView.pageSpacing
+        let pageStride = pageHeight + JotPageLayout.pageSpacing
         let deleteIndex = index.map { min(max(0, $0), totalPages - 1) } ?? (totalPages - 1)
         let fullPDF: Data
         let pagePDFData: Data
@@ -579,7 +579,7 @@ extension EditJotViewModel {
         guard isPersistenceReady,
               let trashedPage = trashedPages.first(where: { $0.id == id }) else { return false }
         let pageHeight = normalizedPageHeight()
-        let pageStride = pageHeight + JotBackgroundView.pageSpacing
+        let pageStride = pageHeight + JotPageLayout.pageSpacing
         let pageSize = CGSize(width: currentWidth, height: pageHeight)
         let currentPageCount = logicalPageCount()
         let insertionIndex = min(max(0, trashedPage.originalIndex), currentPageCount)
@@ -801,7 +801,7 @@ extension EditJotViewModel {
     }
 
     fileprivate func pageIndex(for stroke: PKStroke) -> Int {
-        let stride = normalizedPageHeight() + JotBackgroundView.pageSpacing
+        let stride = normalizedPageHeight() + JotPageLayout.pageSpacing
         guard stride.isFinite, stride > 0 else { return 0 }
         let value = floor(stroke.renderBounds.midY / stride)
         guard value.isFinite, value > 0 else { return 0 }
