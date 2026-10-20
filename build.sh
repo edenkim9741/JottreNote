@@ -17,7 +17,7 @@ xcodebuild \
   -destination 'generic/platform=iOS' \
   -derivedDataPath "$DERIVED_DATA" \
   -allowProvisioningUpdates \
-  MARKETING_VERSION=2.1.8 \
+  MARKETING_VERSION=2.1.10 \
   CURRENT_PROJECT_VERSION=0 \
   build
 
