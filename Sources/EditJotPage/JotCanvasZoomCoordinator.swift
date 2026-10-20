@@ -195,6 +195,7 @@ final class JotCanvasZoomCoordinator: NSObject, UIGestureRecognizerDelegate {
         let scrollView = documentScrollView(in: pdfView)
         let target = pageScales.scale(for: nextFitMode)
         nextFitMode = nextFitMode.next
+        let tapInPage = pdfView.convert(tapInPDFView, to: page)
         guard let scaleRange = Self.expandedScaleRange(
             minimum: pdfView.minScaleFactor,
             maximum: pdfView.maxScaleFactor,
@@ -208,26 +209,78 @@ final class JotCanvasZoomCoordinator: NSObject, UIGestureRecognizerDelegate {
         pdfView.minScaleFactor = scaleRange.minimum
         pdfView.maxScaleFactor = scaleRange.maximum
         settleTask?.cancel()
-        let oldScale = pdfView.scaleFactor
         UIView.animate(withDuration: 0.25, delay: 0, options: [.beginFromCurrentState, .curveEaseInOut]) {
             pdfView.autoScales = false
             pdfView.scaleFactor = target
+        } completion: { [weak self] _ in
+            // PDFKit updates documentView/contentSize/insets after scaleFactor
+            // changes. Anchor against the final page transform, never the
+            // stale scroll geometry from the animation block.
+            pdfView.setNeedsLayout()
+            pdfView.layoutIfNeeded()
+            pdfView.documentView?.setNeedsLayout()
+            pdfView.documentView?.layoutIfNeeded()
+            scrollView?.setNeedsLayout()
+            scrollView?.layoutIfNeeded()
             if let scrollView {
-                // PDFKit applies scaleFactor around the viewport center. Shift
-                // its document scroll offset to keep the tapped PDF location
-                // anchored even when safe areas or split view offset the center.
-                let ratio = target / oldScale
-                let delta = CGPoint(
-                    x: (tapInPDFView.x - viewport.midX) * (ratio - 1),
-                    y: (tapInPDFView.y - viewport.midY) * (ratio - 1)
-                )
-                scrollView.setContentOffset(
-                    CGPoint(x: scrollView.contentOffset.x + delta.x, y: scrollView.contentOffset.y + delta.y),
-                    animated: false
+                self?.alignPageAfterZoom(
+                    page: page,
+                    pagePoint: tapInPage,
+                    tapPoint: tapInPDFView,
+                    viewport: viewport,
+                    pdfView: pdfView,
+                    scrollView: scrollView
                 )
             }
-        } completion: { [weak self] _ in
             self?.schedule(delay: .milliseconds(40))
+        }
+    }
+
+    private func alignPageAfterZoom(
+        page: PDFPage,
+        pagePoint: CGPoint,
+        tapPoint: CGPoint,
+        viewport: CGRect,
+        pdfView: PDFView,
+        scrollView: UIScrollView
+    ) {
+        let pageRect = pdfView.convert(page.bounds(for: .cropBox), from: page)
+        let pointInPDFView = pdfView.convert(pagePoint, from: page)
+        let pointInScrollView = pdfView.convert(pointInPDFView, to: scrollView)
+
+        // PDFKit centers axes whose content is smaller than the viewport. Keep
+        // that native policy; only adjust axes that actually scroll.
+        let scrollsHorizontally = pageRect.width > viewport.width + 0.5
+            && scrollView.contentSize.width > scrollView.bounds.width + 0.5
+        let scrollsVertically = pageRect.height > viewport.height + 0.5
+            && scrollView.contentSize.height > scrollView.bounds.height + 0.5
+        guard scrollsHorizontally || scrollsVertically else { return }
+
+        let targetInPDFView = CGPoint(
+            x: scrollsHorizontally ? tapPoint.x : pageRect.midX,
+            y: scrollsVertically ? tapPoint.y : pageRect.midY
+        )
+        let targetInScrollView = pdfView.convert(targetInPDFView, to: scrollView)
+        let delta = CGPoint(
+            x: scrollsHorizontally ? pointInScrollView.x - targetInScrollView.x : 0,
+            y: scrollsVertically ? pointInScrollView.y - targetInScrollView.y : 0
+        )
+        let inset = scrollView.adjustedContentInset
+        let minimumOffset = CGPoint(x: -inset.left, y: -inset.top)
+        let maximumOffset = CGPoint(
+            x: max(minimumOffset.x, scrollView.contentSize.width - scrollView.bounds.width + inset.right),
+            y: max(minimumOffset.y, scrollView.contentSize.height - scrollView.bounds.height + inset.bottom)
+        )
+        let desiredOffset = CGPoint(
+            x: min(max(scrollView.contentOffset.x + delta.x, minimumOffset.x), maximumOffset.x),
+            y: min(max(scrollView.contentOffset.y + delta.y, minimumOffset.y), maximumOffset.y)
+        )
+        if abs(desiredOffset.x - scrollView.contentOffset.x) > 0.5
+            || abs(desiredOffset.y - scrollView.contentOffset.y) > 0.5
+        {
+            scrollView.setContentOffset(desiredOffset, animated: false)
+            pdfView.layoutIfNeeded()
+            scrollView.layoutIfNeeded()
         }
     }
 

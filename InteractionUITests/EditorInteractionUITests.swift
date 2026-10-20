@@ -144,47 +144,112 @@ final class EditorInteractionUITests: XCTestCase {
         XCTAssertFalse(app.buttons["Insert Space"].exists)
     }
 
-    func testFingerDoubleTapZoomsAroundTapAndReturnsToFit() async throws {
+    func testFingerDoubleTapAlternatesPageFitAndKeepsPDFLayoutAligned() async throws {
         let app = launch(tool: "pen")
         let page = app.staticTexts["editor.page.0"]
         XCTAssertTrue(page.waitForExistence(timeout: 15))
 
         let initial = try info(page)
-        let initialScale = try XCTUnwrap(initial["scaleFactor"] as? Double)
         let initialPageRect = try XCTUnwrap(initial["rect"] as? [Double])
+        let initialViewport = try XCTUnwrap(initial["viewportRect"] as? [Double])
         let anchorX = initialPageRect[0] + initialPageRect[2] * 0.32
         let anchorY = initialPageRect[1] + initialPageRect[3] * 0.38
         let zoomTap = app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: anchorX, dy: anchorY))
         zoomTap.doubleTap()
 
         var zoomed = try info(page)
-        for _ in 0..<20 where (zoomed["scaleFactor"] as? Double ?? 0) <= initialScale * 1.1 {
+        for _ in 0..<30 where abs(((zoomed["rect"] as? [Double])?[2] ?? 0) - initialViewport[2]) > 8 {
             try await Task.sleep(for: .milliseconds(100))
             zoomed = try info(page)
         }
-        let zoomedScale = try XCTUnwrap(zoomed["scaleFactor"] as? Double)
-        XCTAssertGreaterThan(zoomedScale, initialScale * 1.1)
         let pageRect = try XCTUnwrap(zoomed["rect"] as? [Double])
+        let viewportRect = try XCTUnwrap(zoomed["viewportRect"] as? [Double])
         let canvasRect = try XCTUnwrap(zoomed["canvasRect"] as? [Double])
-        XCTAssertEqual(anchorX,
-            pageRect[0] + pageRect[2] * 0.32, accuracy: 8,
-            "The tapped PDF point should remain near its original screen position")
-        XCTAssertEqual(anchorY,
-            pageRect[1] + pageRect[3] * 0.38, accuracy: 8,
-            "The tapped PDF point should remain near its original screen position")
+        XCTAssertEqual(pageRect[2], viewportRect[2], accuracy: 8,
+            "The first double tap should fit the page's short side to the viewport")
+        XCTAssertEqual(anchorY, pageRect[1] + pageRect[3] * 0.38, accuracy: 10,
+            "The zoom should keep the tapped point anchored on the scrollable axis")
         for index in 0..<4 {
             XCTAssertEqual(canvasRect[index], pageRect[index], accuracy: 2,
                 "PDF page and PencilKit canvas must remain registered after zoom")
         }
 
-        zoomTap.doubleTap()
-        var restored = try info(page)
-        for _ in 0..<20 where (restored["scaleFactor"] as? Double ?? .greatestFiniteMagnitude) >= zoomedScale * 0.9 {
+        let secondTap = try point(app, info: zoomed, x: 0.75, y: 0.45)
+        secondTap.doubleTap()
+        var fitted = try info(page)
+        for _ in 0..<30 where abs(((fitted["rect"] as? [Double])?[3] ?? 0) - viewportRect[3]) > 8 {
             try await Task.sleep(for: .milliseconds(100))
-            restored = try info(page)
+            fitted = try info(page)
         }
-        let restoredScale = try XCTUnwrap(restored["scaleFactor"] as? Double)
-        XCTAssertEqual(restoredScale, initialScale, accuracy: 0.05)
+        let fittedRect = try XCTUnwrap(fitted["rect"] as? [Double])
+        let fittedViewport = try XCTUnwrap(fitted["viewportRect"] as? [Double])
+        let fittedCanvas = try XCTUnwrap(fitted["canvasRect"] as? [Double])
+        XCTAssertEqual(fittedRect[3], fittedViewport[3], accuracy: 8,
+            "The next double tap should fit the page's long side to the viewport")
+        XCTAssertEqual(fittedRect[0] + fittedRect[2] / 2,
+            fittedViewport[0] + fittedViewport[2] / 2, accuracy: 8,
+            "PDFKit should center a page narrower than the viewport")
+        for index in 0..<4 {
+            XCTAssertEqual(fittedCanvas[index], fittedRect[index], accuracy: 2)
+        }
+    }
+
+    func testRulerStateSurvivesPageSwitchAndZoomNavigation() async throws {
+        let app = launch(tool: "pen")
+        let first = app.staticTexts["editor.page.0"]
+        XCTAssertTrue(first.waitForExistence(timeout: 15))
+        let rulerButton = app.buttons["Ruler"]
+        XCTAssertTrue(rulerButton.waitForExistence(timeout: 10))
+        rulerButton.tap()
+
+        var state = try info(first)
+        for _ in 0..<20 where state["canvasRulerActive"] as? Bool != true {
+            try await Task.sleep(for: .milliseconds(100))
+            state = try info(first)
+        }
+        XCTAssertEqual(state["pickerRulerActive"] as? Bool, true)
+        XCTAssertEqual(state["canvasRulerActive"] as? Bool, true,
+            "The active page canvas must retain the Picker's ruler state")
+        let rulerScreenshot = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        rulerScreenshot.name = "Ruler active on page 1"
+        rulerScreenshot.lifetime = .keepAlways
+        add(rulerScreenshot)
+
+        let nextPageButton = app.buttons["editor.test.nextPage"]
+        XCTAssertTrue(nextPageButton.waitForExistence(timeout: 5))
+        nextPageButton.tap()
+        let second = app.staticTexts["editor.page.1"]
+        XCTAssertTrue(second.waitForExistence(timeout: 5))
+        state = try info(second)
+        for _ in 0..<20 where state["currentPageIndex"] as? Int != 1 {
+            try await Task.sleep(for: .milliseconds(100))
+            state = try info(second)
+        }
+        XCTAssertEqual(state["currentPageIndex"] as? Int, 1,
+            "The test must check the selected page rather than a prefetched overlay")
+        XCTAssertEqual(state["pickerRulerActive"] as? Bool, true)
+        XCTAssertEqual(state["canvasRulerActive"] as? Bool, true,
+            "The newly active page must inherit the active ruler")
+        let nextPageRulerScreenshot = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        nextPageRulerScreenshot.name = "Ruler remains visible after page change"
+        nextPageRulerScreenshot.lifetime = .keepAlways
+        add(nextPageRulerScreenshot)
+
+        try point(app, info: state, x: 0.5, y: 0.5).doubleTap()
+        try await Task.sleep(for: .milliseconds(450))
+        state = try info(second)
+        XCTAssertEqual(state["pickerRulerActive"] as? Bool, true)
+        XCTAssertEqual(state["canvasRulerActive"] as? Bool, true,
+            "Zoom and overlay geometry updates must not deactivate the ruler")
+
+        rulerButton.tap()
+        state = try info(second)
+        for _ in 0..<20 where state["canvasRulerActive"] as? Bool != false {
+            try await Task.sleep(for: .milliseconds(100))
+            state = try info(second)
+        }
+        XCTAssertEqual(state["pickerRulerActive"] as? Bool, false)
+        XCTAssertEqual(state["canvasRulerActive"] as? Bool, false)
     }
 
     func testColdLaunchAfterEditingReturnsToLibrary() {
