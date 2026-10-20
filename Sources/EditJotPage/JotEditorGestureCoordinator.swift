@@ -5,29 +5,17 @@ import UIKit
 /// Applies PencilKit's native input policy to visible page overlays and keeps
 /// direct-touch navigation on PDFKit's own scroll views.
 @MainActor
-final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
+final class JotEditorGestureCoordinator: NSObject {
     private unowned let pdfView: JotPDFView
     private var isEditingEnabled = false
     private var selectedTool: any PKTool = PKInkingTool(.pen)
     private var isRulerActive = false
     private var activePageIndex: Int?
-    private(set) var incidentalEditMenuBlocker: UILongPressGestureRecognizer
-    private let protectedPDFLongPresses = NSHashTable<UILongPressGestureRecognizer>.weakObjects()
+    private let editMenuInteractions = JotEditMenuInteractionController()
 
     init(pdfView: JotPDFView) {
         self.pdfView = pdfView
-        let blocker = UILongPressGestureRecognizer(target: nil, action: nil)
-        blocker.minimumPressDuration = 0.45
-        blocker.cancelsTouchesInView = false
-        blocker.delaysTouchesBegan = false
-        blocker.delaysTouchesEnded = false
-        blocker.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
-        blocker.isEnabled = false
-        incidentalEditMenuBlocker = blocker
         super.init()
-        blocker.delegate = self
-        blocker.addTarget(self, action: #selector(incidentalEditMenuLongPressRecognized(_:)))
-        pdfView.addGestureRecognizer(blocker)
     }
 
     func update(
@@ -53,18 +41,18 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
             tool: tool
         )
         pdfView.suppressesStandardEditActions = suppressesEditActions
-        incidentalEditMenuBlocker.isEnabled = CanvasTouchRouting.shouldBlockIncidentalEditMenu(
+        let suppressesNativeEditMenus = CanvasTouchRouting.shouldSuppressNativeEditMenuInteractions(
             isEditing: isEditing,
-            tool: tool,
-            rulerActive: rulerActive
+            tool: tool
         )
-        installPDFLongPressFailureDependencies()
+        editMenuInteractions.apply(suppressed: suppressesNativeEditMenus, in: pdfView)
 
         for (index, overlay) in overlays {
             guard let canvas = overlay.canvas as? JotCanvasView else { continue }
             configure(canvas, overlay: overlay)
             canvas.suppressesStandardEditActions = suppressesEditActions
             canvas.isRulerActive = isEditingEnabled && self.isRulerActive && index == self.activePageIndex
+            editMenuInteractions.apply(suppressed: suppressesNativeEditMenus, in: overlay)
         }
 
         let input = CanvasTouchRouting.configuration(
@@ -96,25 +84,21 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
             isEditing: isEditingEnabled,
             tool: selectedTool
         )
+        editMenuInteractions.apply(
+            suppressed: CanvasTouchRouting.shouldSuppressNativeEditMenuInteractions(
+                isEditing: isEditingEnabled,
+                tool: selectedTool
+            ),
+            in: overlay
+        )
         canvas.isRulerActive = isEditingEnabled && isRulerActive && pageIndex == activePageIndex
     }
 
     func detach(_ canvas: JotCanvasView) {
+        editMenuInteractions.restore(in: canvas)
         canvas.isRulerActive = false
         canvas.isUserInteractionEnabled = false
         canvas.delegate = nil
-    }
-
-    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
-        guard gestureRecognizer === incidentalEditMenuBlocker else { return true }
-        return CanvasTouchRouting.shouldBlockIncidentalEditMenu(for: touch.type)
-    }
-
-    func gestureRecognizer(
-        _ gestureRecognizer: UIGestureRecognizer,
-        shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
-    ) -> Bool {
-        gestureRecognizer === incidentalEditMenuBlocker || otherGestureRecognizer === incidentalEditMenuBlocker
     }
 
     func pdfNavigationScrollViews() -> [UIScrollView] {
@@ -142,30 +126,6 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
         }
     }
 
-    private func installPDFLongPressFailureDependencies() {
-        guard incidentalEditMenuBlocker.isEnabled else { return }
-
-        func install(in view: UIView) {
-            guard !(view is PKCanvasView), !(view is JotPDFPageCanvasOverlay) else { return }
-            for recognizer in view.gestureRecognizers ?? [] {
-                guard let longPress = recognizer as? UILongPressGestureRecognizer,
-                    longPress !== incidentalEditMenuBlocker,
-                    !protectedPDFLongPresses.contains(longPress)
-                else { continue }
-                // PDFKit's text-selection long presses wait for this direct-
-                // touch recognizer. A stationary finger press is consumed in
-                // normal ink/eraser mode; moving touches still fail it and
-                // continue through PDFKit's pan and pinch recognizers.
-                longPress.require(toFail: incidentalEditMenuBlocker)
-                protectedPDFLongPresses.add(longPress)
-            }
-            for child in view.subviews { install(in: child) }
-        }
-        install(in: pdfView)
-    }
-
-    @objc private func incidentalEditMenuLongPressRecognized(_ recognizer: UILongPressGestureRecognizer) {}
-
     private func toolsMatch(_ lhs: any PKTool, _ rhs: any PKTool) -> Bool {
         if let left = lhs as? PKInkingTool, let right = rhs as? PKInkingTool {
             return left.inkType == right.inkType && left.color.isEqual(right.color) && left.width == right.width
@@ -177,8 +137,95 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
     }
 }
 
-/// PDFKit and PencilKit remain responsible for their own native recognizers.
-/// The editor only suppresses responder actions while a page is being edited.
+/// PDFKit and PencilKit retain their native recognizers and touch routing.
+/// Standard responder actions remain suppressed for ordinary ink tools.
+/// Keeps PDFKit/PencilKit's native edit-menu interactions intact, but removes
+/// only those interactions while pen or eraser input is active. The same
+/// interaction objects are restored for lasso and when editing ends.
+@MainActor
+final class JotEditMenuInteractionController {
+    private final class DetachedInteraction {
+        weak var owner: UIView?
+        let interaction: UIEditMenuInteraction
+
+        init(owner: UIView, interaction: UIEditMenuInteraction) {
+            self.owner = owner
+            self.interaction = interaction
+        }
+    }
+
+    private var detached: [ObjectIdentifier: DetachedInteraction] = [:]
+    #if DEBUG
+    private var diagnosed = Set<ObjectIdentifier>()
+    #endif
+
+    var detachedCount: Int { detached.count }
+
+    func apply(suppressed: Bool, in root: UIView) {
+        detached = detached.filter { $0.value.owner != nil }
+        if suppressed {
+            visit(root) { owner in
+                for interaction in owner.interactions.compactMap({ $0 as? UIEditMenuInteraction }) {
+                    let key = ObjectIdentifier(interaction)
+                    diagnose(interaction, owner: owner)
+                    guard detached[key] == nil else {
+                        owner.removeInteraction(interaction)
+                        continue
+                    }
+                    detached[key] = DetachedInteraction(owner: owner, interaction: interaction)
+                    owner.removeInteraction(interaction)
+                }
+            }
+        } else {
+            restore(in: root)
+        }
+    }
+
+    func restore(in root: UIView) {
+        let keys = detached.compactMap { entry -> ObjectIdentifier? in
+            let (key, record) = entry
+            guard let owner = record.owner,
+                owner === root || owner.isDescendant(of: root)
+            else { return nil }
+            return key
+        }
+        for key in keys {
+            guard let record = detached.removeValue(forKey: key), let owner = record.owner else { continue }
+            if !owner.interactions.contains(where: { $0 === record.interaction }) {
+                owner.addInteraction(record.interaction)
+            }
+        }
+    }
+
+    private func visit(_ view: UIView, body: (UIView) -> Void) {
+        body(view)
+        for child in view.subviews { visit(child, body: body) }
+    }
+
+    private func diagnose(_ interaction: UIEditMenuInteraction, owner: UIView) {
+        #if DEBUG
+        let key = ObjectIdentifier(interaction)
+        guard diagnosed.insert(key).inserted else { return }
+        var hierarchy: [String] = []
+        var current: UIView? = owner
+        while let view = current {
+            hierarchy.append(String(describing: type(of: view)))
+            current = view.superview
+        }
+        let responder = owner.window.flatMap(firstResponder(in:)).map { String(describing: type(of: $0)) } ?? "none"
+        print("[EditMenuDiagnostic] UIEditMenuInteraction owner=\(type(of: owner)) path=\(hierarchy.joined(separator: " <- ")) delegate=\(interaction.delegate.map { String(describing: type(of: $0)) } ?? "system") firstResponder=\(responder)")
+        #endif
+    }
+
+    private func firstResponder(in view: UIView) -> UIResponder? {
+        if view.isFirstResponder { return view }
+        for child in view.subviews {
+            if let responder = firstResponder(in: child) { return responder }
+        }
+        return nil
+    }
+}
+
 final class JotPDFView: PDFView {
     var suppressesStandardEditActions = false
 

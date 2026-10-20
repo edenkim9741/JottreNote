@@ -1,5 +1,6 @@
 import XCTest
 import UIKit
+@preconcurrency import PencilKit
 
 @MainActor
 final class EditorInteractionUITests: XCTestCase {
@@ -65,7 +66,7 @@ final class EditorInteractionUITests: XCTestCase {
         XCTAssertFalse(app.staticTexts["Insert Space"].exists)
     }
 
-    func testFingerPinchStillZoomsWithIncidentalMenuBlocker() async throws {
+    func testFingerPinchStillZoomsWithNativeMenuSuppression() async throws {
         let app = launch(tool: "pen")
         let page = app.staticTexts["editor.page.0"]
         XCTAssertTrue(page.waitForExistence(timeout: 15))
@@ -79,6 +80,53 @@ final class EditorInteractionUITests: XCTestCase {
             after = try info(page)
         }
         XCTAssertGreaterThan(try XCTUnwrap(after["scaleFactor"] as? Double), before * 1.1)
+    }
+
+    func testBlankNoteKeepsPencilKitDrawingAndSuppressesRepeatedFingerEditMenus() async throws {
+        let app = launch(tool: "blank-pen")
+        let page = app.staticTexts["editor.page.0"]
+        XCTAssertTrue(page.waitForExistence(timeout: 15))
+        let pen = app.buttons["Pen"]
+        XCTAssertTrue(pen.waitForExistence(timeout: 5))
+        if try info(page)["tool"] as? String != "pen" {
+            pen.tap()
+        }
+
+        var state = try info(page)
+        XCTAssertEqual(state["blankNoteFixture"] as? Bool, true,
+            "This regression must use a note whose persisted pdfData is nil")
+        XCTAssertGreaterThan(state["strokes"] as? Int ?? 0, 0,
+            "The blank note fixture starts with PencilKit ink already written")
+        XCTAssertEqual(state["drawingPolicy"] as? UInt, PKCanvasViewDrawingPolicy.pencilOnly.rawValue)
+        XCTAssertEqual(state["input"] as? Bool, true)
+        XCTAssertEqual(state["drawingGesture"] as? Bool, true)
+
+        // This fixture has a nil source PDF plus a previously written PKDrawing.
+        // Tap several blank ruled-paper locations as the finger side of the
+        // reported Apple Pencil + finger regression.
+        for (index, position) in [(0.18, 0.27), (0.82, 0.36), (0.25, 0.72), (0.7, 0.81)].enumerated() {
+            state = try info(page)
+            try point(app, info: state, x: position.0, y: position.1).tap()
+            try await Task.sleep(for: .milliseconds(250))
+            XCTAssertFalse(app.menuItems["Select All"].exists, "Unexpected Select All menu after finger tap \(index + 1)")
+            XCTAssertFalse(app.buttons["Insert Space"].exists, "Unexpected Insert Space menu after finger tap \(index + 1)")
+        }
+
+        // Exercise the longer stationary touch that can trigger UIKit edit
+        // menus on devices where the menu appears after a tap/hold sequence.
+        state = try info(page)
+        try point(app, info: state, x: 0.48, y: 0.5).press(forDuration: 1.0)
+        XCTAssertFalse(app.menuItems["Select All"].exists)
+        XCTAssertFalse(app.buttons["Insert Space"].exists)
+
+        state = try info(page)
+        XCTAssertEqual(state["strokes"] as? Int, 1,
+            "Finger navigation must not modify or erase the existing PencilKit drawing")
+        XCTAssertEqual(state["canvasEditMenuInteractions"] as? [String], [],
+            "Native UIEditMenuInteraction should be absent from the canvas during ordinary ink input")
+        XCTAssertEqual(state["pdfEditMenuInteractions"] as? [String], [],
+            "PDFKit's edit menu interaction should also be absent while editing with the pen")
+        XCTAssertEqual(state["drawingGesture"] as? Bool, true)
     }
 
     func testEraserModeAlsoSuppressesIncidentalFingerMenu() throws {

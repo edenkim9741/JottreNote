@@ -24,12 +24,8 @@ enum CanvasTouchRouting {
         isEditing && !(tool is PKLassoTool)
     }
 
-    static func shouldBlockIncidentalEditMenu(isEditing: Bool, tool: any PKTool, rulerActive: Bool) -> Bool {
-        isEditing && !rulerActive && !(tool is PKLassoTool)
-    }
-
-    static func shouldBlockIncidentalEditMenu(for touchType: UITouch.TouchType) -> Bool {
-        touchType == .direct
+    static func shouldSuppressNativeEditMenuInteractions(isEditing: Bool, tool: any PKTool) -> Bool {
+        isEditing && !(tool is PKLassoTool)
     }
 
     struct Configuration: Equatable, Sendable {

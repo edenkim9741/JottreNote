@@ -40,7 +40,7 @@ final class EditorTransitionAndSortingTests: XCTestCase {
             activePageIndex: 0,
             overlays: [0: page]
         )
-        XCTAssertTrue(coordinator.incidentalEditMenuBlocker.isEnabled)
+        XCTAssertTrue(CanvasTouchRouting.shouldSuppressNativeEditMenuInteractions(isEditing: true, tool: PKEraserTool(.bitmap)))
         XCTAssertTrue(canvas.suppressesStandardEditActions)
         XCTAssertFalse(canvas.canPerformAction(#selector(UIResponderStandardEditActions.selectAll(_:)), withSender: nil))
     }
@@ -166,13 +166,42 @@ final class EditorTransitionAndSortingTests: XCTestCase {
         XCTAssertEqual(canvas.drawingPolicy, .pencilOnly)
         XCTAssertFalse(canvas.suppressesStandardEditActions)
         XCTAssertFalse(pdf.suppressesStandardEditActions)
-        XCTAssertFalse(coordinator.incidentalEditMenuBlocker.isEnabled)
+        XCTAssertFalse(CanvasTouchRouting.shouldSuppressNativeEditMenuInteractions(isEditing: true, tool: PKLassoTool()))
         XCTAssertFalse(canvas.isScrollEnabled)
         XCTAssertEqual(scroll.panGestureRecognizer.minimumNumberOfTouches, 1)
         XCTAssertFalse(coordinator.pdfNavigationScrollViews().contains { $0 === canvas })
     }
 
-    func testRulerFingerInteractionIsExcludedFromIncidentalMenuBlocker() {
+    func testCanvasEditMenuInteractionTracksInkAndLassoToolsWithoutDisablingDrawing() throws {
+        let pdf = JotPDFView()
+        let page = overlay()
+        pdf.addSubview(page)
+        let canvas = try XCTUnwrap(page.canvas as? JotCanvasView)
+        let editMenu = UIEditMenuInteraction(delegate: nil)
+        canvas.addInteraction(editMenu)
+        let pdfKitMenu = try XCTUnwrap(pdf.interactions.compactMap { $0 as? UIEditMenuInteraction }.first)
+        let coordinator = JotEditorGestureCoordinator(pdfView: pdf)
+
+        coordinator.update(isEditing: true, tool: PKInkingTool(.pen), pickerVisible: true,
+            rulerActive: false, activePageIndex: 0, overlays: [0: page])
+        XCTAssertFalse(canvas.interactions.contains { $0 === editMenu })
+        XCTAssertFalse(pdf.interactions.contains { $0 === pdfKitMenu })
+        XCTAssertTrue(canvas.isUserInteractionEnabled)
+        XCTAssertTrue(canvas.drawingGestureRecognizer.isEnabled)
+
+        coordinator.update(isEditing: true, tool: PKLassoTool(), pickerVisible: true,
+            rulerActive: false, activePageIndex: 0, overlays: [0: page])
+        XCTAssertTrue(canvas.interactions.contains { $0 === editMenu },
+            "PencilKit's native edit menu is restored for lasso selection and copy/paste")
+        XCTAssertTrue(pdf.interactions.contains { $0 === pdfKitMenu })
+
+        coordinator.update(isEditing: false, tool: PKInkingTool(.pen), pickerVisible: false,
+            rulerActive: false, activePageIndex: nil, overlays: [0: page])
+        XCTAssertTrue(canvas.interactions.contains { $0 === editMenu })
+        XCTAssertTrue(pdf.interactions.contains { $0 === pdfKitMenu })
+    }
+
+    func testRulerFingerInteractionRemainsEnabledWithInkMenuSuppression() {
         let pdf = JotPDFView()
         let page = overlay()
         let canvas = page.canvas as! JotCanvasView
@@ -187,7 +216,7 @@ final class EditorTransitionAndSortingTests: XCTestCase {
         )
 
         XCTAssertTrue(page.canvas.isRulerActive)
-        XCTAssertFalse(coordinator.incidentalEditMenuBlocker.isEnabled)
+        XCTAssertTrue(CanvasTouchRouting.shouldSuppressNativeEditMenuInteractions(isEditing: true, tool: PKInkingTool(.pen)))
         XCTAssertTrue(canvas.suppressesStandardEditActions)
     }
 
@@ -204,14 +233,14 @@ final class EditorTransitionAndSortingTests: XCTestCase {
             rulerActive: false, activePageIndex: nil, overlays: [:])
         XCTAssertTrue(pdf.isInMarkupMode)
         XCTAssertTrue(pdf.suppressesStandardEditActions)
-        XCTAssertTrue(coordinator.incidentalEditMenuBlocker.isEnabled)
+        XCTAssertTrue(CanvasTouchRouting.shouldSuppressNativeEditMenuInteractions(isEditing: true, tool: PKInkingTool(.pen)))
         XCTAssertTrue(longPress.isEnabled, "PDFKit recognizers are left under PDFKit's control")
 
         coordinator.update(isEditing: false, tool: PKInkingTool(.pen), pickerVisible: false,
             rulerActive: false, activePageIndex: nil, overlays: [:])
         XCTAssertFalse(pdf.isInMarkupMode)
         XCTAssertFalse(pdf.suppressesStandardEditActions)
-        XCTAssertFalse(coordinator.incidentalEditMenuBlocker.isEnabled)
+        XCTAssertFalse(CanvasTouchRouting.shouldSuppressNativeEditMenuInteractions(isEditing: false, tool: PKInkingTool(.pen)))
         XCTAssertEqual(scroll.panGestureRecognizer.allowedTouchTypes, originalTouchTypes)
     }
 

@@ -9,7 +9,7 @@ import PDFKit
 enum EditorInteractionFixture {
     static var tool: String? {
         let value = ProcessInfo.processInfo.environment["JOTTRE_INTERACTION_TEST_TOOL"]
-        return ["pen", "lasso"].contains(value ?? "") ? value : nil
+        return ["pen", "lasso", "blank-pen"].contains(value ?? "") ? value : nil
     }
 
     static func publish(canvas: PKCanvasView, index: Int, pdfView: PDFView, host: UIView) {
@@ -32,6 +32,8 @@ enum EditorInteractionFixture {
             let rect = pdfView.convert(pdfView.convert(page.bounds(for: .cropBox), from: page), to: window)
             let canvasRect = canvas.convert(canvas.bounds, to: window)
             label.frame = host.convert(rect, from: window)
+            let canvasMenuInteractions = editMenuInteractionDescriptions(in: canvas)
+            let pdfMenuInteractions = editMenuInteractionDescriptions(in: pdfView)
             let midX = canvas.drawing.strokes.isEmpty ? 0 : canvas.drawing.bounds.midX
             let toolName: String
             if canvas.tool is PKLassoTool {
@@ -57,6 +59,9 @@ enum EditorInteractionFixture {
                 "drawingPolicy": canvas.drawingPolicy.rawValue,
                 "drawingGesture": canvas.drawingGestureRecognizer.isEnabled,
                 "offset": [canvas.contentOffset.x, canvas.contentOffset.y],
+                "canvasEditMenuInteractions": canvasMenuInteractions,
+                "pdfEditMenuInteractions": pdfMenuInteractions,
+                "blankNoteFixture": tool == "blank-pen",
             ]
             if let data = try? JSONSerialization.data(withJSONObject: info), let value = String(data: data, encoding: .utf8)
             {
@@ -64,6 +69,17 @@ enum EditorInteractionFixture {
             }
             return nil
         }
+    }
+
+    private static func editMenuInteractionDescriptions(in root: UIView) -> [String] {
+        func collect(_ view: UIView) -> [String] {
+            let own = view.interactions.compactMap { interaction -> String? in
+                guard let menu = interaction as? UIEditMenuInteraction else { return nil }
+                return "\(String(describing: type(of: view))):\(menu.delegate.map { String(describing: type(of: $0)) } ?? "system")"
+            }
+            return own + view.subviews.flatMap(collect)
+        }
+        return collect(root)
     }
 
     static func makeDocument(using service: any JotFileServiceProtocol) throws -> JotFile.Info {
@@ -79,7 +95,7 @@ enum EditorInteractionFixture {
                 )
             }
         }
-        let strokes = (0..<2).map { index in
+        let strokes = (0..<(tool == "blank-pen" ? 1 : 2)).map { index in
             let y = CGFloat(index) * (1600 + JotPageLayout.pageSpacing) + 600
             let points = [CGPoint(x: 360, y: y), CGPoint(x: 840, y: y)].enumerated().map { offset, point in
                 PKStrokePoint(
@@ -99,14 +115,15 @@ enum EditorInteractionFixture {
         }
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("interaction-fixture-" + UUID().uuidString + ".jot")
         let info = JotFile.Info(url: url, name: "Interaction Fixture", modificationDate: nil)
+        let isBlankNote = tool == "blank-pen"
         try service.write(
             jotFile: JotFile(
                 info: info,
                 jot: Jot(
                     drawing: PKDrawing(strokes: tool == "lasso" ? [] : strokes).dataRepresentation(),
                     width: 1200,
-                    pdfData: pdf,
-                    strokePageIndices: tool == "lasso" ? [] : [0, 1]
+                    pdfData: isBlankNote ? nil : pdf,
+                    strokePageIndices: tool == "lasso" ? [] : (isBlankNote ? [0] : [0, 1])
                 )
             )
         )

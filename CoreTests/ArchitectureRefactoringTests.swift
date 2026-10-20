@@ -195,7 +195,7 @@ final class ArchitectureRefactoringTests: XCTestCase {
         )
         XCTAssertEqual(canvas.drawingPolicy, .pencilOnly)
         XCTAssertFalse(canvas.suppressesStandardEditActions)
-        XCTAssertFalse(coordinator.incidentalEditMenuBlocker.isEnabled)
+        XCTAssertFalse(CanvasTouchRouting.shouldSuppressNativeEditMenuInteractions(isEditing: true, tool: PKLassoTool()))
         XCTAssertTrue(first.canvas.isRulerActive)
         XCTAssertFalse(second.canvas.isRulerActive)
     }

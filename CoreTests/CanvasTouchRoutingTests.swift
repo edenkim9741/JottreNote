@@ -19,26 +19,38 @@ final class CanvasTouchRoutingTests: XCTestCase {
     }
 
     @MainActor
-    func testIncidentalEditMenuSuppressionTargetsInkAndEraserButPreservesLassoAndRuler() {
+    func testNativeEditMenuSuppressionTargetsInkAndEraserButPreservesLassoAndRuler() {
         XCTAssertTrue(CanvasTouchRouting.suppressesStandardEditActions(isEditing: true, tool: PKInkingTool(.pen)))
         XCTAssertTrue(CanvasTouchRouting.suppressesStandardEditActions(isEditing: true, tool: PKEraserTool(.bitmap)))
         XCTAssertFalse(CanvasTouchRouting.suppressesStandardEditActions(isEditing: true, tool: PKLassoTool()))
         XCTAssertFalse(CanvasTouchRouting.suppressesStandardEditActions(isEditing: false, tool: PKInkingTool(.pen)))
 
-        XCTAssertTrue(CanvasTouchRouting.shouldBlockIncidentalEditMenu(
-            isEditing: true, tool: PKInkingTool(.pen), rulerActive: false))
-        XCTAssertTrue(CanvasTouchRouting.shouldBlockIncidentalEditMenu(
-            isEditing: true, tool: PKEraserTool(.bitmap), rulerActive: false))
-        XCTAssertFalse(CanvasTouchRouting.shouldBlockIncidentalEditMenu(
-            isEditing: true, tool: PKLassoTool(), rulerActive: false))
-        XCTAssertFalse(CanvasTouchRouting.shouldBlockIncidentalEditMenu(
-            isEditing: true, tool: PKInkingTool(.pen), rulerActive: true))
+        XCTAssertTrue(CanvasTouchRouting.shouldSuppressNativeEditMenuInteractions(isEditing: true, tool: PKInkingTool(.pen)))
+        XCTAssertTrue(CanvasTouchRouting.shouldSuppressNativeEditMenuInteractions(isEditing: true, tool: PKEraserTool(.bitmap)))
+        XCTAssertFalse(CanvasTouchRouting.shouldSuppressNativeEditMenuInteractions(isEditing: true, tool: PKLassoTool()))
+        XCTAssertFalse(CanvasTouchRouting.shouldSuppressNativeEditMenuInteractions(isEditing: false, tool: PKInkingTool(.pen)))
     }
 
     @MainActor
-    func testIncidentalEditMenuBlockerOnlyAcceptsFingerTouches() {
-        XCTAssertTrue(CanvasTouchRouting.shouldBlockIncidentalEditMenu(for: .direct))
-        XCTAssertFalse(CanvasTouchRouting.shouldBlockIncidentalEditMenu(for: .pencil))
+    func testNativeEditMenuInteractionIsRemovedOnlyForInkToolsAndRestoredForLasso() {
+        let canvas = JotCanvasView()
+        let editMenu = UIEditMenuInteraction(delegate: nil)
+        canvas.addInteraction(editMenu)
+        let controller = JotEditMenuInteractionController()
+
+        controller.apply(suppressed: true, in: canvas)
+
+        XCTAssertFalse(canvas.interactions.contains { $0 === editMenu })
+        XCTAssertGreaterThanOrEqual(controller.detachedCount, 1)
+        XCTAssertTrue(canvas.isUserInteractionEnabled)
+        XCTAssertTrue(canvas.drawingGestureRecognizer.isEnabled)
+
+        controller.apply(suppressed: false, in: canvas)
+
+        XCTAssertTrue(canvas.interactions.contains { $0 === editMenu })
+        XCTAssertEqual(controller.detachedCount, 0)
+        XCTAssertTrue(canvas.isUserInteractionEnabled)
+        XCTAssertTrue(canvas.drawingGestureRecognizer.isEnabled)
     }
 
     @MainActor
