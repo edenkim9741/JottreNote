@@ -5,17 +5,40 @@ import UIKit
 /// Applies PencilKit's native input policy to visible page overlays and keeps
 /// direct-touch navigation on PDFKit's own scroll views.
 @MainActor
-final class JotEditorGestureCoordinator: NSObject {
+final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
     private unowned let pdfView: JotPDFView
     private var isEditingEnabled = false
     private var selectedTool: any PKTool = PKInkingTool(.pen)
     private var isRulerActive = false
     private var activePageIndex: Int?
     private let editMenuInteractions = JotEditMenuInteractionController()
+    private(set) var undoDoubleTapRecognizer: UITapGestureRecognizer?
 
     init(pdfView: JotPDFView) {
         self.pdfView = pdfView
         super.init()
+    }
+
+    func installUndoDoubleTapGesture(target: Any, action: Selector) {
+        guard undoDoubleTapRecognizer == nil else { return }
+        let recognizer = UITapGestureRecognizer(target: target, action: action)
+        recognizer.numberOfTouchesRequired = 2
+        recognizer.numberOfTapsRequired = 2
+        recognizer.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+        recognizer.cancelsTouchesInView = false
+        recognizer.delaysTouchesBegan = false
+        recognizer.delaysTouchesEnded = false
+        recognizer.delegate = self
+        pdfView.addGestureRecognizer(recognizer)
+        undoDoubleTapRecognizer = recognizer
+        updateUndoDoubleTapAvailability()
+    }
+
+    func removeUndoDoubleTapGesture() {
+        if let undoDoubleTapRecognizer {
+            pdfView.removeGestureRecognizer(undoDoubleTapRecognizer)
+        }
+        undoDoubleTapRecognizer = nil
     }
 
     func update(
@@ -35,6 +58,7 @@ final class JotEditorGestureCoordinator: NSObject {
             isRulerActive = false
             self.activePageIndex = nil
         }
+        updateUndoDoubleTapAvailability()
         pdfView.isInMarkupMode = isEditing
         let suppressesEditActions = CanvasTouchRouting.suppressesStandardEditActions(
             isEditing: isEditing,
@@ -63,6 +87,28 @@ final class JotEditorGestureCoordinator: NSObject {
             to: pdfNavigationScrollViews().map(\.panGestureRecognizer),
             pencilInputHasPriority: isEditing
         )
+    }
+
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+        gestureRecognizer === undoDoubleTapRecognizer
+    }
+
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+        guard gestureRecognizer === undoDoubleTapRecognizer else { return true }
+        return Self.acceptsUndoDoubleTapTouch(touch.type)
+            && isEditingEnabled
+            && pdfView.document != nil
+    }
+
+    static func acceptsUndoDoubleTapTouch(_ touchType: UITouch.TouchType) -> Bool {
+        touchType == .direct
+    }
+
+    private func updateUndoDoubleTapAvailability() {
+        undoDoubleTapRecognizer?.isEnabled = isEditingEnabled && pdfView.document != nil
     }
 
     func configure(_ canvas: JotCanvasView, overlay: JotPDFPageCanvasOverlay, pageIndex: Int?) {

@@ -134,6 +134,61 @@ final class EditorTransitionAndSortingTests: XCTestCase {
         XCTAssertEqual(JotCanvasZoomCoordinator.targetScale(current: 2.0, scales: portrait), 1.4)
     }
 
+    func testTwoFingerUndoGestureIsScopedToAnEditablePDFAndDoesNotCancelNavigation() throws {
+        let pdf = JotPDFView()
+        pdf.document = try XCTUnwrap(PDFDocument(data: makePDF(pageCount: 1)))
+        let coordinator = JotEditorGestureCoordinator(pdfView: pdf)
+        coordinator.installUndoDoubleTapGesture(target: self, action: #selector(handleUndoGesture(_:)))
+        coordinator.installUndoDoubleTapGesture(target: self, action: #selector(handleUndoGesture(_:)))
+        let recognizer = try XCTUnwrap(coordinator.undoDoubleTapRecognizer)
+
+        XCTAssertEqual(recognizer.numberOfTouchesRequired, 2)
+        XCTAssertEqual(recognizer.numberOfTapsRequired, 2)
+        XCTAssertFalse(recognizer.cancelsTouchesInView)
+        XCTAssertFalse(recognizer.delaysTouchesBegan)
+        XCTAssertFalse(recognizer.delaysTouchesEnded)
+        XCTAssertTrue(recognizer.delegate === coordinator)
+        XCTAssertTrue(recognizer.allowedTouchTypes.contains(NSNumber(value: UITouch.TouchType.direct.rawValue)))
+        XCTAssertEqual(
+            pdf.gestureRecognizers?.filter { $0 === recognizer }.count,
+            1,
+            "Repeated editor synchronization must not register duplicate Undo recognizers"
+        )
+        XCTAssertFalse(recognizer.isEnabled, "Undo is inactive until PDF editing is enabled")
+
+        coordinator.update(
+            isEditing: true,
+            tool: PKInkingTool(.pen),
+            pickerVisible: true,
+            rulerActive: false,
+            activePageIndex: 0,
+            overlays: [:]
+        )
+
+        XCTAssertTrue(recognizer.isEnabled)
+        XCTAssertTrue(JotEditorGestureCoordinator.acceptsUndoDoubleTapTouch(.direct))
+        XCTAssertFalse(JotEditorGestureCoordinator.acceptsUndoDoubleTapTouch(.pencil))
+        XCTAssertTrue(coordinator.gestureRecognizer(
+            recognizer,
+            shouldRecognizeSimultaneouslyWith: UIPanGestureRecognizer()
+        ))
+
+        coordinator.update(
+            isEditing: false,
+            tool: PKInkingTool(.pen),
+            pickerVisible: false,
+            rulerActive: false,
+            activePageIndex: nil,
+            overlays: [:]
+        )
+        XCTAssertFalse(recognizer.isEnabled)
+        coordinator.removeUndoDoubleTapGesture()
+        XCTAssertNil(coordinator.undoDoubleTapRecognizer)
+        XCTAssertFalse(pdf.gestureRecognizers?.contains(recognizer) ?? true)
+    }
+
+    @objc private func handleUndoGesture(_ recognizer: UITapGestureRecognizer) {}
+
     private func makePDF(pageCount: Int) -> Data {
         UIGraphicsPDFRenderer(bounds: CGRect(x: 0, y: 0, width: 600, height: 800)).pdfData { context in
             for _ in 0..<pageCount { context.beginPage() }

@@ -282,12 +282,17 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
         super.viewWillAppear(animated)
         (navigationController?.navigationBar as? JottreNavigationBar)?
             .passesThroughBackgroundTouches = true
+        gestureCoordinator.installUndoDoubleTapGesture(
+            target: self,
+            action: #selector(handleTwoFingerDoubleTap(_:))
+        )
         synchronizePageInputState()
     }
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
         zoomCoordinator.stopObservingDoubleTapZoom()
+        gestureCoordinator.removeUndoDoubleTapGesture()
         (navigationController?.navigationBar as? JottreNavigationBar)?
             .passesThroughBackgroundTouches = false
         gestureCoordinator.update(
@@ -672,6 +677,15 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
 
     @objc private func pdfScaleDidChange() {
         zoomCoordinator.scaleChanged()
+    }
+
+    @objc private func handleTwoFingerDoubleTap(_ gesture: UITapGestureRecognizer) {
+        guard gesture.state == .recognized,
+              pdfView.document != nil,
+              isEditingEnabled,
+              let undoManager = inkUndoManager,
+              undoManager.canUndo else { return }
+        undoManager.undo()
     }
 
     private func updatePageOverlayRendererZoom() {
