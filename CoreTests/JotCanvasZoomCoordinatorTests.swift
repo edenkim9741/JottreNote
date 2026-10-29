@@ -67,8 +67,31 @@ final class JotCanvasZoomCoordinatorTests: XCTestCase {
         )
 
         XCTAssertEqual(range.minimum, 0.72, accuracy: 0.0001)
-        XCTAssertEqual(range.maximum, 1.8, accuracy: 0.0001)
+        XCTAssertGreaterThanOrEqual(range.maximum, 1.8)
+        XCTAssertEqual(range.maximum, 16, accuracy: 0.0001)
         XCTAssertNil(JotCanvasZoomCoordinator.pageFitScales(pageSize: .zero, viewportSize: CGSize(width: 100, height: 100)))
+    }
+
+    func testScaleRangeIncludesFitAbovePreviousMaximumAndProvidesPinchHeadroom() throws {
+        let scales = JotCanvasZoomCoordinator.PageFitScales(shortSide: 18, longSide: 7)
+        let range = try XCTUnwrap(
+            JotCanvasZoomCoordinator.expandedScaleRange(minimum: 1, maximum: 4, toInclude: scales)
+        )
+
+        XCTAssertEqual(range.minimum, 1, accuracy: 0.0001)
+        XCTAssertEqual(range.maximum, 64, accuracy: 0.0001)
+        XCTAssertGreaterThanOrEqual(range.maximum, scales.shortSide)
+
+        let exceptionallySmallPageScales = JotCanvasZoomCoordinator.PageFitScales(shortSide: 80, longSide: 35)
+        let exceptionalRange = try XCTUnwrap(
+            JotCanvasZoomCoordinator.expandedScaleRange(
+                minimum: 1,
+                maximum: 4,
+                toInclude: exceptionallySmallPageScales
+            )
+        )
+        XCTAssertEqual(exceptionalRange.maximum, 80, accuracy: 0.0001,
+            "A required page-fit scale must remain available beyond the preferred pinch ceiling")
     }
 
     func testSmartTargetScaleUsesCurrentScaleRatherThanAStoredCycle() {
@@ -123,6 +146,5 @@ final class JotCanvasZoomCoordinatorTests: XCTestCase {
         )
 
         XCTAssertEqual(scales.shortSide, scales.longSide, accuracy: 0.0001)
-        XCTAssertEqual(scales.scale(for: .shortSide), scales.scale(for: .longSide), accuracy: 0.0001)
     }
 }

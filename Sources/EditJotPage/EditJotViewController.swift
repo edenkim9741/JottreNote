@@ -352,6 +352,11 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
         )
     }
 
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        zoomCoordinator.updateScaleRange(in: pdfView)
+    }
+
     private func setUpViews() {
         view.backgroundColor = .adaptiveBlackWhite
         view.addGestureRecognizer(swipeBackGesture)

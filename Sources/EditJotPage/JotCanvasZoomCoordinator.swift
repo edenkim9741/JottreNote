@@ -61,6 +61,22 @@ final class JotCanvasZoomCoordinator: NSObject, UIGestureRecognizerDelegate {
             doubleTapRecognizer = recognizer
         }
         doubleTapRecognizer?.isEnabled = isEnabled
+        updateScaleRange(in: pdfView)
+    }
+
+    /// Keep a useful pinch range available after PDFKit recalculates its fit
+    /// scale (for example after a page, document, or viewport change).
+    func updateScaleRange(in pdfView: PDFView) {
+        guard let page = pdfView.currentPage,
+              let viewport = displayViewport(in: pdfView),
+              let pageScales = scales(for: page, viewport: viewport.size),
+              let range = Self.expandedScaleRange(
+                minimum: pdfView.minScaleFactor,
+                maximum: pdfView.scaleFactor,
+                toInclude: pageScales
+              ) else { return }
+        pdfView.minScaleFactor = range.minimum
+        pdfView.maxScaleFactor = range.maximum
     }
 
     func stopObservingDoubleTapZoom() {
@@ -79,6 +95,7 @@ final class JotCanvasZoomCoordinator: NSObject, UIGestureRecognizerDelegate {
 
     func scaleChanged() {
         guard !pinches.allObjects.contains(where: { $0.state == .began || $0.state == .changed }) else { return }
+        if let doubleTapHost { updateScaleRange(in: doubleTapHost) }
         schedule(delay: .milliseconds(80))
     }
 
@@ -143,9 +160,18 @@ final class JotCanvasZoomCoordinator: NSObject, UIGestureRecognizerDelegate {
               maximum.isFinite, maximum > 0, maximum >= minimum,
               scales.shortSide.isFinite, scales.shortSide > 0,
               scales.longSide.isFinite, scales.longSide > 0 else { return nil }
+        let fitMaximum = max(scales.shortSide, scales.longSide)
+        let requestedPinchMaximum = fitMaximum >= preferredPinchMaximumScale / pinchMaximumScalePerFit
+            ? preferredPinchMaximumScale
+            : max(minimumPinchMaximumScale, fitMaximum * pinchMaximumScalePerFit)
+        // Keep pinch zoom useful without letting tiny PDF page dimensions
+        // produce an unbounded UIScrollView/PDFKit rendering scale. A fit
+        // target itself is always included, even when it exceeds this
+        // preferred ceiling.
+        let pinchMaximum = max(fitMaximum, min(preferredPinchMaximumScale, requestedPinchMaximum))
         return ScaleRange(
             minimum: min(minimum, min(scales.shortSide, scales.longSide)),
-            maximum: max(maximum, max(scales.shortSide, scales.longSide))
+            maximum: max(maximum, fitMaximum, pinchMaximum)
         )
     }
 
