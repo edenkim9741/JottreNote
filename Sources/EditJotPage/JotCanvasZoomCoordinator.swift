@@ -130,6 +130,20 @@ final class JotCanvasZoomCoordinator: NSObject, UIGestureRecognizerDelegate {
         return PageFitScales(shortSide: short, longSide: long)
     }
 
+    static func pageFitViewport(_ viewport: CGRect) -> CGRect? {
+        guard viewport.origin.x.isFinite, viewport.origin.y.isFinite,
+              viewport.width.isFinite, viewport.width > 0,
+              viewport.height.isFinite, viewport.height > 0 else { return nil }
+
+        // Preserve a small, symmetric gutter so PDFKit rounding and tile
+        // layout do not turn a nominal width-fit into horizontal scrolling.
+        let horizontalInset = viewport.width * 0.015
+        let verticalInset = viewport.height * 0.015
+        let fittedViewport = viewport.insetBy(dx: horizontalInset, dy: verticalInset)
+        guard fittedViewport.width > 0, fittedViewport.height > 0 else { return nil }
+        return fittedViewport
+    }
+
     static func expandedScaleRange(
         minimum: CGFloat,
         maximum: CGFloat,
@@ -250,10 +264,11 @@ final class JotCanvasZoomCoordinator: NSObject, UIGestureRecognizerDelegate {
 
         // PDFKit centers axes whose content is smaller than the viewport. Keep
         // that native policy; only adjust axes that actually scroll.
+        let visibleScrollRect = scrollView.bounds.inset(by: scrollView.adjustedContentInset)
         let scrollsHorizontally = pageRect.width > viewport.width + 0.5
-            && scrollView.contentSize.width > scrollView.bounds.width + 0.5
+            && scrollView.contentSize.width > visibleScrollRect.width + 0.5
         let scrollsVertically = pageRect.height > viewport.height + 0.5
-            && scrollView.contentSize.height > scrollView.bounds.height + 0.5
+            && scrollView.contentSize.height > visibleScrollRect.height + 0.5
         guard scrollsHorizontally || scrollsVertically else { return }
 
         let targetInPDFView = CGPoint(
@@ -305,10 +320,10 @@ final class JotCanvasZoomCoordinator: NSObject, UIGestureRecognizerDelegate {
     }
 
     private func displayViewport(in pdfView: PDFView) -> CGRect? {
-        let viewport = pdfView.bounds.inset(by: pdfView.safeAreaInsets)
-        guard viewport.width.isFinite, viewport.width > 0,
-              viewport.height.isFinite, viewport.height > 0 else { return nil }
-        return viewport
+        guard let scrollView = documentScrollView(in: pdfView) else { return nil }
+        let visibleRect = scrollView.bounds.inset(by: scrollView.adjustedContentInset)
+        let pdfViewport = pdfView.convert(visibleRect, from: scrollView)
+        return Self.pageFitViewport(pdfViewport)
     }
 
     private func scales(for page: PDFPage, viewport: CGSize) -> PageFitScales? {

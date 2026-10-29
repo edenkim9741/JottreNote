@@ -73,6 +73,18 @@ final class JotCanvasZoomCoordinatorTests: XCTestCase {
         XCTAssertNil(JotCanvasZoomCoordinator.pageFitScales(pageSize: .zero, viewportSize: CGSize(width: 100, height: 100)))
     }
 
+    func testPageFitViewportKeepsSymmetricGuttersInsideActualViewport() throws {
+        let actualViewport = CGRect(x: 12, y: 30, width: 1_000, height: 700)
+        let fittedViewport = try XCTUnwrap(JotCanvasZoomCoordinator.pageFitViewport(actualViewport))
+
+        XCTAssertEqual(fittedViewport.minX - actualViewport.minX, 15, accuracy: 0.001)
+        XCTAssertEqual(actualViewport.maxX - fittedViewport.maxX, 15, accuracy: 0.001)
+        XCTAssertEqual(fittedViewport.width, 970, accuracy: 0.001)
+        XCTAssertEqual(fittedViewport.minY - actualViewport.minY, 10.5, accuracy: 0.001)
+        XCTAssertEqual(actualViewport.maxY - fittedViewport.maxY, 10.5, accuracy: 0.001)
+        XCTAssertNil(JotCanvasZoomCoordinator.pageFitViewport(.zero))
+    }
+
     func testAfterPinchNextFitChoosesTheOppositeOfTheNearestPageFit() {
         let scales = JotCanvasZoomCoordinator.PageFitScales(shortSide: 1.6, longSide: 0.8)
 
