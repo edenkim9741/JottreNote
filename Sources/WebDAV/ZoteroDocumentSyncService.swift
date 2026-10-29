@@ -19,7 +19,11 @@ struct ZoteroDocumentSyncService: Sendable {
 
     /// Returns a user-visible reason when an upload could not be completed.
     /// A nil result means the attachment is synced or was not dirty.
-    func uploadCachedAttachment(key: String?, fallbackModificationDate: Date?) async -> String? {
+    func uploadCachedAttachment(
+        key: String?,
+        fallbackModificationDate: Date?,
+        allowingActiveEdit: Bool = false
+    ) async -> String? {
         guard let key else { return nil }
         let userID = defaultsService.getValue(DefaultsKey<String>.zoteroUserID) ?? ""
         guard !userID.isEmpty else {
@@ -27,6 +31,9 @@ struct ZoteroDocumentSyncService: Sendable {
             return "Zotero User ID is not configured."
         }
         let canonicalKey = cacheStore.canonicalAttachmentKey(key, userID: userID)
+        if !allowingActiveEdit, await ZoteroEditingSessionGate.shared.isEditing(key: canonicalKey) {
+            return nil
+        }
         do {
             return try await AsyncResourceAccessCoordinator.shared.withAccess(
                 to: "zotero-cache-upload:" + userID + ":" + canonicalKey
@@ -48,6 +55,7 @@ struct ZoteroDocumentSyncService: Sendable {
         let key = canonicalKey
         let attachment = cacheStore.load(userID: userID).attachments[canonicalKey]
         if attachment?.isLocalOnly == true || attachment?.isConflict == true { return nil }
+        if attachment?.isPendingSync == true { return nil }
         guard attachment?.syncStatus == .dirty else { return nil }
         guard let path = attachment?.localCachePath,
             FileManager.default.fileExists(atPath: path),
@@ -96,4 +104,46 @@ struct ZoteroDocumentSyncService: Sendable {
 
 extension Notification.Name {
     static let zoteroAttachmentCacheChanged = Notification.Name("ZoteroAttachmentCacheChanged")
+    static let zoteroEditorDidEnd = Notification.Name("ZoteroEditorDidEnd")
+}
+
+/// Prevents library-level remote sync from reading or replacing an attachment
+/// while its editor is open. A synchronization already in progress is allowed
+/// to finish before a new editor session becomes active.
+actor ZoteroEditingSessionGate {
+    static let shared = ZoteroEditingSessionGate()
+
+    private var editingSessions: [String: String] = [:]
+    private var synchronizationInProgress = false
+    private var synchronizationWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func beginEditing(key: String, sessionID: String) async {
+        guard !key.isEmpty, !sessionID.isEmpty else { return }
+        editingSessions[sessionID] = key
+        while synchronizationInProgress {
+            await withCheckedContinuation { synchronizationWaiters.append($0) }
+        }
+    }
+
+    func endEditing(sessionID: String) -> (key: String?, shouldSynchronize: Bool) {
+        let key = editingSessions.removeValue(forKey: sessionID)
+        return (key, editingSessions.isEmpty)
+    }
+
+    func beginSynchronization() -> Bool {
+        guard editingSessions.isEmpty, !synchronizationInProgress else { return false }
+        synchronizationInProgress = true
+        return true
+    }
+
+    func endSynchronization() {
+        synchronizationInProgress = false
+        let waiters = synchronizationWaiters
+        synchronizationWaiters.removeAll(keepingCapacity: true)
+        waiters.forEach { $0.resume() }
+    }
+
+    func isEditing(key: String) -> Bool {
+        editingSessions.values.contains(key)
+    }
 }

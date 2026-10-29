@@ -80,6 +80,11 @@ private final class ZoteroLibraryViewModel: ObservableObject {
         guard !userID.isEmpty, !apiKey.isEmpty, !isSyncing else { return }
         isSyncing = true
         defer { isSyncing = false }
+        let syncGate = ZoteroEditingSessionGate.shared
+        guard await syncGate.beginSynchronization() else {
+            refreshCacheState()
+            return
+        }
         do {
             let syncService = makeSyncService()
             let documentSync = ZoteroDocumentSyncService(defaultsService: defaults, cacheStore: cacheStore)
@@ -101,6 +106,7 @@ private final class ZoteroLibraryViewModel: ObservableObject {
         } catch {
             errorMessage = String(localized: "zotero.error.librarySync")
         }
+        await syncGate.endSynchronization()
     }
 
     func reloadAccountAndSynchronize() async {
@@ -327,6 +333,8 @@ private final class ZoteroLibraryViewModel: ObservableObject {
     func createDocument(title: String, pageSize: CGSize) async -> String? {
         let resolvedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !resolvedTitle.isEmpty else { return String(localized: "zotero.create.titleRequired") }
+        var sessionIDForCleanup: String?
+        var didOpenEditor = false
         do {
             let filename = Self.safePDFFileName(from: resolvedTitle)
             let now = Date()
@@ -335,6 +343,14 @@ private final class ZoteroLibraryViewModel: ObservableObject {
             let lastName = defaults.getValue(.zoteroDefaultAuthorLastName) ?? ""
             let temporaryParentKey = "temp_\(UUID().uuidString)"
             let temporaryAttachmentKey = "temp_\(UUID().uuidString)"
+            let sessionID = jotSessionID(for: temporaryAttachmentKey)
+            sessionIDForCleanup = sessionID
+            if onOpenJot != nil {
+                await ZoteroEditingSessionGate.shared.beginEditing(
+                    key: temporaryAttachmentKey,
+                    sessionID: sessionID
+                )
+            }
             let item = ZoteroItem(
                 key: temporaryParentKey,
                 title: resolvedTitle,
@@ -396,7 +412,10 @@ private final class ZoteroLibraryViewModel: ObservableObject {
             snapshot = cacheStore.load(userID: userID)
             selection = selectedCollectionKeys.first.map(ZoteroLibraryLocation.collection) ?? .myLibrary
             NotificationCenter.default.post(name: .zoteroAttachmentCacheChanged, object: temporaryAttachmentKey)
-            onOpenJot?(fileInfo)
+            if onOpenJot != nil {
+                onOpenJot?(fileInfo)
+                didOpenEditor = true
+            }
             print("[ZoteroDraft] Created local offline draft at \(cacheURL.path), bytes: \(hybridPDF.count)")
 
             guard !userID.isEmpty, !apiKey.isEmpty else {
@@ -406,6 +425,9 @@ private final class ZoteroLibraryViewModel: ObservableObject {
             let pending = cacheStore.load(userID: userID).attachments[temporaryAttachmentKey]?.isPendingSync == true
             return pending ? String(localized: "zotero.create.offlineDraft") : nil
         } catch {
+            if !didOpenEditor, let sessionIDForCleanup {
+                await endEditingSession(sessionID: sessionIDForCleanup, requestSynchronization: true)
+            }
             return "\(String(localized: "zotero.create.failed"))\n\(error.localizedDescription)"
         }
     }
@@ -544,10 +566,13 @@ private final class ZoteroLibraryViewModel: ObservableObject {
         guard openingAttachmentKey == nil else { return }
         openingAttachmentKey = attachment.key
         defer { openingAttachmentKey = nil }
+        let sessionID = jotSessionID(for: attachment.key)
+        await ZoteroEditingSessionGate.shared.beginEditing(key: attachment.key, sessionID: sessionID)
+        let currentAttachment = cacheStore.load(userID: userID).attachments[attachment.key] ?? attachment
         do {
             let sourceData: Data
             let loadedFromLocalCache: Bool
-            if let path = attachment.localCachePath,
+            if let path = currentAttachment.localCachePath,
                FileManager.default.fileExists(atPath: path) {
                 sourceData = try Data(contentsOf: URL(fileURLWithPath: path))
                 loadedFromLocalCache = true
@@ -560,7 +585,7 @@ private final class ZoteroLibraryViewModel: ObservableObject {
             let unpacked = try? HybridPDFManager.load(data: sourceData)
             print("[ZoteroLoad] Unpacking hybrid PDF from local cache... Strokes restored: \(unpacked.flatMap { try? PKDrawing(data: $0.jot.drawing).strokes.count } ?? 0)")
             let sourcePDF = unpacked?.pdfData ?? HybridPDFManager.pdfData(in: sourceData)
-            let title = title(for: attachment)
+            let title = title(for: currentAttachment)
             let jot = Jot(
                 drawing: unpacked?.jot.drawing ?? Jot.makeEmpty().drawing,
                 width: unpacked?.jot.width ?? Jot.defaultWidth,
@@ -569,32 +594,51 @@ private final class ZoteroLibraryViewModel: ObservableObject {
                 pdfInsertedPageSlots: unpacked?.jot.pdfInsertedPageSlots ?? [],
                 strokePageIndices: unpacked?.jot.strokePageIndices ?? [],
                 trashedPages: unpacked?.jot.trashedPages ?? [],
-                zoteroItemKey: attachment.key,
-                zoteroFileName: attachment.filename
+                zoteroItemKey: currentAttachment.key,
+                zoteroFileName: currentAttachment.filename
             )
             let fileInfo = JotFile.Info(url: fileURL, name: title, modificationDate: nil)
             try JotFileService(fileService: LocalFileService(fileManager: .default))
                 .write(jotFile: JotFile(info: fileInfo, jot: jot))
             if !loadedFromLocalCache {
-                try savePDFCache(data: sourceData, key: attachment.key)
+                try savePDFCache(data: sourceData, key: currentAttachment.key)
                 snapshot = try cacheStore.markDownloaded(
-                    key: attachment.key,
-                    path: pdfCacheURL(for: attachment.key),
+                    key: currentAttachment.key,
+                    path: pdfCacheURL(for: currentAttachment.key),
                     md5: ZoteroSyncService.md5Hex(sourceData),
                     userID: userID
                 )
-            } else if attachment.syncStatus != .dirty,
-                      let cachePath = attachment.localCachePath {
+            } else if currentAttachment.syncStatus != .dirty,
+                      let cachePath = currentAttachment.localCachePath {
                 snapshot = try cacheStore.markDownloaded(
-                    key: attachment.key,
+                    key: currentAttachment.key,
                     path: URL(fileURLWithPath: cachePath),
                     md5: ZoteroSyncService.md5Hex(sourceData),
                     userID: userID
                 )
             }
-            onOpenJot?(fileInfo)
+            if let onOpenJot {
+                onOpenJot(fileInfo)
+            } else {
+                await endEditingSession(sessionID: sessionID, requestSynchronization: true)
+            }
         } catch {
+            await endEditingSession(sessionID: sessionID, requestSynchronization: true)
             errorMessage = String(localized: "zotero.error.openPDF")
+        }
+    }
+
+    private func jotSessionID(for key: String) -> String {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("ZoteroJots", isDirectory: true)
+            .appendingPathComponent("\(key).jot")
+            .standardizedFileURL.path
+    }
+
+    private func endEditingSession(sessionID: String, requestSynchronization: Bool) async {
+        let result = await ZoteroEditingSessionGate.shared.endEditing(sessionID: sessionID)
+        if result.shouldSynchronize && requestSynchronization {
+            NotificationCenter.default.post(name: .zoteroEditorDidEnd, object: result.key)
         }
     }
 
@@ -796,6 +840,9 @@ struct ZoteroLibraryView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .zoteroAttachmentCacheChanged)) { _ in
             model.refreshCacheState()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .zoteroEditorDidEnd)) { _ in
+            Task { await model.synchronize() }
         }
     }
 

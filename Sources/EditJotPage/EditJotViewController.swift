@@ -251,6 +251,8 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         #if !targetEnvironment(macCatalyst)
+        pencilInteraction.isEnabled = true
+        synchronizeSelectedToolFromPicker()
         if !isToolPickerObserverAttached {
             toolPicker.addObserver(self)
             isToolPickerObserverAttached = true
@@ -830,15 +832,30 @@ extension EditJotViewController: PKToolPickerObserver {
     }
 
     private func selectedCanvasToolDidChange() {
-        let previousCanvasTool = selectedCanvasTool
+        synchronizeSelectedToolFromPicker(recordHistory: true)
+        updateCanvasInteraction()
+    }
+
+    private func synchronizeSelectedToolFromPicker(recordHistory: Bool = false) {
         let selectedTool = selectedToolFromPicker()
-        previousSelectedTool = previousCanvasTool
+        let selectedIdentifier = toolPicker.selectedToolItemIdentifier
+        if let previousIdentifier = selectedToolItemIdentifier,
+            previousIdentifier != selectedIdentifier,
+            recordHistory
+        {
+            previousSelectedTool = ToolSelection(
+                tool: selectedCanvasTool,
+                itemIdentifier: previousIdentifier
+            )
+        }
+        selectedToolItemIdentifier = selectedIdentifier
         if !(selectedTool is PKEraserTool) {
-            lastSelectedNonEraserTool = selectedTool
+            lastSelectedNonEraserTool = ToolSelection(
+                tool: selectedTool,
+                itemIdentifier: selectedIdentifier
+            )
         }
         selectedCanvasTool = selectedTool
-
-        updateCanvasInteraction()
     }
 
     private func selectedToolFromPicker() -> any PKTool {

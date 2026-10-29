@@ -219,6 +219,14 @@ final class EditJotViewModel {
                     guard let self else {
                         return
                     }
+                    if let key = content.zoteroItemKey {
+                        let gate = ZoteroEditingSessionGate.shared
+                        await gate.beginEditing(key: key, sessionID: jotFileInfo.url.standardizedFileURL.path)
+                        guard !Task.isCancelled else {
+                            _ = await gate.endEditing(sessionID: jotFileInfo.url.standardizedFileURL.path)
+                            return
+                        }
+                    }
                     applyLoadedContent(content)
                     progressContinuation.yield(1.0)
                     do {
@@ -310,7 +318,6 @@ final class EditJotViewModel {
     func didTapBackButton() {
         Task { @MainActor [weak self] in
             guard let self, await self.flushPendingChanges() else { return }
-            self.enqueueZoteroUpload()
             if let jotFileVersions = self.repository.getConflictingVersions(
                 jotFileInfo: self.jotFileInfo
             ) {
@@ -333,32 +340,41 @@ final class EditJotViewModel {
     func didDisappear() async {
         // A quick back/background event can arrive before an asynchronous read
         // completes. Never replace an existing note with the VM's empty defaults.
-        guard isPersistenceReady else { return }
-        // Skip Zotero upload entirely when the note was not modified.
-        // Opening a note just to read it should not trigger PDF re-rendering
-        // and network uploads.
-        guard await flushPendingChanges(presentsError: false) else { return }
-        enqueueZoteroUpload()
+        guard isPersistenceReady else {
+            loadingTask?.cancel()
+            await finishZoteroEditingSession(upload: false, requestSynchronization: true)
+            return
+        }
+        let didPersist = await flushPendingChanges(presentsError: false)
+        await finishZoteroEditingSession(upload: didPersist, requestSynchronization: didPersist)
     }
 
-    /// Flushes local state while UIKit grants finite background execution time.
-    /// Zotero upload is launched only after the durable local
-    /// write has completed.
+    /// Backgrounding saves locally but keeps the remote attachment untouched
+    /// while the editor session remains open.
     func didEnterBackground() async {
-        guard await flushPendingChanges(presentsError: false), !Task.isCancelled else { return }
-        enqueueZoteroUpload()
+        _ = await flushPendingChanges(presentsError: false)
     }
 
-    private func enqueueZoteroUpload() {
-        guard let key = currentZoteroItemKey else { return }
-        let service = zoteroDocumentSyncService
-        let modificationDate = jotFileInfo.modificationDate
-        Task.detached(priority: .utility) {
-            _ = await service.uploadCachedAttachment(
+    func applicationWillTerminate() async {
+        loadingTask?.cancel()
+        let didPersist = isPersistenceReady
+            ? await flushPendingChanges(presentsError: false)
+            : false
+        await finishZoteroEditingSession(upload: didPersist, requestSynchronization: false)
+    }
+
+    private func finishZoteroEditingSession(upload: Bool, requestSynchronization: Bool) async {
+        let sessionID = jotFileInfo.url.standardizedFileURL.path
+        if upload, let key = currentZoteroItemKey {
+            _ = await zoteroDocumentSyncService.uploadCachedAttachment(
                 key: key,
-                fallbackModificationDate: modificationDate
+                fallbackModificationDate: jotFileInfo.modificationDate,
+                allowingActiveEdit: true
             )
         }
+        let endedSession = await ZoteroEditingSessionGate.shared.endEditing(sessionID: sessionID)
+        guard let key = endedSession.key, endedSession.shouldSynchronize, requestSynchronization else { return }
+        NotificationCenter.default.post(name: .zoteroEditorDidEnd, object: key)
     }
 
     deinit {
