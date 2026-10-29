@@ -6,20 +6,9 @@ import UIKit
 /// transform carries ink during zoom; PencilKit tiles refresh after it settles.
 @MainActor
 final class JotCanvasZoomCoordinator: NSObject, UIGestureRecognizerDelegate {
-    enum PageFitMode: Equatable {
-        case shortSide
-        case longSide
-
-        var next: Self { self == .shortSide ? .longSide : .shortSide }
-    }
-
     struct PageFitScales: Equatable {
         let shortSide: CGFloat
         let longSide: CGFloat
-
-        func scale(for mode: PageFitMode) -> CGFloat {
-            mode == .shortSide ? shortSide : longSide
-        }
     }
 
     struct ScaleRange: Equatable {
@@ -33,10 +22,11 @@ final class JotCanvasZoomCoordinator: NSObject, UIGestureRecognizerDelegate {
     private let nativeDoubleTapStates = NSMapTable<UITapGestureRecognizer, NSNumber>.weakToStrongObjects()
     private weak var doubleTapHost: PDFView?
     private(set) var doubleTapRecognizer: UITapGestureRecognizer?
-    private weak var fitCycleDocument: PDFDocument?
-    private weak var fitCyclePage: PDFPage?
-    private var fitCycleViewportSize: CGSize?
-    private var nextFitMode: PageFitMode = .shortSide
+
+    private static let minimumPinchMaximumScale: CGFloat = 16
+    private static let pinchMaximumScalePerFit: CGFloat = 4
+    private static let preferredPinchMaximumScale: CGFloat = 64
+    private static let fitScaleTolerance: CGFloat = 0.005
 
     init(refresh: @escaping @MainActor () -> Void) { self.refresh = refresh }
     deinit {
@@ -135,11 +125,11 @@ final class JotCanvasZoomCoordinator: NSObject, UIGestureRecognizerDelegate {
               viewport.width.isFinite, viewport.width > 0,
               viewport.height.isFinite, viewport.height > 0 else { return nil }
 
-        // Preserve a small, symmetric gutter so PDFKit rounding and tile
-        // layout do not turn a nominal width-fit into horizontal scrolling.
+        // Preserve a small horizontal gutter so PDFKit rounding and tile
+        // layout do not turn a width-fit into horizontal scrolling. Keep the
+        // full vertical viewport so a height-fit fills the available height.
         let horizontalInset = viewport.width * 0.015
-        let verticalInset = viewport.height * 0.015
-        let fittedViewport = viewport.insetBy(dx: horizontalInset, dy: verticalInset)
+        let fittedViewport = viewport.insetBy(dx: horizontalInset, dy: 0)
         guard fittedViewport.width > 0, fittedViewport.height > 0 else { return nil }
         return fittedViewport
     }
@@ -159,12 +149,18 @@ final class JotCanvasZoomCoordinator: NSObject, UIGestureRecognizerDelegate {
         )
     }
 
-    static func nextFitMode(afterPinchAt current: CGFloat, scales: PageFitScales) -> PageFitMode {
-        guard current.isFinite, current > 0 else { return .shortSide }
-        let shortDistance = abs(log(current / scales.shortSide))
-        let longDistance = abs(log(current / scales.longSide))
-        let nearestMode: PageFitMode = shortDistance <= longDistance ? .shortSide : .longSide
-        return nearestMode.next
+    static func targetScale(current: CGFloat, scales: PageFitScales) -> CGFloat {
+        let lower = min(scales.shortSide, scales.longSide)
+        let upper = max(scales.shortSide, scales.longSide)
+        guard current.isFinite, current > 0 else { return lower }
+
+        if approximatelyEqual(current, upper) { return lower }
+        if approximatelyEqual(current, lower) { return upper }
+        return current < lower ? lower : upper
+    }
+
+    private static func approximatelyEqual(_ lhs: CGFloat, _ rhs: CGFloat) -> Bool {
+        abs(lhs - rhs) <= max(0.001, max(abs(lhs), abs(rhs)) * fitScaleTolerance)
     }
 
     @objc private func pinchChanged(_ pinch: UIPinchGestureRecognizer) {
@@ -172,7 +168,6 @@ final class JotCanvasZoomCoordinator: NSObject, UIGestureRecognizerDelegate {
         case .began, .changed:
             settleTask?.cancel()
         case .ended:
-            prepareNextFitAfterPinch()
             schedule(delay: .zero)
         case .cancelled, .failed:
             schedule(delay: .zero)
@@ -203,12 +198,9 @@ final class JotCanvasZoomCoordinator: NSObject, UIGestureRecognizerDelegate {
               let viewport = displayViewport(in: pdfView),
               let pageScales = scales(for: page, viewport: viewport.size) else { return }
 
-        resetFitCycleIfNeeded(document: pdfView.document, page: page, viewportSize: viewport.size)
-
         let tapInPDFView = recognizer.location(in: pdfView)
         let scrollView = documentScrollView(in: pdfView)
-        let target = pageScales.scale(for: nextFitMode)
-        nextFitMode = nextFitMode.next
+        let target = Self.targetScale(current: pdfView.scaleFactor, scales: pageScales)
         let tapInPage = pdfView.convert(tapInPDFView, to: page)
         guard let scaleRange = Self.expandedScaleRange(
             minimum: pdfView.minScaleFactor,
@@ -299,31 +291,9 @@ final class JotCanvasZoomCoordinator: NSObject, UIGestureRecognizerDelegate {
         }
     }
 
-    private func prepareNextFitAfterPinch() {
-        guard let pdfView = doubleTapHost,
-              let page = pdfView.currentPage,
-              let viewport = displayViewport(in: pdfView),
-              let pageScales = scales(for: page, viewport: viewport.size) else { return }
-        resetFitCycleIfNeeded(document: pdfView.document, page: page, viewportSize: viewport.size)
-        nextFitMode = Self.nextFitMode(afterPinchAt: pdfView.scaleFactor, scales: pageScales)
-    }
-
-    private func resetFitCycleIfNeeded(document: PDFDocument?, page: PDFPage, viewportSize: CGSize) {
-        let viewportChanged = fitCycleViewportSize.map {
-            abs($0.width - viewportSize.width) > 0.5 || abs($0.height - viewportSize.height) > 0.5
-        } ?? true
-        guard fitCycleDocument !== document || fitCyclePage !== page || viewportChanged else { return }
-        fitCycleDocument = document
-        fitCyclePage = page
-        fitCycleViewportSize = viewportSize
-        nextFitMode = .shortSide
-    }
-
     private func displayViewport(in pdfView: PDFView) -> CGRect? {
-        guard let scrollView = documentScrollView(in: pdfView) else { return nil }
-        let visibleRect = scrollView.bounds.inset(by: scrollView.adjustedContentInset)
-        let pdfViewport = pdfView.convert(visibleRect, from: scrollView)
-        return Self.pageFitViewport(pdfViewport)
+        let visibleRect = pdfView.bounds.inset(by: pdfView.safeAreaInsets)
+        return Self.pageFitViewport(visibleRect)
     }
 
     private func scales(for page: PDFPage, viewport: CGSize) -> PageFitScales? {

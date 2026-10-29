@@ -16,8 +16,6 @@ final class JotCanvasZoomCoordinatorTests: XCTestCase {
 
         XCTAssertEqual(scales.shortSide, 1_024.0 / 612.0, accuracy: 0.0001)
         XCTAssertEqual(scales.longSide, 700.0 / 792.0, accuracy: 0.0001)
-        XCTAssertEqual(JotCanvasZoomCoordinator.PageFitMode.shortSide.next, .longSide)
-        XCTAssertEqual(JotCanvasZoomCoordinator.PageFitMode.longSide.next, .shortSide)
     }
 
     func testLandscapeAndRotatedPagesUseTheirDisplayedShortAndLongAxes() throws {
@@ -73,24 +71,47 @@ final class JotCanvasZoomCoordinatorTests: XCTestCase {
         XCTAssertNil(JotCanvasZoomCoordinator.pageFitScales(pageSize: .zero, viewportSize: CGSize(width: 100, height: 100)))
     }
 
-    func testPageFitViewportKeepsSymmetricGuttersInsideActualViewport() throws {
+    func testSmartTargetScaleUsesCurrentScaleRatherThanAStoredCycle() {
+        let scales = JotCanvasZoomCoordinator.PageFitScales(shortSide: 1.6, longSide: 0.8)
+
+        XCTAssertEqual(JotCanvasZoomCoordinator.targetScale(current: 0.5, scales: scales), 0.8)
+        XCTAssertEqual(JotCanvasZoomCoordinator.targetScale(current: 0.8, scales: scales), 1.6)
+        XCTAssertEqual(JotCanvasZoomCoordinator.targetScale(current: 1.2, scales: scales), 1.6)
+        XCTAssertEqual(JotCanvasZoomCoordinator.targetScale(current: 1.6, scales: scales), 0.8)
+        XCTAssertEqual(JotCanvasZoomCoordinator.targetScale(current: 2.4, scales: scales), 1.6)
+    }
+
+    func testPinchScaleAndRepeatedDoubleTapsChooseFromTheActualCurrentScale() {
+        let scales = JotCanvasZoomCoordinator.PageFitScales(shortSide: 1.6, longSide: 0.8)
+
+        let afterPinchIn = JotCanvasZoomCoordinator.targetScale(current: 2.25, scales: scales)
+        XCTAssertEqual(afterPinchIn, 1.6)
+        let afterFirstTap = JotCanvasZoomCoordinator.targetScale(current: afterPinchIn, scales: scales)
+        XCTAssertEqual(afterFirstTap, 0.8)
+        let afterSecondTap = JotCanvasZoomCoordinator.targetScale(current: afterFirstTap, scales: scales)
+        XCTAssertEqual(afterSecondTap, 1.6)
+    }
+
+    func testFitScaleComparisonUsesSmallAbsoluteAndRelativeTolerance() {
+        let scales = JotCanvasZoomCoordinator.PageFitScales(shortSide: 1.6, longSide: 0.8)
+
+        XCTAssertEqual(JotCanvasZoomCoordinator.targetScale(current: 1.603, scales: scales), 0.8)
+        XCTAssertEqual(JotCanvasZoomCoordinator.targetScale(current: 0.799, scales: scales), 1.6)
+        XCTAssertEqual(JotCanvasZoomCoordinator.targetScale(current: 1.58, scales: scales), 1.6)
+        XCTAssertEqual(JotCanvasZoomCoordinator.targetScale(current: 0.83, scales: scales), 1.6)
+    }
+
+    func testPageFitViewportKeepsHorizontalGuttersAndFullVerticalFitArea() throws {
         let actualViewport = CGRect(x: 12, y: 30, width: 1_000, height: 700)
         let fittedViewport = try XCTUnwrap(JotCanvasZoomCoordinator.pageFitViewport(actualViewport))
 
         XCTAssertEqual(fittedViewport.minX - actualViewport.minX, 15, accuracy: 0.001)
         XCTAssertEqual(actualViewport.maxX - fittedViewport.maxX, 15, accuracy: 0.001)
         XCTAssertEqual(fittedViewport.width, 970, accuracy: 0.001)
-        XCTAssertEqual(fittedViewport.minY - actualViewport.minY, 10.5, accuracy: 0.001)
-        XCTAssertEqual(actualViewport.maxY - fittedViewport.maxY, 10.5, accuracy: 0.001)
+        XCTAssertEqual(fittedViewport.minY, actualViewport.minY, accuracy: 0.001)
+        XCTAssertEqual(fittedViewport.maxY, actualViewport.maxY, accuracy: 0.001)
+        XCTAssertEqual(fittedViewport.height, actualViewport.height, accuracy: 0.001)
         XCTAssertNil(JotCanvasZoomCoordinator.pageFitViewport(.zero))
-    }
-
-    func testAfterPinchNextFitChoosesTheOppositeOfTheNearestPageFit() {
-        let scales = JotCanvasZoomCoordinator.PageFitScales(shortSide: 1.6, longSide: 0.8)
-
-        XCTAssertEqual(JotCanvasZoomCoordinator.nextFitMode(afterPinchAt: 1.58, scales: scales), .longSide)
-        XCTAssertEqual(JotCanvasZoomCoordinator.nextFitMode(afterPinchAt: 0.83, scales: scales), .shortSide)
-        XCTAssertEqual(JotCanvasZoomCoordinator.nextFitMode(afterPinchAt: 1.25, scales: scales), .longSide)
     }
 
     func testEqualFitTargetsRemainStableWithoutRequiringAnExtraZoomState() throws {

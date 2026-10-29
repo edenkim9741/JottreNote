@@ -152,23 +152,40 @@ final class EditorInteractionUITests: XCTestCase {
         let initial = try info(page)
         let initialPageRect = try XCTUnwrap(initial["rect"] as? [Double])
         let initialViewport = try XCTUnwrap(initial["viewportRect"] as? [Double])
+        let startsAtWidthFit = abs(initialPageRect[2] - initialViewport[2]) <= 8
+            || abs(initialPageRect[2] - initialViewport[2] * 0.97) <= 8
+        let startsAtHeightFit = abs(initialPageRect[3] - initialViewport[3]) <= 8
+        XCTAssertTrue(startsAtWidthFit || startsAtHeightFit,
+            "PDFKit should begin at one of the page-fit scales")
+        let firstTapFitsHeight = startsAtWidthFit
         let anchorX = initialPageRect[0] + initialPageRect[2] * 0.32
         let anchorY = initialPageRect[1] + initialPageRect[3] * 0.38
         let zoomTap = app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: anchorX, dy: anchorY))
         zoomTap.doubleTap()
 
         var zoomed = try info(page)
-        for _ in 0..<30 where abs(((zoomed["rect"] as? [Double])?[2] ?? 0) - initialViewport[2]) > 8 {
+        for _ in 0..<30 {
+            guard let rect = zoomed["rect"] as? [Double] else { break }
+            let fittedDimension = firstTapFitsHeight ? rect[3] : rect[2]
+            let viewportDimension = firstTapFitsHeight ? initialViewport[3] : initialViewport[2]
+            if abs(fittedDimension - viewportDimension) <= 8 { break }
             try await Task.sleep(for: .milliseconds(100))
             zoomed = try info(page)
         }
         let pageRect = try XCTUnwrap(zoomed["rect"] as? [Double])
         let viewportRect = try XCTUnwrap(zoomed["viewportRect"] as? [Double])
         let canvasRect = try XCTUnwrap(zoomed["canvasRect"] as? [Double])
-        XCTAssertEqual(pageRect[2], viewportRect[2], accuracy: 8,
-            "The first double tap should fit the page's short side to the viewport")
-        XCTAssertEqual(anchorY, pageRect[1] + pageRect[3] * 0.38, accuracy: 10,
-            "The zoom should keep the tapped point anchored on the scrollable axis")
+        if firstTapFitsHeight {
+            XCTAssertEqual(pageRect[3], viewportRect[3], accuracy: 8,
+                "A tap from width-fit should select height-fit")
+            XCTAssertEqual(anchorX, pageRect[0] + pageRect[2] * 0.32, accuracy: 10,
+                "The zoom should keep the tapped point anchored on the scrollable axis")
+        } else {
+            XCTAssertEqual(pageRect[2], viewportRect[2] * 0.97, accuracy: 8,
+                "A tap from height-fit should select width-fit with a small horizontal gutter")
+            XCTAssertEqual(anchorY, pageRect[1] + pageRect[3] * 0.38, accuracy: 10,
+                "The zoom should keep the tapped point anchored on the scrollable axis")
+        }
         for index in 0..<4 {
             XCTAssertEqual(canvasRect[index], pageRect[index], accuracy: 2,
                 "PDF page and PencilKit canvas must remain registered after zoom")
@@ -177,15 +194,24 @@ final class EditorInteractionUITests: XCTestCase {
         let secondTap = try point(app, info: zoomed, x: 0.75, y: 0.45)
         secondTap.doubleTap()
         var fitted = try info(page)
-        for _ in 0..<30 where abs(((fitted["rect"] as? [Double])?[3] ?? 0) - viewportRect[3]) > 8 {
+        for _ in 0..<30 {
+            guard let rect = fitted["rect"] as? [Double] else { break }
+            let fittedDimension = firstTapFitsHeight ? rect[2] : rect[3]
+            let viewportDimension = firstTapFitsHeight ? viewportRect[2] * 0.97 : viewportRect[3]
+            if abs(fittedDimension - viewportDimension) <= 8 { break }
             try await Task.sleep(for: .milliseconds(100))
             fitted = try info(page)
         }
         let fittedRect = try XCTUnwrap(fitted["rect"] as? [Double])
         let fittedViewport = try XCTUnwrap(fitted["viewportRect"] as? [Double])
         let fittedCanvas = try XCTUnwrap(fitted["canvasRect"] as? [Double])
-        XCTAssertEqual(fittedRect[3], fittedViewport[3], accuracy: 8,
-            "The next double tap should fit the page's long side to the viewport")
+        if firstTapFitsHeight {
+            XCTAssertEqual(fittedRect[2], fittedViewport[2] * 0.97, accuracy: 8,
+                "The next double tap should return to width-fit")
+        } else {
+            XCTAssertEqual(fittedRect[3], fittedViewport[3], accuracy: 8,
+                "The next double tap should return to height-fit")
+        }
         XCTAssertEqual(fittedRect[0] + fittedRect[2] / 2,
             fittedViewport[0] + fittedViewport[2] / 2, accuracy: 8,
             "PDFKit should center a page narrower than the viewport")

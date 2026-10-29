@@ -124,14 +124,14 @@ final class EditorTransitionAndSortingTests: XCTestCase {
         XCTAssertTrue(doubleTapRecognizers(in: pdf).allSatisfy { $0 === installed || !$0.isEnabled })
     }
 
-    func testDoubleTapFitModesAlternateShortSideThenLongSide() {
-        XCTAssertEqual(JotCanvasZoomCoordinator.PageFitMode.shortSide.next, .longSide)
-        XCTAssertEqual(JotCanvasZoomCoordinator.PageFitMode.longSide.next, .shortSide)
-
+    func testDoubleTapFitTargetIsSelectedFromCurrentScale() {
         let portrait = JotCanvasZoomCoordinator.PageFitScales(shortSide: 1.4, longSide: 0.8)
-        XCTAssertEqual(portrait.scale(for: .shortSide), 1.4)
-        XCTAssertEqual(portrait.scale(for: .longSide), 0.8)
-        XCTAssertNotEqual(portrait.scale(for: .shortSide), portrait.scale(for: .longSide))
+
+        XCTAssertEqual(JotCanvasZoomCoordinator.targetScale(current: 0.5, scales: portrait), 0.8)
+        XCTAssertEqual(JotCanvasZoomCoordinator.targetScale(current: 0.8, scales: portrait), 1.4)
+        XCTAssertEqual(JotCanvasZoomCoordinator.targetScale(current: 1.1, scales: portrait), 1.4)
+        XCTAssertEqual(JotCanvasZoomCoordinator.targetScale(current: 1.4, scales: portrait), 0.8)
+        XCTAssertEqual(JotCanvasZoomCoordinator.targetScale(current: 2.0, scales: portrait), 1.4)
     }
 
     private func makePDF(pageCount: Int) -> Data {
