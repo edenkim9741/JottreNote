@@ -50,11 +50,17 @@ private final class PersistentToolPickerAnchorView: UIView {
 final class EditJotViewController: UIViewController, @preconcurrency PDFPageOverlayViewProvider {
 
     #if !targetEnvironment(macCatalyst)
+    private struct ToolSelection {
+        let tool: any PKTool
+        let itemIdentifier: String
+    }
+
     private lazy var toolPicker = PKToolPicker()
     private lazy var pencilInteraction = UIPencilInteraction(delegate: self)
     private let persistentCanvasAnchor = PersistentToolPickerAnchorView(frame: .zero)
-    private var lastSelectedNonEraserTool: (any PKTool)?
-    private var previousSelectedTool: (any PKTool)?
+    private var selectedToolItemIdentifier: String?
+    private var lastSelectedNonEraserTool: ToolSelection?
+    private var previousSelectedTool: ToolSelection?
     private var isToolPickerObserverAttached = false
     private var isRestoringToolPicker = false
     private weak var activeLassoCanvas: JotCanvasView?
@@ -235,6 +241,12 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
         )
         NotificationCenter.default.addObserver(
             self,
+            selector: #selector(applicationWillTerminate),
+            name: UIApplication.willTerminateNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
             selector: #selector(pdfPageChanged),
             name: Notification.Name.PDFViewPageChanged,
             object: pdfView
@@ -296,6 +308,7 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
             isToolPickerObserverAttached = false
         }
         if let canvas = activeLassoCanvas {
+            toolPicker.removeObserver(canvas)
             toolPicker.setVisible(false, forFirstResponder: canvas)
             _ = canvas.resignFirstResponder()
         }
@@ -490,6 +503,7 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
         #endif
         guard overlayStore.remove(overlay, page: page) else { return }
         if activeLassoCanvas === canvas {
+            toolPicker.removeObserver(canvas)
             _ = canvas.resignFirstResponder()
             activeLassoCanvas = nil
             restorePersistentToolPickerIfNeeded()
@@ -580,9 +594,15 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
             let color = defaultsService.getValue(colorKey).flatMap { UIColor(hex: $0) } ?? .label
             let pen = PKInkingTool(.pen, color: color, width: CGFloat(width))
             selectedCanvasTool = pen
-            lastSelectedNonEraserTool = pen
-            previousSelectedTool = pen
             selectToolInPicker(pen)
+            let selection = ToolSelection(
+                tool: selectedToolFromPicker(),
+                itemIdentifier: toolPicker.selectedToolItemIdentifier
+            )
+            selectedCanvasTool = selection.tool
+            selectedToolItemIdentifier = selection.itemIdentifier
+            lastSelectedNonEraserTool = selection
+            previousSelectedTool = selection
             didSelectInitialPenTool = true
         }
         #endif
@@ -627,6 +647,12 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
         // The system Pencil-only preference can change while Jottre is
         // suspended. Refresh document navigation before the next gesture.
         synchronizePageInputState()
+    }
+
+    @objc
+    private func applicationWillTerminate() {
+        applicationBackgroundFlushTask?.cancel()
+        Task { @MainActor [viewModel] in await viewModel.applicationWillTerminate() }
     }
 
     @discardableResult
@@ -871,19 +897,55 @@ extension EditJotViewController: PKToolPickerObserver {
         return PKInkingTool(.pen)
     }
 
-    private func selectToolInPicker(_ tool: any PKTool) {
-        // Identifiers belong to the items installed in this picker. A newly
-        // constructed item can have a different identifier and select nothing.
-        let item = toolPicker.toolItems.first { item in
-            if let desired = tool as? PKInkingTool, let existing = item as? PKToolPickerInkingItem {
-                return existing.inkingTool.inkType == desired.inkType
-            }
-            if let desired = tool as? PKEraserTool, let existing = item as? PKToolPickerEraserItem {
-                return existing.eraserTool.eraserType == desired.eraserType
-            }
-            return tool is PKLassoTool && item is PKToolPickerLassoItem
+    private func selectToolInPicker(_ selection: ToolSelection) {
+        if toolPicker.toolItems.contains(where: { $0.identifier == selection.itemIdentifier }) {
+            toolPicker.selectedToolItemIdentifier = selection.itemIdentifier
+            return
         }
-        if let item { toolPicker.selectedToolItemIdentifier = item.identifier }
+
+        // Prefer an exact public-tool match, then fall back to the nearest
+        // installed item when the picker no longer contains the old item.
+        let exactItem = toolPicker.toolItems.first { Self.matches($0, selection.tool, includeSettings: true) }
+        let compatibleItem = exactItem ?? toolPicker.toolItems.first {
+            Self.matches($0, selection.tool, includeSettings: false)
+        }
+        if let compatibleItem { toolPicker.selectedToolItemIdentifier = compatibleItem.identifier }
+    }
+
+    private func selectToolInPicker(_ tool: any PKTool) {
+        guard let item = toolPicker.toolItems.first(where: {
+            Self.matches($0, tool, includeSettings: false)
+        }) else { return }
+        selectToolInPicker(ToolSelection(tool: tool, itemIdentifier: item.identifier))
+    }
+
+    private func selectEraserInPicker() {
+        // The system picker uses fixed-width bitmap eraser items on current
+        // iPadOS releases; requiring the legacy `.bitmap` type can miss them.
+        let eraserItem = toolPicker.toolItems.first { item in
+            (item as? PKToolPickerEraserItem)?.eraserTool.eraserType == .bitmap
+        } ?? toolPicker.toolItems.first { $0 is PKToolPickerEraserItem }
+        guard let eraserItem else { return }
+        toolPicker.selectedToolItemIdentifier = eraserItem.identifier
+    }
+
+    private static func matches(
+        _ item: PKToolPickerItem,
+        _ tool: any PKTool,
+        includeSettings: Bool
+    ) -> Bool {
+        if let desired = tool as? PKInkingTool, let candidate = item as? PKToolPickerInkingItem {
+            let actual = candidate.inkingTool
+            guard actual.inkType == desired.inkType else { return false }
+            guard includeSettings else { return true }
+            return actual.width == desired.width && actual.color.isEqual(desired.color)
+        }
+        if let desired = tool as? PKEraserTool, let candidate = item as? PKToolPickerEraserItem {
+            let actual = candidate.eraserTool
+            guard actual.eraserType == desired.eraserType else { return false }
+            return !includeSettings || actual.width == desired.width
+        }
+        return tool is PKLassoTool && item is PKToolPickerLassoItem
     }
 
 }
@@ -899,10 +961,15 @@ extension EditJotViewController: UIPencilInteractionDelegate {
         case .switchEraser:
             let selectedTool = selectedToolFromPicker()
             if selectedTool is PKEraserTool {
-                selectToolInPicker(lastSelectedNonEraserTool ?? PKInkingTool(.pen))
+                if let lastSelectedNonEraserTool {
+                    selectToolInPicker(lastSelectedNonEraserTool)
+                } else {
+                    selectToolInPicker(PKInkingTool(.pen))
+                }
             } else {
-                lastSelectedNonEraserTool = selectedTool
-                selectToolInPicker(PKEraserTool(.bitmap))
+                let identifier = toolPicker.selectedToolItemIdentifier
+                lastSelectedNonEraserTool = ToolSelection(tool: selectedTool, itemIdentifier: identifier)
+                selectEraserInPicker()
             }
         case .switchPrevious:
             if let previousSelectedTool {
@@ -989,7 +1056,13 @@ extension EditJotViewController {
         persistentCanvasAnchor.preservesFirstResponder = false
         _ = persistentCanvasAnchor.resignFirstResponder()
         if activeLassoCanvas !== canvas { _ = activeLassoCanvas?.resignFirstResponder() }
+        if let previousCanvas = activeLassoCanvas, previousCanvas !== canvas {
+            toolPicker.removeObserver(previousCanvas)
+        }
         activeLassoCanvas = canvas
+        // PKCanvasView handles picker attribute changes (including recoloring
+        // its active lasso selection) only while it observes this picker.
+        toolPicker.addObserver(canvas)
         if canvas.becomeFirstResponder() {
             toolPicker.setVisible(true, forFirstResponder: canvas)
         }
@@ -1015,7 +1088,10 @@ extension EditJotViewController {
             }
             return
         }
-        _ = activeLassoCanvas?.resignFirstResponder()
+        if let canvas = activeLassoCanvas {
+            toolPicker.removeObserver(canvas)
+            _ = canvas.resignFirstResponder()
+        }
         activeLassoCanvas = nil
         if !persistentCanvasAnchor.isFirstResponder { _ = persistentCanvasAnchor.becomeFirstResponder() }
         if !toolPicker.isVisible { toolPicker.setVisible(true, forFirstResponder: persistentCanvasAnchor) }
