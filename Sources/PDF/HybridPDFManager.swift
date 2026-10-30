@@ -311,55 +311,69 @@ enum HybridPDFManager {
     /// document. Normalize that identifier so export and backup produce the same
     /// bytes for the same source PDF and Jot state. Both identifiers remain
     /// content-derived and the replacement preserves the original byte length.
+    /// Mutate a single copy-on-write Data buffer instead of materializing multiple
+    /// whole-PDF byte arrays during large document saves.
     private static func canonicalizeDocumentIdentifier(in data: Data) -> Data {
-        var bytes = Array(data)
-        let token = Array("/ID".utf8)
-        guard bytes.count >= token.count,
-              let tokenStart = (0...(bytes.count - token.count)).reversed().first(where: {
-                  Array(bytes[$0..<$0 + token.count]) == token
-              }) else { return data }
+        let token = Data("/ID".utf8)
+        guard let tokenRange = data.range(of: token, options: .backwards) else { return data }
 
         func isWhitespace(_ byte: UInt8) -> Bool {
             byte == 0x00 || byte == 0x09 || byte == 0x0A || byte == 0x0C || byte == 0x0D || byte == 0x20
         }
-        var cursor = tokenStart + token.count
-        while cursor < bytes.count, isWhitespace(bytes[cursor]) { cursor += 1 }
-        guard cursor < bytes.count, bytes[cursor] == 0x5B else { return data }
-        cursor += 1
+        var cursor = tokenRange.upperBound
+        while cursor < data.endIndex, isWhitespace(data[cursor]) { cursor = data.index(after: cursor) }
+        guard cursor < data.endIndex, data[cursor] == 0x5B else { return data }
+        cursor = data.index(after: cursor)
 
-        func nextHexRange(in bytes: [UInt8], cursor: inout Int) -> Range<Int>? {
-            while cursor < bytes.count, isWhitespace(bytes[cursor]) { cursor += 1 }
-            guard cursor < bytes.count, bytes[cursor] == 0x3C else { return nil }
-            cursor += 1
+        func nextHexRange(in bytes: Data, cursor: inout Data.Index) -> Range<Data.Index>? {
+            while cursor < bytes.endIndex, isWhitespace(bytes[cursor]) { cursor = bytes.index(after: cursor) }
+            guard cursor < bytes.endIndex, bytes[cursor] == 0x3C else { return nil }
+            cursor = bytes.index(after: cursor)
             let start = cursor
-            while cursor < bytes.count, bytes[cursor] != 0x3E {
+            while cursor < bytes.endIndex, bytes[cursor] != 0x3E {
                 let byte = bytes[cursor]
                 let isHex = (0x30...0x39).contains(byte) || (0x41...0x46).contains(byte) || (0x61...0x66).contains(byte)
                 guard isHex else { return nil }
-                cursor += 1
+                cursor = bytes.index(after: cursor)
             }
-            guard cursor < bytes.count else { return nil }
+            guard cursor < bytes.endIndex else { return nil }
             let range = start..<cursor
-            cursor += 1
+            cursor = bytes.index(after: cursor)
             return range
         }
 
-        guard let firstID = nextHexRange(in: bytes, cursor: &cursor),
-              let secondID = nextHexRange(in: bytes, cursor: &cursor),
-              firstID.count == secondID.count,
-              firstID.count >= 32,
-              firstID.count.isMultiple(of: 2) else { return data }
+        guard let firstID = nextHexRange(in: data, cursor: &cursor),
+              let secondID = nextHexRange(in: data, cursor: &cursor),
+              data.distance(from: firstID.lowerBound, to: firstID.upperBound)
+                == data.distance(from: secondID.lowerBound, to: secondID.upperBound),
+              data.distance(from: firstID.lowerBound, to: firstID.upperBound) >= 32,
+              data.distance(from: firstID.lowerBound, to: firstID.upperBound).isMultiple(of: 2) else { return data }
 
-        var normalized = bytes
-        normalized.replaceSubrange(firstID, with: repeatElement(UInt8(0x30), count: firstID.count))
-        normalized.replaceSubrange(secondID, with: repeatElement(UInt8(0x30), count: secondID.count))
-        let digest = Array(SHA256.hash(data: Data(normalized)))
-        let identifier = digest.prefix(firstID.count / 2).flatMap { byte in
-            [Array("0123456789abcdef".utf8)[Int(byte >> 4)], Array("0123456789abcdef".utf8)[Int(byte & 0x0F)]]
+        let idLength = data.distance(from: firstID.lowerBound, to: firstID.upperBound)
+        var normalized = data
+        for range in [firstID, secondID] {
+            var index = range.lowerBound
+            while index < range.upperBound {
+                normalized[index] = 0x30
+                index = normalized.index(after: index)
+            }
         }
-        bytes.replaceSubrange(firstID, with: identifier)
-        bytes.replaceSubrange(secondID, with: identifier)
-        return Data(bytes)
+        let digest = SHA256.hash(data: normalized)
+        let hex = Array("0123456789abcdef".utf8)
+        var identifier: [UInt8] = []
+        identifier.reserveCapacity(idLength)
+        for byte in digest.prefix(idLength / 2) {
+            identifier.append(hex[Int(byte >> 4)])
+            identifier.append(hex[Int(byte & 0x0F)])
+        }
+        for range in [firstID, secondID] {
+            var index = range.lowerBound
+            for byte in identifier {
+                normalized[index] = byte
+                index = normalized.index(after: index)
+            }
+        }
+        return normalized
     }
 }
 

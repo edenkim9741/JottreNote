@@ -1630,6 +1630,35 @@ final class HybridPDFTests: XCTestCase {
         XCTAssertGreaterThan(changedPixels, 0, "The exported PDF rendering must include the ink appearance.")
     }
 
+    func testRepeatedPDFKitSerializationPreservesHybridPayloadAndInk() throws {
+        let pdf = try makePDF(pageSize: CGSize(width: 240, height: 320), rotation: 0)
+        let drawing = PKDrawing(strokes: [makeStroke()])
+        let jotData = Data("stable-diagnostic-regression".utf8)
+
+        func save() throws -> Data {
+            try HybridPDFManager.saveWithPDFKitAnnotations(
+                pdfData: pdf,
+                jotData: jotData,
+                drawing: drawing,
+                strokePageIndices: [0],
+                canvasPageSize: CGSize(width: 1200, height: 1600)
+            )
+        }
+
+        let first = try save()
+        let second = try save()
+
+        for saved in [first, second] {
+            let document = try XCTUnwrap(PDFDocument(data: HybridPDFManager.pdfData(in: saved)))
+            XCTAssertEqual(document.pageCount, 1)
+            XCTAssertEqual(
+                document.page(at: 0)?.annotations.filter { $0.contents == PDFAnnotationConverter.marker }.count,
+                1
+            )
+            XCTAssertEqual(HybridPDFManager.embeddedJotData(in: saved), jotData)
+        }
+    }
+
     func testCropOffsetAndRotationMapCanvasCornersToPageCoordinates() {
         let bounds = CGRect(x: 40, y: 70, width: 240, height: 320)
         let displaySize = PDFAnnotationConverter.displaySize(for: bounds, rotation: 90)
