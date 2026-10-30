@@ -262,6 +262,7 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
+        JottreDiagnostics.shared.record("editor.opened")
         #if !targetEnvironment(macCatalyst)
         pencilInteraction.isEnabled = true
         synchronizeSelectedToolFromPicker()
@@ -291,6 +292,7 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
+        JottreDiagnostics.shared.record("editor.closed")
         zoomCoordinator.stopObservingDoubleTapZoom()
         gestureCoordinator.removeUndoDoubleTapGesture()
         (navigationController?.navigationBar as? JottreNavigationBar)?
@@ -823,6 +825,7 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
     @objc private func pdfPageChanged() {
         guard !isInstallingPDFDocument else { return }
         guard let pageIndex = currentPDFPageIndex else { return }
+        JottreDiagnostics.shared.recordPage(pageIndex, strokeCount: viewModel.currentDrawing.strokes.count)
         pendingScrollPage = pageIndex
         defaultsService.set(lastPageKey, value: pageIndex)
         #if !targetEnvironment(macCatalyst)
@@ -1421,6 +1424,7 @@ extension EditJotViewController: PKCanvasViewDelegate {
                 strokePageIndices: inkCanvasCoordinator.committedStrokePageIndices,
                 changedPageIndices: [pageIndex]
             )
+            JottreDiagnostics.shared.updateInkState(strokeCount: inkCanvasCoordinator.committedDrawing.strokes.count)
             return
         }
     }

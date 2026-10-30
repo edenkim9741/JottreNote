@@ -238,6 +238,9 @@ final class EditJotViewModel {
                 } catch {
                     guard !(error is CancellationError) else { return }
                     progressContinuation.yield(nil)
+                    JottreDiagnostics.shared.record("pdf.load.failed", details: [
+                        "errorType": String(reflecting: type(of: error))
+                    ])
                     logger.error("Failed to read drawing: \(error)")
                 }
             }

@@ -137,6 +137,7 @@ struct EditJotRepository: EditJotRepositoryProtocol {
         jotFileInfo: JotFile.Info,
         onProgress: @Sendable (Double) -> Void
     ) async throws -> JotContent {
+        let loadStarted = ContinuousClock.now
         onProgress(0.1)
         let file = try jotFileService.readJotFile(jotFileInfo: jotFileInfo)
         onProgress(0.5)
@@ -145,11 +146,26 @@ struct EditJotRepository: EditJotRepositoryProtocol {
         let sourceJot = file.jot
         let drawing = try PKDrawing(data: sourceJot.drawing)
         let storedPDFData = file.jot.pdfData
+        JottreDiagnostics.shared.record("pdf.load.started", details: [
+            "pdfSizeBytes": storedPDFData?.count ?? 0
+        ])
+        JottreDiagnostics.shared.sampleMemoryNow(for: "pdf.load.before")
         let pdfData = storedPDFData.map(HybridPDFManager.pdfData(in:))
         let pageCount = pdfData.flatMap { PDFDocument(data: $0)?.pageCount } ?? 0
         let hasEmbeddedJot = storedPDFData.map { HybridPDFManager.embeddedJotData(in: $0) != nil } ?? false
         print("[Load] PDF Data Size: \(pdfData?.count ?? 0), PageCount: \(pageCount), Embedded Jot Found: \(hasEmbeddedJot), Drawing Strokes: \(drawing.strokes.count)")
         onProgress(0.9)
+        let elapsed = loadStarted.duration(to: .now)
+        JottreDiagnostics.shared.recordDocument(
+            identifier: jotFileInfo.url.lastPathComponent,
+            pdfSize: pdfData?.count ?? 0,
+            pageCount: pageCount,
+            strokeCount: drawing.strokes.count
+        )
+        JottreDiagnostics.shared.record("pdf.load.completed", details: [
+            "durationMilliseconds": JottreDiagnostics.milliseconds(elapsed)
+        ])
+        JottreDiagnostics.shared.sampleMemoryNow(for: "pdf.load.after")
         return JotContent(
             drawing: drawing,
             width: sourceJot.width,
@@ -169,6 +185,10 @@ struct EditJotRepository: EditJotRepositoryProtocol {
         jotFileInfo: JotFile.Info,
         content: JotContent
     ) async throws {
+        JottreDiagnostics.shared.record("persistence.snapshot.encoded", details: [
+            "strokeCount": content.drawing.strokes.count,
+            "pdfSizeBytes": content.pdfData?.count ?? 0
+        ])
         let drawingData = content.drawing.dataRepresentation()
         let strokes = content.drawing.strokes
         let strokePageIndices = content.strokePageIndices.count == strokes.count
@@ -384,6 +404,13 @@ actor EditJotPersistenceWriter {
 
             let result: Result<Void, any Error>
             let saveStartedAt = ContinuousClock.now
+            JottreDiagnostics.shared.recordPersistenceStarted(
+                identifier: jotFileInfo.url.lastPathComponent,
+                revision: snapshot.revision,
+                strokeCount: snapshot.content.drawing.strokes.count,
+                pdfSizeBytes: snapshot.content.pdfData?.count ?? 0
+            )
+            JottreDiagnostics.shared.sampleMemoryNow(for: "persistence.before")
             do {
                 // PDFKit serialization, PencilKit encoding and cache writes are
                 // CPU/disk work. Keep them off the editor's executor even when
@@ -393,9 +420,27 @@ actor EditJotPersistenceWriter {
                 }.value
                 let elapsed = saveStartedAt.duration(to: .now)
                 print("[SaveDebounce] Save completed for revision \(snapshot.revision) in \(elapsed) on utility worker.")
+                JottreDiagnostics.shared.recordPersistence(
+                    identifier: jotFileInfo.url.lastPathComponent,
+                    revision: snapshot.revision,
+                    strokeCount: snapshot.content.drawing.strokes.count,
+                    result: "success",
+                    durationMilliseconds: JottreDiagnostics.milliseconds(elapsed)
+                )
+                JottreDiagnostics.shared.sampleMemoryNow(for: "persistence.after")
                 result = .success(())
             } catch {
                 logger.error("Failed to persist jot: \(error)")
+                let elapsed = saveStartedAt.duration(to: .now)
+                JottreDiagnostics.shared.recordPersistence(
+                    identifier: jotFileInfo.url.lastPathComponent,
+                    revision: snapshot.revision,
+                    strokeCount: snapshot.content.drawing.strokes.count,
+                    result: "failure",
+                    durationMilliseconds: JottreDiagnostics.milliseconds(elapsed),
+                    errorType: String(reflecting: type(of: error))
+                )
+                JottreDiagnostics.shared.sampleMemoryNow(for: "persistence.failed")
                 result = .failure(error)
             }
 

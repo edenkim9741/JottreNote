@@ -172,6 +172,9 @@ enum HybridPDFManager {
         let canvasPageStride = canvasPageSize.height + canvasPageSpacing
         guard canvasPageStride.isFinite, canvasPageStride > 0 else { throw Failure.invalidDrawing }
         let cleanPDF = try EmbeddedFileStore.pdfData(from: pdfData)
+        let saveStarted = ContinuousClock.now
+        JottreDiagnostics.shared.recordPDFSaveStage("started", byteCount: cleanPDF.count)
+        JottreDiagnostics.shared.sampleMemoryNow(for: "pdf.save.before")
         guard var document = PDFDocument(data: cleanPDF), document.pageCount > 0 else {
             throw Failure.invalidPDF
         }
@@ -227,9 +230,27 @@ enum HybridPDFManager {
             guard attachedCount >= annotations.count else { throw Failure.annotationNotRetained }
         }
 
+        let serializationStarted = ContinuousClock.now
         guard let serializedPDF = document.dataRepresentation() else { throw Failure.invalidPDF }
+        JottreDiagnostics.shared.recordPDFSaveStage(
+            "pdfkitSerialized",
+            durationMilliseconds: JottreDiagnostics.milliseconds(serializationStarted.duration(to: .now)),
+            byteCount: serializedPDF.count
+        )
+        let normalizationStarted = ContinuousClock.now
         let annotatedPDF = canonicalizeDocumentIdentifier(in: serializedPDF)
+        JottreDiagnostics.shared.recordPDFSaveStage(
+            "identifierNormalized",
+            durationMilliseconds: JottreDiagnostics.milliseconds(normalizationStarted.duration(to: .now)),
+            byteCount: annotatedPDF.count
+        )
+        let embeddingStarted = ContinuousClock.now
         let hybrid = try EmbeddedFileStore.replacing(data: jotData, in: annotatedPDF)
+        JottreDiagnostics.shared.recordPDFSaveStage(
+            "jotEmbedded",
+            durationMilliseconds: JottreDiagnostics.milliseconds(embeddingStarted.duration(to: .now)),
+            byteCount: hybrid.count
+        )
         guard let savedDocument = PDFDocument(data: HybridPDFManager.pdfData(in: hybrid)),
               savedDocument.pageCount == document.pageCount else {
             throw Failure.invalidPDF
@@ -240,6 +261,12 @@ enum HybridPDFManager {
             }.count ?? 0
         }
         guard savedAnnotationCount == expectedCount else { throw Failure.annotationNotRetained }
+        JottreDiagnostics.shared.recordPDFSaveStage(
+            "completed",
+            durationMilliseconds: JottreDiagnostics.milliseconds(saveStarted.duration(to: .now)),
+            byteCount: hybrid.count
+        )
+        JottreDiagnostics.shared.sampleMemoryNow(for: "pdf.save.after")
         return hybrid
     }
 
