@@ -536,26 +536,18 @@ private final class ZoteroLibraryViewModel: ObservableObject {
     }
 
     func attachmentGroups(for location: ZoteroLibraryLocation) -> [ZoteroAttachmentGroup] {
-        let visibleAttachments = attachments(for: location)
-        var order: [String] = []
-        var grouped: [String: [ZoteroAttachment]] = [:]
-        for attachment in visibleAttachments {
-            let groupKey = attachment.parentItemKey ?? attachment.key
-            if grouped[groupKey] == nil { order.append(groupKey) }
-            grouped[groupKey, default: []].append(attachment)
-        }
-        return order.compactMap { key in
-            guard let attachments = grouped[key], !attachments.isEmpty else { return nil }
-            let parent = snapshot.items[key]
-            var details = parent?.creators.prefix(2).joined(separator: ", ") ?? ""
-            if let year = parent?.year { details += details.isEmpty ? year : " · \(year)" }
-            return ZoteroAttachmentGroup(
-                key: key,
-                title: parent?.title ?? attachments[0].filename,
-                subtitle: details,
-                attachments: attachments
-            )
-        }
+        ZoteroLibraryAttachmentProjection.groups(for: attachments(for: location), in: snapshot)
+    }
+
+    func hasUsableLocalFile(for attachment: ZoteroAttachment) -> Bool {
+        cacheStore.hasUsableLocalFile(for: attachment)
+    }
+
+    func displayStatus(for attachment: ZoteroAttachment) -> ZoteroAttachmentDisplayStatus {
+        ZoteroAttachmentDisplayStatus.resolve(
+            syncStatus: attachment.syncStatus,
+            hasLocalFile: hasUsableLocalFile(for: attachment)
+        )
     }
 
     private func isOrderedBefore(_ lhs: ZoteroAttachment, _ rhs: ZoteroAttachment) -> Bool {
@@ -626,10 +618,21 @@ private final class ZoteroLibraryViewModel: ObservableObject {
         do {
             let sourceData: Data
             let loadedFromLocalCache: Bool
-            if let path = currentAttachment.localCachePath,
-               FileManager.default.fileExists(atPath: path) {
-                sourceData = try Data(contentsOf: URL(fileURLWithPath: path))
-                loadedFromLocalCache = true
+            let hasLocalFile = cacheStore.hasUsableLocalFile(for: currentAttachment)
+            if currentAttachment.syncStatus == .dirty && !hasLocalFile {
+                throw ZoteroCacheStore.Failure.invalidLocalAttachmentFile
+            }
+            if hasLocalFile, let path = currentAttachment.localCachePath {
+                if let localData = try? Data(contentsOf: URL(fileURLWithPath: path)),
+                   ZoteroCacheStore.isSupportedAttachmentData(localData) {
+                    sourceData = localData
+                    loadedFromLocalCache = true
+                } else if currentAttachment.syncStatus == .dirty {
+                    throw ZoteroCacheStore.Failure.invalidLocalAttachmentFile
+                } else {
+                    sourceData = try await makeSyncService().download(documentID: attachment.key)
+                    loadedFromLocalCache = false
+                }
             } else {
                 sourceData = try await makeSyncService().download(documentID: attachment.key)
                 loadedFromLocalCache = false
@@ -895,6 +898,9 @@ struct ZoteroLibraryView: View {
         .onReceive(NotificationCenter.default.publisher(for: .zoteroAttachmentCacheChanged)) { _ in
             model.refreshCacheState()
         }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+            model.refreshCacheState()
+        }
         .onReceive(NotificationCenter.default.publisher(for: .zoteroEditorDidEnd)) { _ in
             Task { await model.synchronize() }
         }
@@ -1090,7 +1096,8 @@ struct ZoteroLibraryView: View {
         subtitle: String,
         selectionKey: String
     ) -> some View {
-        Button {
+        let displayStatus = model.displayStatus(for: attachment)
+        return Button {
             if model.isSelecting {
                 model.toggleSelection(for: selectionKey)
             } else if attachment.isConflict {
@@ -1101,10 +1108,10 @@ struct ZoteroLibraryView: View {
         } label: {
             HStack(spacing: 12) {
                 if model.isSelecting { selectionIndicator(for: selectionKey) }
-                Image(systemName: statusSymbol(attachment))
-                    .foregroundStyle(statusColor(attachment))
+                Image(systemName: statusSymbol(displayStatus))
+                    .foregroundStyle(statusColor(displayStatus))
                     .frame(width: 24)
-                    .accessibilityLabel(statusDescription(attachment))
+                    .accessibilityLabel(statusDescription(displayStatus))
                 VStack(alignment: .leading, spacing: 4) {
                     Text(title).font(.headline).lineLimit(2)
                     if !subtitle.isEmpty {
@@ -1200,24 +1207,29 @@ struct ZoteroLibraryView: View {
         }
     }
 
-    private func statusDescription(_ attachment: ZoteroAttachment) -> String {
-        switch attachment.syncStatus {
+    private func statusDescription(_ status: ZoteroAttachmentDisplayStatus) -> String {
+        switch status {
         case .cloudOnly: String(localized: "zotero.status.cloudOnly")
         case .downloaded: String(localized: "zotero.status.downloaded")
-        case .dirty: String(localized: "zotero.status.pendingSync")
+        case .pendingSync: String(localized: "zotero.status.pendingSync")
+        case .missingLocalChanges: String(localized: "zotero.status.missingLocalChanges")
         }
     }
 
-    private func statusSymbol(_ attachment: ZoteroAttachment) -> String {
-        switch attachment.syncStatus {
+    private func statusSymbol(_ status: ZoteroAttachmentDisplayStatus) -> String {
+        switch status {
         case .cloudOnly: "icloud"
         case .downloaded: "arrow.down.circle.fill"
-        case .dirty: "arrow.triangle.2.circlepath"
+        case .pendingSync: "arrow.triangle.2.circlepath"
+        case .missingLocalChanges: "exclamationmark.triangle.fill"
         }
     }
 
-    private func statusColor(_ attachment: ZoteroAttachment) -> Color {
-        attachment.syncStatus == .dirty ? .orange : .secondary
+    private func statusColor(_ status: ZoteroAttachmentDisplayStatus) -> Color {
+        switch status {
+        case .pendingSync, .missingLocalChanges: .orange
+        case .cloudOnly, .downloaded: .secondary
+        }
     }
 }
 

@@ -303,12 +303,35 @@ final class ZoteroCacheStore: @unchecked Sendable {
     func load(userID: String) -> ZoteroCacheSnapshot {
         withCacheAccess {
             guard let data = try? Data(contentsOf: url(for: userID)),
-                  let snapshot = try? decoder.decode(ZoteroCacheSnapshot.self, from: data),
+                  var snapshot = try? decoder.decode(ZoteroCacheSnapshot.self, from: data),
                   snapshot.userID == userID else {
                 return .empty(userID: userID)
             }
+            var repairedMissingLocalFiles = false
+            for (key, var attachment) in snapshot.attachments
+                where attachment.syncStatus == .downloaded && !attachment.isConflict && !attachment.isLocalOnly {
+                guard !hasUsableLocalFile(for: attachment) else { continue }
+                attachment.localCachePath = nil
+                attachment.md5 = nil
+                attachment.syncStatus = .cloudOnly
+                snapshot.attachments[key] = attachment
+                repairedMissingLocalFiles = true
+            }
+            if repairedMissingLocalFiles { try? saveUnlocked(snapshot) }
             return snapshot
         }
+    }
+
+    /// Returns true only for a readable PDF cache owned by this attachment.
+    /// Checking this attachment's recorded path, file type, size, and header keeps
+    /// library rendering cheap without opening or hashing the full document.
+    func hasUsableLocalFile(for attachment: ZoteroAttachment) -> Bool {
+        guard let path = attachment.localCachePath, !path.isEmpty else { return false }
+        return isUsableLocalCacheFile(at: URL(fileURLWithPath: path))
+    }
+
+    static func isSupportedAttachmentData(_ data: Data) -> Bool {
+        hasSupportedAttachmentHeader(data.prefix(1_024))
     }
 
     func save(_ snapshot: ZoteroCacheSnapshot) throws {
@@ -656,6 +679,9 @@ final class ZoteroCacheStore: @unchecked Sendable {
 
     func markDownloaded(key: String, path: URL, md5: String, userID: String) throws -> ZoteroCacheSnapshot {
         try updateAttachment(key: key, userID: userID) { attachment in
+            guard isUsableLocalCacheFile(at: path) else {
+                throw Failure.invalidLocalAttachmentFile
+            }
             attachment.localCachePath = path.path
             attachment.syncStatus = .downloaded
             attachment.md5 = md5
@@ -710,10 +736,22 @@ final class ZoteroCacheStore: @unchecked Sendable {
                 try saveUnlocked(snapshot)
                 return snapshot
             }
-            if let path = attachment.localCachePath,
-               !FileManager.default.fileExists(atPath: path) {
-                try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+            guard Self.isSupportedAttachmentData(data) else {
+                throw Failure.invalidLocalAttachmentFile
             }
+            let cacheURL = attachment.localCachePath.map(URL.init(fileURLWithPath:))
+                ?? defaultPDFCacheURL(for: canonicalKey)
+            if !isUsableLocalCacheFile(at: cacheURL) {
+                try FileManager.default.createDirectory(
+                    at: cacheURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                try data.write(to: cacheURL, options: .atomic)
+            }
+            guard isUsableLocalCacheFile(at: cacheURL) else {
+                throw Failure.invalidLocalAttachmentFile
+            }
+            attachment.localCachePath = cacheURL.path
             attachment.md5 = uploadedMD5
             // Zotero's attachment metadata hashes the standards PDF stored in
             // the ZIP, while `md5` tracks the local hybrid cache bytes.
@@ -903,8 +941,14 @@ final class ZoteroCacheStore: @unchecked Sendable {
             guard var attachment = snapshot.attachments[key] else { throw Failure.attachmentNotFound }
             guard !attachment.isConflict && !attachment.isLocalOnly else { return }
             let url = defaultPDFCacheURL(for: key)
+            guard Self.isSupportedAttachmentData(data) else {
+                throw Failure.invalidLocalAttachmentFile
+            }
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             try data.write(to: url, options: .atomic)
+            guard isUsableLocalCacheFile(at: url) else {
+                throw Failure.invalidLocalAttachmentFile
+            }
             attachment.localCachePath = url.path
             attachment.syncStatus = .downloaded
             attachment.md5 = ZoteroSyncService.md5Hex(data)
@@ -1169,12 +1213,12 @@ final class ZoteroCacheStore: @unchecked Sendable {
     private func updateAttachment(
         key: String,
         userID: String,
-        update: (inout ZoteroAttachment) -> Void
+        update: (inout ZoteroAttachment) throws -> Void
     ) throws -> ZoteroCacheSnapshot {
         try withCacheAccess {
             var snapshot = loadUnlocked(userID: userID)
             guard var attachment = snapshot.attachments[key] else { throw Failure.attachmentNotFound }
-            update(&attachment)
+            try update(&attachment)
             snapshot.attachments[key] = attachment
             try saveUnlocked(snapshot)
             return snapshot
@@ -1204,6 +1248,25 @@ final class ZoteroCacheStore: @unchecked Sendable {
             .appendingPathComponent("\(key).pdf")
     }
 
+    private func isUsableLocalCacheFile(at url: URL) -> Bool {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              attributes[.type] as? FileAttributeType == .typeRegular,
+              (attributes[.size] as? NSNumber)?.int64Value ?? 0 > 0,
+              let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? handle.close() }
+        guard let header = try? handle.read(upToCount: 1_024) else { return false }
+        return Self.isSupportedAttachmentData(header)
+    }
+
+    private static func hasSupportedAttachmentHeader(_ data: Data) -> Bool {
+        if data.range(of: Data("%PDF-".utf8)) != nil { return true }
+        guard data.count >= 4, data[data.startIndex] == 0x50, data[data.startIndex + 1] == 0x4B else {
+            return false
+        }
+        let signature = [data[data.startIndex + 2], data[data.startIndex + 3]]
+        return signature == [0x03, 0x04] || signature == [0x05, 0x06] || signature == [0x07, 0x08]
+    }
+
     private static func normalizedMD5(_ value: String?) -> String? {
         guard let value else { return nil }
         let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -1213,5 +1276,6 @@ final class ZoteroCacheStore: @unchecked Sendable {
     enum Failure: Error {
         case cacheAdvancedDuringSync, attachmentNotFound, dirtyAttachmentCannotBeOffloaded
         case invalidPendingDraft, pendingDraftNotFound, itemNotFound, conflictNotFound
+        case invalidLocalAttachmentFile
     }
 }

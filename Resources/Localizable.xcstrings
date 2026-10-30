@@ -8453,6 +8453,23 @@
         }
       }
     },
+    "zotero.status.missingLocalChanges" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pending changes, but the local file is missing"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "동기화 대기 중이나 로컬 파일이 없습니다"
+          }
+        }
+      }
+    },
     "zotero.settings.account" : {
       "extractionState" : "manual",
       "localizations" : {

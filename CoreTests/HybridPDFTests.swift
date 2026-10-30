@@ -720,7 +720,7 @@ final class HybridPDFTests: XCTestCase {
         let key = "ABCD2345"
         let parentKey = "PARENT23"
         let localPDF = Data("local hybrid handwriting".utf8)
-        let remotePDF = Data("remote updated PDF".utf8)
+        let remotePDF = try makePDF(pageSize: CGSize(width: 240, height: 320), rotation: 0)
         let store = ZoteroCacheStore()
         let item = ZoteroItem(
             key: parentKey,
@@ -944,7 +944,7 @@ final class HybridPDFTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: try XCTUnwrap(localAttachment.localCachePath))), localData)
 
         let (serverStore, serverUserID, serverConflictKey, _, _) = try seededStore("server")
-        let serverData = Data("latest-zotero-server".utf8)
+        let serverData = try makePDF(pageSize: CGSize(width: 240, height: 320), rotation: 0)
         let serverResolved = try serverStore.resolveConflictKeepingServer(
             key: serverConflictKey, serverData: serverData, userID: serverUserID
         )
@@ -1369,6 +1369,121 @@ final class HybridPDFTests: XCTestCase {
         }
         XCTAssertEqual(snapshot.items[parent.key]?.title, parent.title)
         XCTAssertEqual(Set(snapshot.attachments.keys), ["ATTACH11"])
+    }
+
+    func testLocalFileDisplayDoesNotTrustStaleSyncStatus() {
+        XCTAssertEqual(
+            ZoteroAttachmentDisplayStatus.resolve(syncStatus: .downloaded, hasLocalFile: false),
+            .cloudOnly
+        )
+        XCTAssertEqual(
+            ZoteroAttachmentDisplayStatus.resolve(syncStatus: .cloudOnly, hasLocalFile: true),
+            .downloaded
+        )
+        XCTAssertEqual(
+            ZoteroAttachmentDisplayStatus.resolve(syncStatus: .dirty, hasLocalFile: true),
+            .pendingSync
+        )
+        XCTAssertEqual(
+            ZoteroAttachmentDisplayStatus.resolve(syncStatus: .dirty, hasLocalFile: false),
+            .missingLocalChanges
+        )
+    }
+
+    func testCacheLoadRepairsMissingDownloadedFilesButPreservesDirtyAttachments() throws {
+        let userID = "missing-cache-\(UUID().uuidString)"
+        let store = ZoteroCacheStore()
+        let parent = ZoteroItem(
+            key: "PARENT25", title: "Cache Test", creators: [], year: nil,
+            parentItemKey: nil, collectionKeys: [], itemType: "document",
+            dateAdded: Date(), dateModified: Date(), version: 1, isTrashed: false
+        )
+        let pdf = try makePDF(pageSize: CGSize(width: 240, height: 320), rotation: 0)
+        let hybrid = try HybridPDFManager.embedJotPreservingSourcePDF(pdfData: pdf, jotData: Data("jot".utf8))
+        let downloaded = ZoteroAttachment(
+            key: "ATTACH21", parentItemKey: parent.key, contentType: "application/pdf",
+            filename: "downloaded.pdf", localCachePath: nil, syncStatus: .cloudOnly,
+            version: 1, md5: nil, modificationTimeMilliseconds: nil
+        )
+        let dirty = ZoteroAttachment(
+            key: "ATTACH22", parentItemKey: parent.key, contentType: "application/pdf",
+            filename: "dirty.pdf", localCachePath: nil, syncStatus: .cloudOnly,
+            version: 1, md5: nil, modificationTimeMilliseconds: nil
+        )
+        let downloadedURL = try store.registerCreatedDocument(
+            item: parent, attachment: downloaded, hybridPDF: hybrid, libraryVersion: 1, userID: userID
+        )
+        let dirtyURL = try store.registerCreatedDocument(
+            item: parent, attachment: dirty, hybridPDF: hybrid, libraryVersion: 1, userID: userID
+        )
+        defer { _ = try? store.permanentlyDeleteItems(keys: [parent.key], userID: userID) }
+
+        var snapshot = store.load(userID: userID)
+        var downloadedState = try XCTUnwrap(snapshot.attachments[downloaded.key])
+        downloadedState.syncStatus = .downloaded
+        downloadedState.remoteMD5 = "remote-checksum"
+        downloadedState.remoteMD5IsPDF = true
+        snapshot.attachments[downloaded.key] = downloadedState
+        try store.save(snapshot)
+        try FileManager.default.removeItem(at: downloadedURL)
+        try FileManager.default.removeItem(at: dirtyURL)
+
+        let repaired = store.load(userID: userID)
+        XCTAssertEqual(repaired.attachments[downloaded.key]?.syncStatus, .cloudOnly)
+        XCTAssertNil(repaired.attachments[downloaded.key]?.localCachePath)
+        XCTAssertEqual(repaired.attachments[downloaded.key]?.remoteMD5, "remote-checksum")
+        XCTAssertEqual(repaired.attachments[dirty.key]?.syncStatus, .dirty)
+        XCTAssertEqual(repaired.attachments[dirty.key]?.localCachePath, dirtyURL.path)
+        XCTAssertFalse(store.hasUsableLocalFile(for: try XCTUnwrap(repaired.attachments[dirty.key])))
+    }
+
+    func testCacheValidationRejectsUnrelatedAndNonPDFFiles() throws {
+        let userID = "cache-validation-\(UUID().uuidString)"
+        let store = ZoteroCacheStore()
+        let parent = ZoteroItem(
+            key: "PARENT26", title: "Validation Test", creators: [], year: nil,
+            parentItemKey: nil, collectionKeys: [], itemType: "document",
+            dateAdded: Date(), dateModified: Date(), version: 1, isTrashed: false
+        )
+        let attachment = ZoteroAttachment(
+            key: "ATTACH31", parentItemKey: parent.key, contentType: "application/pdf",
+            filename: "same-name.pdf", localCachePath: nil, syncStatus: .cloudOnly,
+            version: 1, md5: nil, modificationTimeMilliseconds: nil
+        )
+        let pdf = try makePDF(pageSize: CGSize(width: 240, height: 320), rotation: 0)
+        let hybrid = try HybridPDFManager.embedJotPreservingSourcePDF(pdfData: pdf, jotData: Data("jot".utf8))
+        let cacheURL = try store.registerCreatedDocument(
+            item: parent, attachment: attachment, hybridPDF: hybrid, libraryVersion: 1, userID: userID
+        )
+        defer { _ = try? store.permanentlyDeleteItems(keys: [parent.key], userID: userID) }
+
+        let cachedAttachment = try XCTUnwrap(store.load(userID: userID).attachments[attachment.key])
+        XCTAssertTrue(store.hasUsableLocalFile(for: cachedAttachment))
+
+        let unrelatedDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: unrelatedDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: unrelatedDirectory) }
+        let sameNamedFile = unrelatedDirectory.appendingPathComponent(cacheURL.lastPathComponent)
+        try hybrid.write(to: sameNamedFile)
+        var unrelatedAttachment = cachedAttachment
+        unrelatedAttachment.localCachePath = nil
+        XCTAssertFalse(store.hasUsableLocalFile(for: unrelatedAttachment))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sameNamedFile.path),
+            "An unrelated same-named file must not stand in for this attachment's recorded cache path")
+
+        var directoryAttachment = cachedAttachment
+        directoryAttachment.localCachePath = unrelatedDirectory.path
+        XCTAssertFalse(store.hasUsableLocalFile(for: directoryAttachment))
+
+        let emptyFile = unrelatedDirectory.appendingPathComponent("empty.pdf")
+        try Data().write(to: emptyFile)
+        var emptyAttachment = cachedAttachment
+        emptyAttachment.localCachePath = emptyFile.path
+        XCTAssertFalse(store.hasUsableLocalFile(for: emptyAttachment))
+
+        try Data("not a PDF".utf8).write(to: cacheURL)
+        XCTAssertFalse(store.hasUsableLocalFile(for: cachedAttachment))
     }
 
     func testSoftTrashPreservesCachedPDFAndPermanentDeleteRemovesIt() throws {
