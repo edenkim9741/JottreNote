@@ -2,7 +2,7 @@ import SwiftUI
 @preconcurrency import PencilKit
 import Network
 
-private enum ZoteroLibraryLocation: Hashable {
+enum ZoteroLibraryLocation: Hashable {
     case myLibrary
     case collection(String)
     case unfiled
@@ -27,12 +27,79 @@ private enum ZoteroNoteOrientation: String, CaseIterable, Identifiable {
     }
 }
 
-private struct ZoteroAttachmentGroup: Identifiable {
+struct ZoteroAttachmentGroup: Identifiable {
     let key: String
     let title: String
     let subtitle: String
     let attachments: [ZoteroAttachment]
     var id: String { key }
+}
+
+enum ZoteroAttachmentDisplayStatus: Equatable {
+    case cloudOnly
+    case downloaded
+    case pendingSync
+    case missingLocalChanges
+
+    static func resolve(syncStatus: ZoteroAttachmentSyncStatus, hasLocalFile: Bool) -> Self {
+        switch syncStatus {
+        case .cloudOnly, .downloaded:
+            return hasLocalFile ? .downloaded : .cloudOnly
+        case .dirty:
+            return hasLocalFile ? .pendingSync : .missingLocalChanges
+        }
+    }
+}
+
+enum ZoteroLibraryAttachmentProjection {
+    static func attachments(
+        in snapshot: ZoteroCacheSnapshot,
+        location: ZoteroLibraryLocation
+    ) -> [ZoteroAttachment] {
+        snapshot.attachments.values.filter { attachment in
+            let attachmentItem = snapshot.items[attachment.key]
+            let attachmentIsTrashed = attachmentItem?.isTrashed ?? false
+            let owner = attachment.parentItemKey.flatMap { snapshot.items[$0] } ?? attachmentItem
+            guard let owner else { return location == .myLibrary && !attachmentIsTrashed }
+
+            switch location {
+            case .myLibrary:
+                return !owner.isTrashed && !attachmentIsTrashed
+            case .collection(let key):
+                return !owner.isTrashed && !attachmentIsTrashed && owner.collectionKeys.contains(key)
+            case .unfiled:
+                return !owner.isTrashed && !attachmentIsTrashed
+                    && owner.collectionKeys.isEmpty && owner.parentItemKey == nil
+            case .trash:
+                return owner.isTrashed || attachmentIsTrashed
+            }
+        }
+    }
+
+    static func groups(
+        for visibleAttachments: [ZoteroAttachment],
+        in snapshot: ZoteroCacheSnapshot
+    ) -> [ZoteroAttachmentGroup] {
+        var order: [String] = []
+        var grouped: [String: [ZoteroAttachment]] = [:]
+        for attachment in visibleAttachments {
+            let groupKey = attachment.parentItemKey ?? attachment.key
+            if grouped[groupKey] == nil { order.append(groupKey) }
+            grouped[groupKey, default: []].append(attachment)
+        }
+        return order.compactMap { key in
+            guard let attachments = grouped[key], !attachments.isEmpty else { return nil }
+            let parent = snapshot.items[key]
+            var details = parent?.creators.prefix(2).joined(separator: ", ") ?? ""
+            if let year = parent?.year { details += details.isEmpty ? year : " · \(year)" }
+            return ZoteroAttachmentGroup(
+                key: key,
+                title: parent?.title ?? attachments[0].filename,
+                subtitle: details,
+                attachments: attachments
+            )
+        }
+    }
 }
 
 @MainActor
@@ -464,21 +531,8 @@ private final class ZoteroLibraryViewModel: ObservableObject {
     }
 
     func attachments(for location: ZoteroLibraryLocation) -> [ZoteroAttachment] {
-        snapshot.attachments.values.filter { attachment in
-            let owner = attachment.parentItemKey.flatMap { snapshot.items[$0] }
-                ?? snapshot.items[attachment.key]
-            guard let owner else { return location == .myLibrary }
-            switch location {
-            case .myLibrary:
-                return !owner.isTrashed
-            case .collection(let key):
-                return !owner.isTrashed && owner.collectionKeys.contains(key)
-            case .unfiled:
-                return !owner.isTrashed && owner.collectionKeys.isEmpty && owner.parentItemKey == nil
-            case .trash:
-                return owner.isTrashed
-            }
-        }.sorted(by: isOrderedBefore)
+        ZoteroLibraryAttachmentProjection.attachments(in: snapshot, location: location)
+            .sorted(by: isOrderedBefore)
     }
 
     func attachmentGroups(for location: ZoteroLibraryLocation) -> [ZoteroAttachmentGroup] {
@@ -924,12 +978,17 @@ struct ZoteroLibraryView: View {
                         attachment,
                         title: model.title(for: attachment),
                         subtitle: model.subtitle(for: attachment),
-                        selectionKey: group.key
+                        selectionKey: attachmentSelectionKey(attachment, groupKey: group.key)
                     )
                 } else {
                     DisclosureGroup(isExpanded: expandedBinding(for: group.key)) {
                         ForEach(group.attachments) { attachment in
-                            attachmentRow(attachment, title: attachment.filename, subtitle: "", selectionKey: group.key)
+                            attachmentRow(
+                                attachment,
+                                title: attachment.filename,
+                                subtitle: "",
+                                selectionKey: attachmentSelectionKey(attachment, groupKey: group.key)
+                            )
                         }
                     } label: {
                         HStack(spacing: 10) {
@@ -949,7 +1008,11 @@ struct ZoteroLibraryView: View {
                                 .background(.quaternary, in: Capsule())
                         }
                         .contentShape(Rectangle())
-                        .contextMenu { documentContextMenu(itemKey: group.key) }
+                        .contextMenu {
+                            if model.selection != .trash || model.snapshot.items[group.key]?.isTrashed == true {
+                                documentContextMenu(itemKey: group.key)
+                            }
+                        }
                     }
                 }
             }
@@ -1061,6 +1124,14 @@ struct ZoteroLibraryView: View {
         }
         .buttonStyle(.plain)
         .contextMenu { documentContextMenu(itemKey: selectionKey) }
+    }
+
+    private func attachmentSelectionKey(_ attachment: ZoteroAttachment, groupKey: String) -> String {
+        if model.selection == .trash,
+           model.snapshot.items[attachment.key]?.isTrashed == true {
+            return attachment.key
+        }
+        return groupKey
     }
 
     @ViewBuilder

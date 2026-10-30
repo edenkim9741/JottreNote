@@ -1260,6 +1260,117 @@ final class HybridPDFTests: XCTestCase {
         XCTAssertEqual(restorePayload, ["deleted": false])
     }
 
+    func testAttachmentGroupsShrinkWhenPDFChildrenAreTrashed() throws {
+        let parent = ZoteroItem(
+            key: "PARENT23", title: "Paper A", creators: ["Ada Lovelace"], year: "1843",
+            parentItemKey: nil, collectionKeys: ["COLL2345"], itemType: "document",
+            dateAdded: Date(), dateModified: Date(), version: 1, isTrashed: false
+        )
+        let childKeys = ["ATTACH01", "ATTACH02", "ATTACH03"]
+        let childItems = childKeys.map { key in
+            ZoteroItem(
+                key: key, title: "\(key).pdf", creators: [], year: nil,
+                parentItemKey: parent.key, collectionKeys: [], itemType: "attachment",
+                dateAdded: Date(), dateModified: Date(), version: 1, isTrashed: false
+            )
+        }
+        let attachments = childKeys.map { key in
+            ZoteroAttachment(
+                key: key, parentItemKey: parent.key, contentType: "application/pdf",
+                filename: "\(key).pdf", localCachePath: nil, syncStatus: .cloudOnly,
+                version: 1, md5: nil, modificationTimeMilliseconds: nil
+            )
+        }
+        var snapshot = ZoteroCacheSnapshot(
+            userID: "groups-\(UUID().uuidString)", lastLibraryVersion: 1,
+            collections: [:], items: Dictionary(uniqueKeysWithValues: ([parent] + childItems).map { ($0.key, $0) }),
+            attachments: Dictionary(uniqueKeysWithValues: attachments.map { ($0.key, $0) }),
+            lastSyncedAt: Date()
+        )
+
+        func groupSizes(_ location: ZoteroLibraryLocation) -> [Int] {
+            ZoteroLibraryAttachmentProjection.groups(
+                for: ZoteroLibraryAttachmentProjection.attachments(in: snapshot, location: location),
+                in: snapshot
+            ).map(\.attachments.count)
+        }
+
+        XCTAssertEqual(groupSizes(.myLibrary), [3])
+        XCTAssertTrue(groupSizes(.trash).isEmpty)
+
+        for key in ["ATTACH03", "ATTACH02"] {
+            let child = snapshot.items[key]!
+            snapshot.items[key] = ZoteroItem(
+                key: child.key, title: child.title, creators: child.creators, year: child.year,
+                parentItemKey: child.parentItemKey, collectionKeys: child.collectionKeys,
+                itemType: child.itemType, dateAdded: child.dateAdded, dateModified: Date(),
+                version: child.version + 1, isTrashed: true
+            )
+            XCTAssertEqual(groupSizes(.myLibrary), key == "ATTACH03" ? [2] : [1])
+            XCTAssertEqual(groupSizes(.trash), key == "ATTACH03" ? [1] : [2])
+        }
+
+        let finalGroup = try XCTUnwrap(
+            ZoteroLibraryAttachmentProjection.groups(
+                for: ZoteroLibraryAttachmentProjection.attachments(in: snapshot, location: .myLibrary),
+                in: snapshot
+            ).first
+        )
+        XCTAssertEqual(finalGroup.key, parent.key)
+        XCTAssertEqual(finalGroup.attachments.map(\.key), ["ATTACH01"])
+    }
+
+    func testRemoteDeletionDeltaShrinksPDFGroupToOneCurrentAttachment() throws {
+        let userID = "group-delta-\(UUID().uuidString)"
+        let store = ZoteroCacheStore()
+        let parent = ZoteroItem(
+            key: "PARENT24", title: "Paper B", creators: [], year: nil,
+            parentItemKey: nil, collectionKeys: [], itemType: "document",
+            dateAdded: Date(), dateModified: Date(), version: 1, isTrashed: false
+        )
+        let childKeys = ["ATTACH11", "ATTACH12", "ATTACH13"]
+        let children = childKeys.map { key in
+            ZoteroItem(
+                key: key, title: "\(key).pdf", creators: [], year: nil,
+                parentItemKey: parent.key, collectionKeys: [], itemType: "attachment",
+                dateAdded: Date(), dateModified: Date(), version: 1, isTrashed: false
+            )
+        }
+        let attachments = childKeys.map { key in
+            ZoteroAttachment(
+                key: key, parentItemKey: parent.key, contentType: "application/pdf",
+                filename: "\(key).pdf", localCachePath: nil, syncStatus: .cloudOnly,
+                version: 1, md5: nil, modificationTimeMilliseconds: nil
+            )
+        }
+        defer { _ = try? store.permanentlyDeleteItems(keys: [parent.key], userID: userID) }
+
+        var snapshot = try store.apply(
+            ZoteroLibraryDelta(
+                sinceVersion: 0, libraryVersion: 1, collections: [],
+                items: [parent] + children, attachments: attachments,
+                deletedCollectionKeys: [], deletedItemKeys: []
+            ),
+            userID: userID
+        )
+        for (version, key) in [(2, "ATTACH13"), (3, "ATTACH12")] {
+            snapshot = try store.apply(
+                ZoteroLibraryDelta(
+                    sinceVersion: version - 1, libraryVersion: version, collections: [],
+                    items: [], attachments: [], deletedCollectionKeys: [], deletedItemKeys: [key]
+                ),
+                userID: userID
+            )
+            let groups = ZoteroLibraryAttachmentProjection.groups(
+                for: ZoteroLibraryAttachmentProjection.attachments(in: snapshot, location: .myLibrary),
+                in: snapshot
+            )
+            XCTAssertEqual(groups.map(\.attachments.count), version == 2 ? [2] : [1])
+        }
+        XCTAssertEqual(snapshot.items[parent.key]?.title, parent.title)
+        XCTAssertEqual(Set(snapshot.attachments.keys), ["ATTACH11"])
+    }
+
     func testSoftTrashPreservesCachedPDFAndPermanentDeleteRemovesIt() throws {
         let userID = "trash-\(UUID().uuidString)"
         let store = ZoteroCacheStore()
