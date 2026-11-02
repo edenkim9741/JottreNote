@@ -338,7 +338,9 @@ struct ZoteroAPIClient: Sendable {
         firstName: String,
         lastName: String,
         fullName: String,
-        date: Date = Date()
+        date: Date = Date(),
+        parentItemKey: String? = nil,
+        pdfAttachmentKey: String? = nil
     ) async throws -> CreatedZoteroDocumentKeys {
         let trimmedFullName = fullName.trimmingCharacters(in: .whitespacesAndNewlines)
         let creator = ZoteroCreator(
@@ -357,7 +359,9 @@ struct ZoteroAPIClient: Sendable {
             collectionKeys: collectionKeys,
             itemType: "document",
             metadataFields: ["date": dateFormatter.string(from: date)],
-            creators: [creator]
+            creators: [creator],
+            parentItemKey: parentItemKey,
+            pdfAttachmentKey: pdfAttachmentKey
         )
     }
 
@@ -423,11 +427,16 @@ struct ZoteroAPIClient: Sendable {
         )
     }
 
-    func createPDFAttachment(parentItemKey: String, filename: String) async throws -> (key: String, libraryVersion: Int) {
+    func createPDFAttachment(
+        parentItemKey: String,
+        filename: String,
+        attachmentKey: String? = nil
+    ) async throws -> (key: String, libraryVersion: Int) {
         guard Int(userID) != nil, ZoteroSyncService.isValidKey(parentItemKey) else {
             throw Failure.invalidUserID
         }
-        let attachmentKey = Self.generateItemKey()
+        let attachmentKey = attachmentKey ?? Self.generateItemKey()
+        guard ZoteroSyncService.isValidKey(attachmentKey) else { throw Failure.invalidKey }
         let payload: [String: Any] = [
             "key": attachmentKey,
             "version": 0,

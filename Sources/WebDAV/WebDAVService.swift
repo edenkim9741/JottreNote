@@ -11,6 +11,7 @@ struct WebDAVService: Sendable {
     let baseURL: URL
     let username: String
     let password: String
+    private let session: URLSession
 
     private static let session: URLSession = {
         let configuration = URLSessionConfiguration.ephemeral
@@ -18,6 +19,13 @@ struct WebDAVService: Sendable {
         configuration.timeoutIntervalForResource = 60
         return URLSession(configuration: configuration)
     }()
+
+    init(baseURL: URL, username: String, password: String, session: URLSession? = nil) {
+        self.baseURL = baseURL
+        self.username = username
+        self.password = password
+        self.session = session ?? Self.session
+    }
 
     func upload(
         data: Data,
@@ -79,7 +87,7 @@ struct WebDAVService: Sendable {
     private func send(_ request: URLRequest) async throws -> (Data, URLResponse) {
         for attempt in 0..<3 {
             do {
-                let result = try await Self.session.data(for: request)
+                let result = try await session.data(for: request)
                 if let response = result.1 as? HTTPURLResponse,
                    Self.isTransientStatus(response.statusCode), attempt < 2 {
                     try await Task.sleep(for: .seconds(attempt + 1))

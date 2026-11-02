@@ -856,6 +856,26 @@ final class ZoteroCacheStore: @unchecked Sendable {
         )
     }
 
+    func registerPendingAttachment(
+        parentItem: ZoteroItem,
+        attachment: ZoteroAttachment,
+        hybridPDF: Data,
+        userID: String
+    ) throws -> URL {
+        guard !parentItem.isPendingSync,
+              attachment.isPendingSync,
+              attachment.parentItemKey == parentItem.key else {
+            throw Failure.invalidPendingDraft
+        }
+        return try registerCreatedDocument(
+            item: parentItem,
+            attachment: attachment,
+            hybridPDF: hybridPDF,
+            libraryVersion: load(userID: userID).lastLibraryVersion,
+            userID: userID
+        )
+    }
+
     func pendingDrafts(userID: String) -> [(item: ZoteroItem, attachment: ZoteroAttachment)] {
         let snapshot = load(userID: userID)
         return snapshot.attachments.values
@@ -889,7 +909,13 @@ final class ZoteroCacheStore: @unchecked Sendable {
                     at: newPath.deletingLastPathComponent(),
                     withIntermediateDirectories: true
                 )
-                try FileManager.default.copyItem(at: oldPath, to: newPath)
+                if oldPath.path != newPath.path {
+                    if FileManager.default.fileExists(atPath: newPath.path) {
+                        _ = try FileManager.default.replaceItemAt(newPath, withItemAt: oldPath)
+                    } else {
+                        try FileManager.default.copyItem(at: oldPath, to: newPath)
+                    }
+                }
                 if let data = try? Data(contentsOf: newPath),
                    let loaded = try? HybridPDFManager.load(data: data) {
                     var remappedJot = loaded.jot
@@ -947,6 +973,82 @@ final class ZoteroCacheStore: @unchecked Sendable {
                 isTrashed: false
             )
             snapshot.attachments[created.attachmentKey] = oldAttachment
+            snapshot.lastLibraryVersion = max(snapshot.lastLibraryVersion, version)
+            try saveUnlocked(snapshot)
+            if let oldPath, oldPath.path != newPath.path {
+                try? FileManager.default.removeItem(at: oldPath)
+            }
+        }
+    }
+
+    func promotePendingAttachment(
+        temporaryAttachmentKey: String,
+        createdAttachmentKey: String,
+        version: Int,
+        userID: String
+    ) throws {
+        try withCacheAccess {
+            var snapshot = loadUnlocked(userID: userID)
+            guard var attachment = snapshot.attachments[temporaryAttachmentKey],
+                  attachment.isPendingSync,
+                  let parentKey = attachment.parentItemKey,
+                  let parent = snapshot.items[parentKey],
+                  !parent.isPendingSync else {
+                throw Failure.pendingDraftNotFound
+            }
+            let oldPath = attachment.localCachePath.map(URL.init(fileURLWithPath:))
+            let newPath = defaultPDFCacheURL(for: createdAttachmentKey)
+            if let oldPath, oldPath.path != newPath.path,
+               FileManager.default.fileExists(atPath: oldPath.path) {
+                try FileManager.default.createDirectory(
+                    at: newPath.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                try FileManager.default.copyItem(at: oldPath, to: newPath)
+            }
+            guard FileManager.default.fileExists(atPath: newPath.path),
+                  let loaded = try? HybridPDFManager.load(data: Data(contentsOf: newPath)) else {
+                throw Failure.invalidLocalAttachmentFile
+            }
+            var remappedJot = loaded.jot
+            remappedJot.zoteroItemKey = createdAttachmentKey
+            remappedJot.zoteroFileName = attachment.filename
+            let jotData = try JotHybridPDFBuilder.encodedJotData(remappedJot)
+            let remapped = try HybridPDFManager.embedJotPreservingSourcePDF(
+                pdfData: loaded.pdfData,
+                jotData: jotData
+            )
+            try remapped.write(to: newPath, options: .atomic)
+
+            snapshot.items.removeValue(forKey: temporaryAttachmentKey)
+            snapshot.attachments.removeValue(forKey: temporaryAttachmentKey)
+            if temporaryAttachmentKey != createdAttachmentKey {
+                snapshot.keyAliases[temporaryAttachmentKey] = createdAttachmentKey
+            }
+            attachment.key = createdAttachmentKey
+            attachment.parentItemKey = parentKey
+            attachment.localCachePath = newPath.path
+            attachment.version = version
+            attachment.md5 = ZoteroSyncService.md5Hex(remapped)
+            attachment.remoteMD5 = nil
+            attachment.remoteMD5IsPDF = false
+            attachment.syncStatus = .dirty
+            attachment.isPendingSync = false
+            attachment.syncError = nil
+            snapshot.items[createdAttachmentKey] = ZoteroItem(
+                key: createdAttachmentKey,
+                title: attachment.filename,
+                creators: [],
+                year: nil,
+                parentItemKey: parentKey,
+                collectionKeys: [],
+                itemType: "attachment",
+                dateAdded: Date(),
+                dateModified: Date(),
+                version: version,
+                isTrashed: false
+            )
+            snapshot.attachments[createdAttachmentKey] = attachment
             snapshot.lastLibraryVersion = max(snapshot.lastLibraryVersion, version)
             try saveUnlocked(snapshot)
             if let oldPath, oldPath.path != newPath.path {

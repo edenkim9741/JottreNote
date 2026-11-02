@@ -111,6 +111,25 @@ actor ZoteroSyncEngine {
                         message: String(localized: "zotero.sync.status.creatingItems")
                     )
                     do {
+                        if !draft.item.isPendingSync {
+                            print("[ZoteroSync] Registering a pending PDF note under existing item \(draft.item.key).")
+                            let createdAttachment = try await apiClient.createPDFAttachment(
+                                parentItemKey: draft.item.key,
+                                filename: draft.attachment.filename,
+                                attachmentKey: ZoteroSyncService.isValidKey(draft.attachment.key)
+                                    ? draft.attachment.key
+                                    : nil
+                            )
+                            try cacheStore.promotePendingAttachment(
+                                temporaryAttachmentKey: draft.attachment.key,
+                                createdAttachmentKey: createdAttachment.key,
+                                version: createdAttachment.libraryVersion,
+                                userID: userID
+                            )
+                            print("[ZoteroSync] Registered PDF attachment \(createdAttachment.key) under existing parent \(draft.item.key).")
+                            continue
+                        }
+
                         let created: CreatedZoteroDocumentKeys
                         if draft.item.metadataFields.isEmpty {
                             let author = draft.item.creators.first ?? ""
@@ -121,7 +140,11 @@ actor ZoteroSyncEngine {
                                 firstName: "",
                                 lastName: "",
                                 fullName: author,
-                                date: draft.item.dateAdded ?? Date()
+                                date: draft.item.dateAdded ?? Date(),
+                                parentItemKey: ZoteroSyncService.isValidKey(draft.item.key) ? draft.item.key : nil,
+                                pdfAttachmentKey: ZoteroSyncService.isValidKey(draft.attachment.key)
+                                    ? draft.attachment.key
+                                    : nil
                             )
                         } else {
                             created = try await apiClient.createItemWithPDFAttachment(

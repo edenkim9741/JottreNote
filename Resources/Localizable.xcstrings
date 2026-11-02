@@ -9184,6 +9184,40 @@
         }
       }
     },
+    "zotero.import.addAttachment" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Add Attachment"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "첨부 추가"
+          }
+        }
+      }
+    },
+    "zotero.import.addNote" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "New Note"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "새 노트"
+          }
+        }
+      }
+    },
     "zotero.import.addPDF" : {
       "extractionState" : "manual",
       "localizations" : {

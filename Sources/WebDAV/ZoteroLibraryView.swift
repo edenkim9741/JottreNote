@@ -400,7 +400,7 @@ private final class ZoteroLibraryViewModel: ObservableObject {
         sorting.save(to: defaults)
     }
 
-    func createDocument(title: String, pageSize: CGSize) async -> String? {
+    func createDocument(title: String, pageSize: CGSize, parentItemKey: String? = nil) async -> String? {
         let resolvedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !resolvedTitle.isEmpty else { return String(localized: "zotero.create.titleRequired") }
         var sessionIDForCleanup: String?
@@ -411,8 +411,25 @@ private final class ZoteroLibraryViewModel: ObservableObject {
             let fullName = defaults.getValue(.zoteroDefaultAuthorFullName) ?? ""
             let firstName = defaults.getValue(.zoteroDefaultAuthorFirstName) ?? ""
             let lastName = defaults.getValue(.zoteroDefaultAuthorLastName) ?? ""
-            let temporaryParentKey = "temp_\(UUID().uuidString)"
-            let temporaryAttachmentKey = "temp_\(UUID().uuidString)"
+            let existingParent: ZoteroItem?
+            if let parentItemKey {
+                guard ZoteroSyncService.isValidKey(parentItemKey),
+                      let parent = snapshot.items[parentItemKey],
+                      parent.parentItemKey == nil,
+                      !parent.isPendingSync,
+                      !parent.isTrashed,
+                      !["attachment", "note", "annotation"].contains(parent.itemType) else {
+                    return String(localized: "zotero.create.failed")
+                }
+                existingParent = parent
+            } else {
+                existingParent = nil
+            }
+            let temporaryParentKey = existingParent?.key ?? ZoteroAPIClient.generateItemKey()
+            var temporaryAttachmentKey = ZoteroAPIClient.generateItemKey()
+            while temporaryAttachmentKey == temporaryParentKey {
+                temporaryAttachmentKey = ZoteroAPIClient.generateItemKey()
+            }
             let sessionID = jotSessionID(for: temporaryAttachmentKey)
             sessionIDForCleanup = sessionID
             if onOpenJot != nil {
@@ -421,24 +438,24 @@ private final class ZoteroLibraryViewModel: ObservableObject {
                     sessionID: sessionID
                 )
             }
-            let item = ZoteroItem(
-                key: temporaryParentKey,
-                title: resolvedTitle,
-                creators: Self.authorDisplayNames(
-                    first: firstName,
-                    last: lastName,
-                    full: fullName
-                ),
-                year: Calendar(identifier: .gregorian).component(.year, from: now).description,
-                parentItemKey: nil,
-                collectionKeys: selectedCollectionKeys,
-                itemType: "document",
-                dateAdded: now,
-                dateModified: now,
-                version: snapshot.lastLibraryVersion,
-                isTrashed: false,
-                isPendingSync: true
-            )
+            let item = existingParent ?? ZoteroItem(
+                    key: temporaryParentKey,
+                    title: resolvedTitle,
+                    creators: Self.authorDisplayNames(
+                        first: firstName,
+                        last: lastName,
+                        full: fullName
+                    ),
+                    year: Calendar(identifier: .gregorian).component(.year, from: now).description,
+                    parentItemKey: nil,
+                    collectionKeys: selectedCollectionKeys,
+                    itemType: "document",
+                    dateAdded: now,
+                    dateModified: now,
+                    version: snapshot.lastLibraryVersion,
+                    isTrashed: false,
+                    isPendingSync: true
+                )
             let attachment = ZoteroAttachment(
                 key: temporaryAttachmentKey,
                 parentItemKey: temporaryParentKey,
@@ -461,12 +478,22 @@ private final class ZoteroLibraryViewModel: ObservableObject {
                 zoteroFileName: filename
             )
             let hybridPDF = try JotHybridPDFBuilder.buildHybridPDF(jot: jot)
-            let cacheURL = try cacheStore.registerOfflineDraft(
-                item: item,
-                attachment: attachment,
-                hybridPDF: hybridPDF,
-                userID: userID
-            )
+            let cacheURL: URL
+            if existingParent == nil {
+                cacheURL = try cacheStore.registerOfflineDraft(
+                    item: item,
+                    attachment: attachment,
+                    hybridPDF: hybridPDF,
+                    userID: userID
+                )
+            } else {
+                cacheURL = try cacheStore.registerPendingAttachment(
+                    parentItem: item,
+                    attachment: attachment,
+                    hybridPDF: hybridPDF,
+                    userID: userID
+                )
+            }
             let fileURL = try localJotURL(for: temporaryAttachmentKey)
             let jotWithPDF = Jot(
                 drawing: empty.drawing,
@@ -492,8 +519,11 @@ private final class ZoteroLibraryViewModel: ObservableObject {
                 return String(localized: "zotero.create.offlineDraft")
             }
             await synchronize()
-            let pending = cacheStore.load(userID: userID).attachments[temporaryAttachmentKey]?.isPendingSync == true
-            return pending ? String(localized: "zotero.create.offlineDraft") : nil
+            let currentKey = cacheStore.canonicalAttachmentKey(temporaryAttachmentKey, userID: userID)
+            let currentAttachment = cacheStore.load(userID: userID).attachments[currentKey]
+            if currentAttachment?.isPendingSync == true { return String(localized: "zotero.create.offlineDraft") }
+            if currentAttachment?.syncStatus == .dirty { return String(localized: "zotero.create.uploadFailed") }
+            return nil
         } catch {
             if !didOpenEditor, let sessionIDForCleanup {
                 await endEditingSession(sessionID: sessionIDForCleanup, requestSynchronization: true)
@@ -926,6 +956,7 @@ struct ZoteroLibraryView: View {
     @ObservedObject private var syncProgress: ZoteroSyncProgress
     @State private var showingSettings = false
     @State private var showingNewDocument = false
+    @State private var newNoteParentKey: String?
     @State private var showingPDFImporter = false
     @State private var showingAttachmentImporter = false
     @State private var showingPDFCreation = false
@@ -1028,9 +1059,15 @@ struct ZoteroLibraryView: View {
                 Task { await model.reloadAccountAndSynchronize() }
             }
         }
-        .sheet(isPresented: $showingNewDocument) {
+        .sheet(isPresented: $showingNewDocument, onDismiss: {
+            newNoteParentKey = nil
+        }) {
             ZoteroCreateDocumentSheet { title, pageSize in
-                let result = await model.createDocument(title: title, pageSize: pageSize)
+                let result = await model.createDocument(
+                    title: title,
+                    pageSize: pageSize,
+                    parentItemKey: newNoteParentKey
+                )
                 if result == String(localized: "zotero.create.offlineDraft") {
                     creationNotice = result
                     return nil
@@ -1284,11 +1321,23 @@ struct ZoteroLibraryView: View {
                        groupItem.parentItemKey == nil,
                        !["attachment", "note", "annotation"].contains(groupItem.itemType),
                        !groupItem.isTrashed {
-                        Button {
-                            pendingAttachmentParentKey = group.key
-                            showingAttachmentImporter = true
+                        Menu {
+                            Button {
+                                pendingAttachmentParentKey = group.key
+                                expandedAttachmentGroups.insert(group.key)
+                                showingAttachmentImporter = true
+                            } label: {
+                                Label(String(localized: "zotero.import.addPDF"), systemImage: "doc.badge.plus")
+                            }
+                            Button {
+                                newNoteParentKey = group.key
+                                expandedAttachmentGroups.insert(group.key)
+                                showingNewDocument = true
+                            } label: {
+                                Label(String(localized: "zotero.import.addNote"), systemImage: "square.and.pencil")
+                            }
                         } label: {
-                            Label(String(localized: "zotero.import.addPDF"), systemImage: "plus")
+                            Label(String(localized: "zotero.import.addAttachment"), systemImage: "plus")
                                 .font(.subheadline.weight(.medium))
                         }
                         .buttonStyle(.borderless)
@@ -1465,11 +1514,23 @@ struct ZoteroLibraryView: View {
             } else {
                 if item.parentItemKey == nil,
                    !["attachment", "note", "annotation"].contains(item.itemType) {
-                    Button {
-                        pendingAttachmentParentKey = itemKey
-                        showingAttachmentImporter = true
+                    Menu {
+                        Button {
+                            pendingAttachmentParentKey = itemKey
+                            expandedAttachmentGroups.insert(itemKey)
+                            showingAttachmentImporter = true
+                        } label: {
+                            Label(String(localized: "zotero.import.addPDF"), systemImage: "doc.badge.plus")
+                        }
+                        Button {
+                            newNoteParentKey = itemKey
+                            expandedAttachmentGroups.insert(itemKey)
+                            showingNewDocument = true
+                        } label: {
+                            Label(String(localized: "zotero.import.addNote"), systemImage: "square.and.pencil")
+                        }
                     } label: {
-                        Label(String(localized: "zotero.import.addPDF"), systemImage: "doc.badge.plus")
+                        Label(String(localized: "zotero.import.addAttachment"), systemImage: "plus")
                     }
                 }
                 Button {

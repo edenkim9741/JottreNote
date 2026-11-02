@@ -1478,6 +1478,225 @@ final class HybridPDFTests: XCTestCase {
         XCTAssertEqual(promoted.creators, ["Ada Lovelace"])
     }
 
+    func testExistingParentCanOwnAPendingPDFNoteWithoutBecomingADraft() throws {
+        let userID = "pending-child-\(UUID().uuidString)"
+        let store = ZoteroCacheStore()
+        let parent = ZoteroItem(
+            key: "PARENT29",
+            title: "Existing Article",
+            creators: ["Jane Doe"],
+            year: "2024",
+            parentItemKey: nil,
+            collectionKeys: [],
+            itemType: "journalArticle",
+            dateAdded: Date(),
+            dateModified: Date(),
+            version: 1,
+            isTrashed: false
+        )
+        let key = "ATTACH29"
+        defer { _ = try? store.permanentlyDeleteItems(keys: [parent.key], userID: userID) }
+        let pdf = try makePDF(pageSize: CGSize(width: 240, height: 320), rotation: 0)
+        let hybrid = try JotHybridPDFBuilder.buildHybridPDF(jot: Jot(
+            drawing: Jot.makeEmpty().drawing,
+            width: Jot.defaultWidth,
+            pdfData: pdf,
+            zoteroItemKey: key,
+            zoteroFileName: "Note.pdf"
+        ))
+
+        _ = try store.registerPendingAttachment(
+            parentItem: parent,
+            attachment: ZoteroAttachment(
+                key: key,
+                parentItemKey: parent.key,
+                contentType: "application/pdf",
+                filename: "Note.pdf",
+                localCachePath: nil,
+                syncStatus: .dirty,
+                version: parent.version,
+                md5: nil,
+                modificationTimeMilliseconds: nil,
+                isPendingSync: true
+            ),
+            hybridPDF: hybrid,
+            userID: userID
+        )
+
+        let pending = try XCTUnwrap(store.pendingDrafts(userID: userID).first)
+        XCTAssertEqual(pending.item.key, parent.key)
+        XCTAssertFalse(pending.item.isPendingSync)
+        XCTAssertTrue(pending.attachment.isPendingSync)
+
+        try store.promotePendingAttachment(
+            temporaryAttachmentKey: key,
+            createdAttachmentKey: key,
+            version: 2,
+            userID: userID
+        )
+        let snapshot = store.load(userID: userID)
+        XCTAssertEqual(snapshot.items[parent.key]?.itemType, "journalArticle")
+        XCTAssertEqual(snapshot.items[parent.key]?.title, "Existing Article")
+        XCTAssertFalse(try XCTUnwrap(snapshot.attachments[key]).isPendingSync)
+        XCTAssertEqual(snapshot.attachments[key]?.syncStatus, .dirty)
+        let cachedPDF = try Data(contentsOf: URL(fileURLWithPath: try XCTUnwrap(snapshot.attachments[key]?.localCachePath)))
+        let remapped = try HybridPDFManager.load(data: cachedPDF)
+        XCTAssertEqual(remapped.jot.zoteroItemKey, key)
+    }
+
+    func testPendingPDFNoteForExistingItemRegistersChildThenEnqueuesItsUpload() async throws {
+        let userID = "existing-note-\(UUID().uuidString)"
+        let store = ZoteroCacheStore()
+        let parent = ZoteroItem(
+            key: "PARENT26",
+            title: "Existing Article",
+            creators: ["Jane Doe"],
+            year: "2024",
+            parentItemKey: nil,
+            collectionKeys: ["COLL2345"],
+            itemType: "journalArticle",
+            dateAdded: Date(),
+            dateModified: Date(),
+            version: 1,
+            isTrashed: false
+        )
+        let attachmentKey = "ATTACH27"
+        let filename = "Meeting Notes.pdf"
+        let pdf = try makePDF(pageSize: CGSize(width: 240, height: 320), rotation: 0)
+        let hybrid = try JotHybridPDFBuilder.buildHybridPDF(jot: Jot(
+            drawing: Jot.makeEmpty().drawing,
+            width: Jot.defaultWidth,
+            pdfData: pdf,
+            zoteroItemKey: attachmentKey,
+            zoteroFileName: filename
+        ))
+        _ = try store.registerPendingAttachment(
+            parentItem: parent,
+            attachment: ZoteroAttachment(
+                key: attachmentKey,
+                parentItemKey: parent.key,
+                contentType: "application/pdf",
+                filename: filename,
+                localCachePath: nil,
+                syncStatus: .dirty,
+                version: 1,
+                md5: nil,
+                modificationTimeMilliseconds: nil,
+                isPendingSync: true
+            ),
+            hybridPDF: hybrid,
+            userID: userID
+        )
+        defer { _ = try? store.permanentlyDeleteItems(keys: [parent.key], userID: userID) }
+
+        let recorder = ZoteroRequestRecorder()
+        ZoteroCreationURLProtocol.configure { request, _ in
+            let path = request.url?.path ?? ""
+            if request.url?.host == "webdav.test" {
+                recorder.append(request)
+                return (201, Data())
+            }
+            if path.hasSuffix("/deleted") {
+                return (200, Data(#"{"collections":[],"items":[]}"#.utf8))
+            }
+            if path.hasSuffix("/collections") {
+                let query = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems ?? []
+                return (200, query.contains(where: { $0.name == "limit" }) ? Data("[]".utf8) : Data("{}".utf8))
+            }
+            if path.hasSuffix("/items/top") || path.hasSuffix("/items") {
+                if request.httpMethod == "POST" {
+                    var captured = request
+                    captured.httpBody = try Self.requestBody(from: request)
+                    recorder.append(captured)
+                    let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(captured.httpBody)) as? [[String: Any]])
+                    let key = try XCTUnwrap(payload.first?["key"] as? String)
+                    return (200, try JSONSerialization.data(withJSONObject: ["successful": ["0": key]]))
+                }
+                return (200, Data("{}".utf8))
+            }
+            if path.hasSuffix("/items/\(attachmentKey)"), request.httpMethod == "GET" {
+                return (200, try JSONSerialization.data(withJSONObject: [
+                    "key": attachmentKey,
+                    "version": 101,
+                    "data": ["itemType": "attachment", "title": "Meeting Notes", "parentItem": parent.key],
+                ]))
+            }
+            if path.hasSuffix("/items/\(attachmentKey)"), request.httpMethod == "PUT" {
+                recorder.append(request)
+                return (204, Data())
+            }
+            return (404, Data())
+        }
+        defer { ZoteroCreationURLProtocol.configure(nil) }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ZoteroCreationURLProtocol.self]
+        let api = ZoteroAPIClient(apiKey: "write-key", userID: "1234", session: URLSession(configuration: configuration))
+        let webDAV = ZoteroSyncService(
+            service: WebDAVService(
+                baseURL: URL(string: "https://webdav.test/")!,
+                username: "user",
+                password: "password",
+                session: URLSession(configuration: configuration)
+            ),
+            apiClient: api
+        )
+        let uploadCounter = SyncQueueCounter()
+        let engine = ZoteroSyncEngine(cacheStore: store)
+
+        let finalSnapshot = try await engine.synchronize(
+            apiClient: api,
+            userID: userID,
+            uploadAttachment: { key in
+                await uploadCounter.recordUpload()
+                let snapshot = store.load(userID: userID)
+                guard let path = snapshot.attachments[key]?.localCachePath,
+                      let attachment = snapshot.attachments[key],
+                      let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
+                    return "missing local upload file"
+                }
+                do {
+                    try await webDAV.upload(
+                        documentID: key,
+                        data: data,
+                        metadata: ZoteroUploadMetadata(
+                            modificationTimeMilliseconds: attachment.modificationTimeMilliseconds,
+                            filename: attachment.filename
+                        )
+                    )
+                } catch {
+                    return error.localizedDescription
+                }
+                _ = try? store.markSynced(key: key, data: data, userID: userID)
+                return nil
+            }
+        )
+
+        let requests = recorder.requests
+        XCTAssertEqual(requests.count, 1)
+        let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(requests[0].httpBody)) as? [[String: Any]])
+        XCTAssertEqual(payload.count, 1)
+        XCTAssertEqual(payload[0]["itemType"] as? String, "attachment")
+        XCTAssertEqual(payload[0]["parentItem"] as? String, parent.key)
+        XCTAssertEqual(finalSnapshot.items[parent.key]?.itemType, "journalArticle")
+        XCTAssertEqual(finalSnapshot.items[parent.key]?.title, parent.title)
+        XCTAssertEqual(finalSnapshot.attachments[attachmentKey]?.isPendingSync, false)
+        XCTAssertEqual(finalSnapshot.attachments[attachmentKey]?.syncStatus, .downloaded)
+        let counts = await uploadCounter.counts
+        XCTAssertEqual(counts.uploads, 1)
+        let webDAVRequests = recorder.requests.filter { $0.url?.host == "webdav.test" }
+        XCTAssertEqual(Set(webDAVRequests.compactMap { $0.url?.path }), [
+            "/zotero/\(attachmentKey).zip",
+            "/zotero/\(attachmentKey).prop",
+        ])
+        XCTAssertEqual(recorder.requests.filter { $0.httpMethod == "PUT" && $0.url?.host == "api.zotero.org" }.count, 1)
+        let archive = try XCTUnwrap(webDAVRequests.first(where: { $0.url?.path.hasSuffix(".zip") == true })?.httpBody)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let files = try ZoteroSyncService.extractArchiveForTesting(archive, to: directory)
+        XCTAssertEqual(PDFDocument(url: try XCTUnwrap(files.first(where: { $0.pathExtension == "pdf" })))?.pageCount, 1)
+    }
+
     func testZoteroTrashAndRestoreUseVersionedPartialUpdates() async throws {
         let recorder = ZoteroRequestRecorder()
         ZoteroCreationURLProtocol.configure { request, _ in
