@@ -1,4 +1,5 @@
 import Foundation
+import PDFKit
 
 enum ZoteroAttachmentSyncStatus: String, Codable, Sendable {
     case cloudOnly
@@ -165,6 +166,8 @@ struct ZoteroAttachment: Codable, Sendable, Hashable, Identifiable {
     var modificationTimeMilliseconds: Int64?
     var remoteMD5: String?
     var remoteMD5IsPDF: Bool
+    var verificationRemoteMD5: String?
+    var verificationRemoteMD5WasChecked: Bool
     var isPendingSync: Bool
     var syncError: String?
     var isLocalOnly: Bool
@@ -172,12 +175,17 @@ struct ZoteroAttachment: Codable, Sendable, Hashable, Identifiable {
     var conflictLocalPath: String?
     var conflictCreatedAt: Date?
     var conflictOriginalKey: String?
+    var conflictDiagnosticID: String?
+    var conflictResolutionParentItemKey: String?
+    var conflictResolutionAttachmentKey: String?
     var id: String { key }
 
     private enum CodingKeys: String, CodingKey {
         case key, parentItemKey, contentType, filename, localCachePath, syncStatus, version
-        case md5, modificationTimeMilliseconds, remoteMD5, remoteMD5IsPDF, isPendingSync, syncError, isLocalOnly
+        case md5, modificationTimeMilliseconds, remoteMD5, remoteMD5IsPDF, verificationRemoteMD5
+        case verificationRemoteMD5WasChecked, isPendingSync, syncError, isLocalOnly
         case isConflict, conflictLocalPath, conflictCreatedAt, conflictOriginalKey
+        case conflictDiagnosticID, conflictResolutionParentItemKey, conflictResolutionAttachmentKey
     }
 
     init(
@@ -185,9 +193,14 @@ struct ZoteroAttachment: Codable, Sendable, Hashable, Identifiable {
         localCachePath: String?, syncStatus: ZoteroAttachmentSyncStatus, version: Int,
         md5: String?, modificationTimeMilliseconds: Int64?, remoteMD5: String? = nil,
         remoteMD5IsPDF: Bool = false,
+        verificationRemoteMD5: String? = nil,
+        verificationRemoteMD5WasChecked: Bool = false,
         isPendingSync: Bool = false, syncError: String? = nil, isLocalOnly: Bool = false,
         isConflict: Bool = false, conflictLocalPath: String? = nil,
-        conflictCreatedAt: Date? = nil, conflictOriginalKey: String? = nil
+        conflictCreatedAt: Date? = nil, conflictOriginalKey: String? = nil,
+        conflictDiagnosticID: String? = nil,
+        conflictResolutionParentItemKey: String? = nil,
+        conflictResolutionAttachmentKey: String? = nil
     ) {
         self.key = key
         self.parentItemKey = parentItemKey
@@ -200,6 +213,8 @@ struct ZoteroAttachment: Codable, Sendable, Hashable, Identifiable {
         self.modificationTimeMilliseconds = modificationTimeMilliseconds
         self.remoteMD5 = remoteMD5
         self.remoteMD5IsPDF = remoteMD5IsPDF
+        self.verificationRemoteMD5 = verificationRemoteMD5
+        self.verificationRemoteMD5WasChecked = verificationRemoteMD5WasChecked
         self.isPendingSync = isPendingSync
         self.syncError = syncError
         self.isLocalOnly = isLocalOnly
@@ -207,6 +222,9 @@ struct ZoteroAttachment: Codable, Sendable, Hashable, Identifiable {
         self.conflictLocalPath = conflictLocalPath
         self.conflictCreatedAt = conflictCreatedAt
         self.conflictOriginalKey = conflictOriginalKey
+        self.conflictDiagnosticID = conflictDiagnosticID
+        self.conflictResolutionParentItemKey = conflictResolutionParentItemKey
+        self.conflictResolutionAttachmentKey = conflictResolutionAttachmentKey
     }
 
     init(from decoder: Decoder) throws {
@@ -225,13 +243,18 @@ struct ZoteroAttachment: Codable, Sendable, Hashable, Identifiable {
             modificationTimeMilliseconds: try values.decodeIfPresent(Int64.self, forKey: .modificationTimeMilliseconds),
             remoteMD5: try values.decodeIfPresent(String.self, forKey: .remoteMD5),
             remoteMD5IsPDF: try values.decodeIfPresent(Bool.self, forKey: .remoteMD5IsPDF) ?? false,
+            verificationRemoteMD5: try values.decodeIfPresent(String.self, forKey: .verificationRemoteMD5),
+            verificationRemoteMD5WasChecked: try values.decodeIfPresent(Bool.self, forKey: .verificationRemoteMD5WasChecked) ?? false,
             isPendingSync: try values.decodeIfPresent(Bool.self, forKey: .isPendingSync) ?? false,
             syncError: try values.decodeIfPresent(String.self, forKey: .syncError),
             isLocalOnly: isLocalOnly,
             isConflict: try values.decodeIfPresent(Bool.self, forKey: .isConflict) ?? isLocalOnly,
             conflictLocalPath: try values.decodeIfPresent(String.self, forKey: .conflictLocalPath) ?? (isLocalOnly ? localCachePath : nil),
             conflictCreatedAt: try values.decodeIfPresent(Date.self, forKey: .conflictCreatedAt),
-            conflictOriginalKey: try values.decodeIfPresent(String.self, forKey: .conflictOriginalKey)
+            conflictOriginalKey: try values.decodeIfPresent(String.self, forKey: .conflictOriginalKey),
+            conflictDiagnosticID: try values.decodeIfPresent(String.self, forKey: .conflictDiagnosticID),
+            conflictResolutionParentItemKey: try values.decodeIfPresent(String.self, forKey: .conflictResolutionParentItemKey),
+            conflictResolutionAttachmentKey: try values.decodeIfPresent(String.self, forKey: .conflictResolutionAttachmentKey)
         )
     }
 }
@@ -364,6 +387,12 @@ final class ZoteroCacheStore: @unchecked Sendable {
         hasSupportedAttachmentHeader(data.prefix(1_024))
     }
 
+    private static func isValidPDFAttachment(_ data: Data) -> Bool {
+        guard isSupportedAttachmentData(data),
+              let document = PDFDocument(data: HybridPDFManager.pdfData(in: data)) else { return false }
+        return document.pageCount > 0
+    }
+
     func save(_ snapshot: ZoteroCacheSnapshot) throws {
         try withCacheAccess {
             try FileManager.default.createDirectory(
@@ -410,7 +439,24 @@ final class ZoteroCacheStore: @unchecked Sendable {
                     || attachment.parentItemKey.map(delta.deletedItemKeys.contains) == true
             }
             for attachment in removedAttachments where attachment.syncStatus == .dirty && !attachment.isConflict {
-                try preserveConflictCopy(attachment, snapshot: &snapshot)
+                let copy: (key: String, conflictDiagnosticID: String)
+                do {
+                    copy = try preserveConflictCopy(attachment, snapshot: &snapshot)
+                } catch {
+                    recordConflictEvent(
+                        "zotero.conflict.copyFailed",
+                        reason: "remoteAttachmentDeletedLocalBackupFailed",
+                        conflictDiagnosticID: nil,
+                        details: ["errorType": String(reflecting: type(of: error)), "errorDomain": (error as NSError).domain, "errorCode": (error as NSError).code]
+                    )
+                    throw error
+                }
+                recordConflictEvent(
+                    "zotero.conflict.detected",
+                    reason: "remoteAttachmentDeleted",
+                    conflictDiagnosticID: copy.conflictDiagnosticID,
+                    details: ["localDirty": true, "remoteMD5Present": false, "lastSyncedMD5Present": attachment.remoteMD5 != nil]
+                )
             }
             for key in delta.deletedItemKeys {
                 snapshot.items.removeValue(forKey: key)
@@ -428,25 +474,89 @@ final class ZoteroCacheStore: @unchecked Sendable {
                         ? Self.normalizedMD5(local.remoteMD5)
                         : nil
                     attachment.remoteMD5 = serverMD5 ?? local.remoteMD5
-                    attachment.remoteMD5IsPDF = serverMD5 != nil || local.remoteMD5IsPDF
+                    if local.syncStatus == .dirty && lastSyncedMD5 == nil {
+                        // A just-observed server checksum is not a proven local
+                        // baseline. Keep the baseline flag unknown until the
+                        // downloaded PDF has been compared with the dirty copy.
+                        attachment.remoteMD5IsPDF = local.remoteMD5IsPDF && Self.normalizedMD5(local.remoteMD5) != nil
+                        attachment.verificationRemoteMD5 = serverMD5
+                        attachment.verificationRemoteMD5WasChecked = true
+                    } else {
+                        attachment.remoteMD5IsPDF = serverMD5 != nil || local.remoteMD5IsPDF
+                        attachment.verificationRemoteMD5 = nil
+                        attachment.verificationRemoteMD5WasChecked = false
+                    }
                     // Item versions and timestamps can change for reasons unrelated
                     // to the PDF bytes. They must never create a handwriting conflict.
                     let remoteChanged = serverMD5 != nil && lastSyncedMD5 != nil
                         && serverMD5 != lastSyncedMD5
-                    if local.syncStatus == .dirty, !remoteChanged,
-                       (serverMD5 == nil || lastSyncedMD5 == nil),
-                       ZoteroSyncEngine.timestampSuggestsRemoteChange(
-                        serverMilliseconds: attachment.modificationTimeMilliseconds,
-                        lastSyncedMilliseconds: local.modificationTimeMilliseconds
-                       ) {
-                        print("[ZoteroSync] Timestamp differs by more than 15 seconds for \(attachment.key), but MD5 is unavailable; keeping local edits and skipping conflict classification.")
+                    let localPDFMD5: String?
+                    if local.syncStatus == .dirty, remoteChanged,
+                       let localPath = local.localCachePath,
+                       let localData = try? Data(contentsOf: URL(fileURLWithPath: localPath)) {
+                        localPDFMD5 = ZoteroSyncService.md5Hex(HybridPDFManager.pdfData(in: localData))
+                    } else {
+                        localPDFMD5 = nil
                     }
-                    if local.syncStatus == .dirty && remoteChanged && !local.isConflict {
-                        try preserveConflictCopy(local, snapshot: &snapshot)
-                        attachment.localCachePath = nil
+                    let localPDFDiffersFromRemote = localPDFMD5.map { $0 != serverMD5 } ?? false
+                    if local.syncStatus == .dirty && !local.isPendingSync
+                        && remoteChanged && localPDFDiffersFromRemote && !local.isConflict {
+                        let copy: (key: String, conflictDiagnosticID: String)
+                        do {
+                            copy = try preserveConflictCopy(local, snapshot: &snapshot)
+                        } catch {
+                            recordConflictEvent(
+                                "zotero.conflict.copyFailed",
+                                reason: "remotePDFMD5ChangedLocalBackupFailed",
+                                conflictDiagnosticID: nil,
+                                details: ["errorType": String(reflecting: type(of: error)), "errorDomain": (error as NSError).domain, "errorCode": (error as NSError).code]
+                            )
+                            throw error
+                        }
+                        recordConflictEvent(
+                            "zotero.conflict.detected",
+                            reason: "remotePDFMD5ChangedAndLocalPDFDiffers",
+                            conflictDiagnosticID: copy.conflictDiagnosticID,
+                            details: [
+                                "localDirty": true,
+                                "remoteMD5Present": true,
+                                "lastSyncedMD5Present": true,
+                                "serverMD5MatchesLastSynced": false,
+                                "localPDFMatchesRemote": false
+                            ]
+                        )
+                        attachment.localCachePath = local.localCachePath
                         attachment.syncStatus = .cloudOnly
-                        attachment.md5 = nil
-                        snapshot.pendingRemoteDownloads.append(attachment.key)
+                        attachment.md5 = local.md5
+                        attachment.verificationRemoteMD5 = serverMD5
+                        attachment.verificationRemoteMD5WasChecked = true
+                        if !snapshot.pendingRemoteDownloads.contains(attachment.key) {
+                            snapshot.pendingRemoteDownloads.append(attachment.key)
+                        }
+                    } else if local.syncStatus == .dirty, !local.isPendingSync,
+                              serverMD5 == nil || lastSyncedMD5 == nil || remoteChanged {
+                        attachment.localCachePath = local.localCachePath
+                        attachment.md5 = local.md5
+                        attachment.syncStatus = .dirty
+                        attachment.verificationRemoteMD5 = serverMD5
+                        attachment.verificationRemoteMD5WasChecked = true
+                        if !snapshot.pendingRemoteDownloads.contains(attachment.key) {
+                            snapshot.pendingRemoteDownloads.append(attachment.key)
+                        }
+                        recordConflictEvent(
+                            "zotero.conflict.remoteVerificationQueued",
+                            reason: serverMD5 == nil
+                                ? "serverMD5Unavailable"
+                                : lastSyncedMD5 == nil
+                                    ? "lastSyncedMD5Unavailable"
+                                    : "remoteMD5ChangedButLocalPDFMayAlreadyMatch",
+                            conflictDiagnosticID: nil,
+                            details: [
+                                "localDirty": true,
+                                "remoteMD5Present": serverMD5 != nil,
+                                "lastSyncedMD5Present": lastSyncedMD5 != nil
+                            ]
+                        )
                     } else {
                         attachment.localCachePath = local.localCachePath
                         attachment.md5 = local.md5
@@ -463,6 +573,8 @@ final class ZoteroCacheStore: @unchecked Sendable {
                 } else {
                     attachment.remoteMD5 = attachment.md5
                     attachment.remoteMD5IsPDF = Self.normalizedMD5(attachment.md5) != nil
+                    attachment.verificationRemoteMD5 = nil
+                    attachment.verificationRemoteMD5WasChecked = false
                 }
                 snapshot.attachments[attachment.key] = attachment
             }
@@ -766,7 +878,7 @@ final class ZoteroCacheStore: @unchecked Sendable {
                 try saveUnlocked(snapshot)
                 return snapshot
             }
-            guard Self.isSupportedAttachmentData(data) else {
+            guard Self.isValidPDFAttachment(data) else {
                 throw Failure.invalidLocalAttachmentFile
             }
             let cacheURL = attachment.localCachePath.map(URL.init(fileURLWithPath:))
@@ -788,8 +900,12 @@ final class ZoteroCacheStore: @unchecked Sendable {
             let standardPDF = HybridPDFManager.pdfData(in: data)
             attachment.remoteMD5 = ZoteroSyncService.md5Hex(standardPDF)
             attachment.remoteMD5IsPDF = true
+            attachment.verificationRemoteMD5 = nil
+            attachment.verificationRemoteMD5WasChecked = false
             attachment.modificationTimeMilliseconds = Int64((Date().timeIntervalSince1970 * 1_000).rounded())
             attachment.syncStatus = .downloaded
+            attachment.syncError = nil
+            clearParentSyncError(for: attachment, snapshot: &snapshot)
             snapshot.attachments[canonicalKey] = attachment
             try saveUnlocked(snapshot)
             return snapshot
@@ -958,6 +1074,8 @@ final class ZoteroCacheStore: @unchecked Sendable {
             oldAttachment.isPendingSync = false
             oldAttachment.syncError = nil
             oldAttachment.remoteMD5 = nil
+            oldAttachment.verificationRemoteMD5 = nil
+            oldAttachment.verificationRemoteMD5WasChecked = false
             snapshot.items[created.parentItemKey] = promotedItem
             snapshot.items[created.attachmentKey] = ZoteroItem(
                 key: created.attachmentKey,
@@ -1032,6 +1150,8 @@ final class ZoteroCacheStore: @unchecked Sendable {
             attachment.md5 = ZoteroSyncService.md5Hex(remapped)
             attachment.remoteMD5 = nil
             attachment.remoteMD5IsPDF = false
+            attachment.verificationRemoteMD5 = nil
+            attachment.verificationRemoteMD5WasChecked = false
             attachment.syncStatus = .dirty
             attachment.isPendingSync = false
             attachment.syncError = nil
@@ -1057,6 +1177,16 @@ final class ZoteroCacheStore: @unchecked Sendable {
         }
     }
 
+    private func clearParentSyncError(
+        for attachment: ZoteroAttachment,
+        snapshot: inout ZoteroCacheSnapshot
+    ) {
+        guard let parentKey = attachment.parentItemKey,
+              var parent = snapshot.items[parentKey] else { return }
+        parent.syncError = nil
+        snapshot.items[parentKey] = parent
+    }
+
     func recordPendingSyncError(key: String, message: String, userID: String) throws {
         try withCacheAccess {
             var snapshot = loadUnlocked(userID: userID)
@@ -1078,8 +1208,20 @@ final class ZoteroCacheStore: @unchecked Sendable {
             guard var attachment = snapshot.attachments[key] else { throw Failure.attachmentNotFound }
             guard !attachment.isConflict && !attachment.isLocalOnly else { return false }
             guard attachment.syncStatus != .dirty else { throw Failure.remoteDownloadWouldOverwriteDirtyAttachment }
+            let expectedRemoteMD5: String?
+            if attachment.verificationRemoteMD5WasChecked {
+                expectedRemoteMD5 = Self.normalizedMD5(attachment.verificationRemoteMD5)
+            } else {
+                expectedRemoteMD5 = attachment.syncStatus == .cloudOnly && attachment.remoteMD5IsPDF
+                    ? Self.normalizedMD5(attachment.remoteMD5)
+                    : nil
+            }
+            if let expectedRemoteMD5,
+               expectedRemoteMD5 != ZoteroSyncService.md5Hex(HybridPDFManager.pdfData(in: data)) {
+                throw Failure.remoteDownloadMetadataMismatch
+            }
             let url = defaultPDFCacheURL(for: key)
-            guard Self.isSupportedAttachmentData(data) else {
+            guard Self.isValidPDFAttachment(data) else {
                 throw Failure.invalidLocalAttachmentFile
             }
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -1090,10 +1232,131 @@ final class ZoteroCacheStore: @unchecked Sendable {
             attachment.localCachePath = url.path
             attachment.syncStatus = .downloaded
             attachment.md5 = ZoteroSyncService.md5Hex(data)
+            attachment.verificationRemoteMD5 = nil
+            attachment.verificationRemoteMD5WasChecked = false
             attachment.syncError = nil
+            clearParentSyncError(for: attachment, snapshot: &snapshot)
             snapshot.attachments[key] = attachment
             snapshot.pendingRemoteDownloads.removeAll { $0 == key }
             try saveUnlocked(snapshot)
+            return true
+        }
+    }
+
+    /// Resolves a queued verification download for a dirty attachment whose
+    /// remote checksum or saved checksum baseline was unavailable at delta time.
+    /// Returns true when the remote version was installed after preserving local ink.
+    func verifyDirtyRemoteVersion(
+        key: String,
+        data: Data,
+        userID: String,
+        context: ZoteroDownloadContext? = nil
+    ) throws -> Bool {
+        try withCacheAccess {
+            var snapshot = loadUnlocked(userID: userID)
+            guard var attachment = snapshot.attachments[key], attachment.syncStatus == .dirty,
+                  !attachment.isPendingSync, !attachment.isConflict, !attachment.isLocalOnly,
+                  let localPath = attachment.localCachePath,
+                  let localData = try? Data(contentsOf: URL(fileURLWithPath: localPath)) else {
+                throw Failure.invalidLocalAttachmentFile
+            }
+
+            let localPDFData = HybridPDFManager.pdfData(in: localData)
+            let remotePDFData = HybridPDFManager.pdfData(in: data)
+            guard let localPDF = PDFDocument(data: localPDFData), localPDF.pageCount > 0,
+                  let remotePDF = PDFDocument(data: remotePDFData), remotePDF.pageCount > 0 else {
+                throw Failure.invalidLocalAttachmentFile
+            }
+            let remoteMD5 = ZoteroSyncService.md5Hex(remotePDFData)
+            if attachment.verificationRemoteMD5WasChecked,
+               let expectedRemoteMD5 = Self.normalizedMD5(attachment.verificationRemoteMD5),
+               expectedRemoteMD5 != remoteMD5 {
+                throw Failure.remoteDownloadMetadataMismatch
+            }
+            let baselineMD5 = attachment.remoteMD5IsPDF
+                ? Self.normalizedMD5(attachment.remoteMD5)
+                : nil
+            let localJotData = HybridPDFManager.embeddedJotData(in: localData)
+            let remoteJotData = HybridPDFManager.embeddedJotData(in: data)
+            let localPDFMatchesRemote = localPDFData == remotePDFData
+            let localJotMatchesRemote = localJotData == remoteJotData
+            let localContentMatches = localPDFMatchesRemote && localJotMatchesRemote
+            let contentMatches = baselineMD5.map { $0 == remoteMD5 || localContentMatches }
+                ?? (localPDFMatchesRemote && localJotMatchesRemote)
+
+            if contentMatches {
+                attachment.remoteMD5 = remoteMD5
+                attachment.remoteMD5IsPDF = true
+                attachment.verificationRemoteMD5 = nil
+                attachment.verificationRemoteMD5WasChecked = false
+                attachment.syncError = nil
+                clearParentSyncError(for: attachment, snapshot: &snapshot)
+                snapshot.attachments[key] = attachment
+                snapshot.pendingRemoteDownloads.removeAll { $0 == key }
+                try saveUnlocked(snapshot)
+                var details = context?.eventDetails ?? [
+                    "requestID": UUID().uuidString,
+                    "attachmentID": UUID().uuidString
+                ]
+                details.merge([
+                    "stage": "remoteVerification",
+                    "serverMD5Present": true,
+                    "lastSyncedMD5Present": baselineMD5 != nil,
+                    "serverMD5MatchesLastSynced": baselineMD5.map { $0 == remoteMD5 } as Any? ?? NSNull(),
+                    "localPDFMatchesRemote": localPDFMatchesRemote,
+                    "localJotMatchesRemote": localJotMatchesRemote
+                ]) { _, new in new }
+                JottreDiagnostics.shared.record("zotero.conflict.remoteVersionVerified", details: details)
+                return false
+            }
+
+            let localBackup = try preserveConflictCopy(attachment, snapshot: &snapshot)
+            recordConflictEvent(
+                "zotero.conflict.detected",
+                reason: "remoteContentDiffersFromDirtyLocal",
+                conflictDiagnosticID: localBackup.conflictDiagnosticID,
+                context: context,
+                details: [
+                    "localDirty": true,
+                    "serverMD5Present": true,
+                    "lastSyncedMD5Present": baselineMD5 != nil,
+                    "serverMD5MatchesLastSynced": baselineMD5.map { $0 == remoteMD5 } as Any? ?? NSNull(),
+                    "localPDFMatchesRemote": localPDFMatchesRemote,
+                    "localJotMatchesRemote": localJotMatchesRemote
+                ]
+            )
+            try saveUnlocked(snapshot)
+
+            let oldPath = attachment.localCachePath.map(URL.init(fileURLWithPath:))
+            let remoteURL = defaultPDFCacheURL(for: key)
+                .deletingLastPathComponent()
+                .appendingPathComponent("\(key).verified-\(UUID().uuidString).pdf")
+            try data.write(to: remoteURL, options: .atomic)
+            guard isUsableLocalCacheFile(at: remoteURL) else {
+                throw Failure.invalidLocalAttachmentFile
+            }
+            attachment.localCachePath = remoteURL.path
+            attachment.syncStatus = .downloaded
+            attachment.md5 = ZoteroSyncService.md5Hex(data)
+            attachment.remoteMD5 = remoteMD5
+            attachment.remoteMD5IsPDF = true
+            attachment.verificationRemoteMD5 = nil
+            attachment.verificationRemoteMD5WasChecked = false
+            attachment.syncError = nil
+            clearParentSyncError(for: attachment, snapshot: &snapshot)
+            snapshot.attachments[key] = attachment
+            snapshot.pendingRemoteDownloads.removeAll { $0 == key }
+            try saveUnlocked(snapshot)
+            if let oldPath, oldPath.path != remoteURL.path {
+                try? FileManager.default.removeItem(at: oldPath)
+            }
+            recordConflictEvent(
+                "zotero.conflict.remoteInstalled",
+                reason: "remoteVersionInstalledAfterVerification",
+                conflictDiagnosticID: localBackup.conflictDiagnosticID,
+                context: context,
+                details: ["syncStatus": ZoteroAttachmentSyncStatus.downloaded.rawValue]
+            )
             return true
         }
     }
@@ -1115,6 +1378,7 @@ final class ZoteroCacheStore: @unchecked Sendable {
                 withIntermediateDirectories: true
             )
             let data = try Data(contentsOf: URL(fileURLWithPath: sourcePath))
+            guard Self.isValidPDFAttachment(data) else { throw Failure.invalidLocalAttachmentFile }
             try data.write(to: destination, options: .atomic)
             original.localCachePath = destination.path
             original.syncStatus = .dirty
@@ -1122,10 +1386,14 @@ final class ZoteroCacheStore: @unchecked Sendable {
             original.modificationTimeMilliseconds = Int64((Date().timeIntervalSince1970 * 1_000).rounded())
             original.syncError = nil
             original.isConflict = false
+            original.verificationRemoteMD5 = nil
+            original.verificationRemoteMD5WasChecked = false
+            clearParentSyncError(for: original, snapshot: &snapshot)
             snapshot.attachments[originalKey] = original
-            removeConflict(key: key, attachment: conflict, snapshot: &snapshot)
+            let conflictPath = removeConflict(key: key, attachment: conflict, snapshot: &snapshot)
             snapshot.pendingRemoteDownloads.removeAll { $0 == originalKey || $0 == key }
             try saveUnlocked(snapshot)
+            removeConflictFile(at: conflictPath)
             return snapshot
         }
     }
@@ -1138,6 +1406,7 @@ final class ZoteroCacheStore: @unchecked Sendable {
                   var original = snapshot.attachments[originalKey] else {
                 throw Failure.conflictNotFound
             }
+            guard Self.isValidPDFAttachment(serverData) else { throw Failure.invalidLocalAttachmentFile }
             let destination = original.localCachePath.map(URL.init(fileURLWithPath:))
                 ?? defaultPDFCacheURL(for: originalKey)
             try FileManager.default.createDirectory(
@@ -1152,12 +1421,16 @@ final class ZoteroCacheStore: @unchecked Sendable {
             original.md5 = localMD5
             original.remoteMD5 = serverMD5
             original.remoteMD5IsPDF = true
+            original.verificationRemoteMD5 = nil
+            original.verificationRemoteMD5WasChecked = false
             original.syncError = nil
             original.isConflict = false
+            clearParentSyncError(for: original, snapshot: &snapshot)
             snapshot.attachments[originalKey] = original
-            removeConflict(key: key, attachment: conflict, snapshot: &snapshot)
+            let conflictPath = removeConflict(key: key, attachment: conflict, snapshot: &snapshot)
             snapshot.pendingRemoteDownloads.removeAll { $0 == originalKey || $0 == key }
             try saveUnlocked(snapshot)
+            removeConflictFile(at: conflictPath)
             return snapshot
         }
     }
@@ -1173,12 +1446,20 @@ final class ZoteroCacheStore: @unchecked Sendable {
             guard let conflict = snapshot.attachments[key], conflict.isConflict,
                   let sourcePath = conflict.conflictLocalPath ?? conflict.localCachePath,
                   FileManager.default.fileExists(atPath: sourcePath),
-                  let conflictItem = snapshot.items[key] else {
+                  let conflictItem = snapshot.items[key],
+                  let originalKey = originalAttachmentKey(for: conflict, snapshot: snapshot),
+                  let original = snapshot.attachments[originalKey] else {
                 throw Failure.conflictNotFound
             }
-            let originalKey = originalAttachmentKey(for: conflict, snapshot: snapshot)
-            let original = originalKey.flatMap { snapshot.attachments[$0] }
+            guard Self.isValidPDFAttachment(serverData) else { throw Failure.invalidLocalAttachmentFile }
+            guard (conflict.conflictResolutionParentItemKey == nil
+                    || conflict.conflictResolutionParentItemKey == created.parentItemKey),
+                  (conflict.conflictResolutionAttachmentKey == nil
+                    || conflict.conflictResolutionAttachmentKey == created.attachmentKey) else {
+                throw Failure.conflictResolutionReservationMismatch
+            }
             let data = try Data(contentsOf: URL(fileURLWithPath: sourcePath))
+            guard Self.isValidPDFAttachment(data) else { throw Failure.invalidLocalAttachmentFile }
             let localItem = ZoteroItem(
                 key: created.parentItemKey,
                 title: conflictItem.title,
@@ -1209,29 +1490,32 @@ final class ZoteroCacheStore: @unchecked Sendable {
                 md5: ZoteroSyncService.md5Hex(data),
                 modificationTimeMilliseconds: Int64((Date().timeIntervalSince1970 * 1_000).rounded())
             )
-            if let originalKey, var existing = original {
-                let originalPath = existing.localCachePath.map(URL.init(fileURLWithPath:))
-                    ?? defaultPDFCacheURL(for: originalKey)
-                try FileManager.default.createDirectory(
-                    at: originalPath.deletingLastPathComponent(),
-                    withIntermediateDirectories: true
-                )
-                try serverData.write(to: originalPath, options: .atomic)
-                existing.localCachePath = originalPath.path
-                existing.syncStatus = .downloaded
-                existing.md5 = ZoteroSyncService.md5Hex(serverData)
-                existing.remoteMD5 = ZoteroSyncService.md5Hex(HybridPDFManager.pdfData(in: serverData))
-                existing.remoteMD5IsPDF = true
-                existing.syncError = nil
-                existing.isConflict = false
-                snapshot.attachments[originalKey] = existing
-            }
+            var existing = original
+            let originalPath = existing.localCachePath.map(URL.init(fileURLWithPath:))
+                ?? defaultPDFCacheURL(for: originalKey)
+            try FileManager.default.createDirectory(
+                at: originalPath.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try serverData.write(to: originalPath, options: .atomic)
+            existing.localCachePath = originalPath.path
+            existing.syncStatus = .downloaded
+            existing.md5 = ZoteroSyncService.md5Hex(serverData)
+            existing.remoteMD5 = ZoteroSyncService.md5Hex(HybridPDFManager.pdfData(in: serverData))
+            existing.remoteMD5IsPDF = true
+            existing.verificationRemoteMD5 = nil
+            existing.verificationRemoteMD5WasChecked = false
+            existing.syncError = nil
+            existing.isConflict = false
+            clearParentSyncError(for: existing, snapshot: &snapshot)
+            snapshot.attachments[originalKey] = existing
             snapshot.items[created.parentItemKey] = localItem
             snapshot.attachments[created.attachmentKey] = localAttachment
-            removeConflict(key: key, attachment: conflict, snapshot: &snapshot)
+            let conflictPath = removeConflict(key: key, attachment: conflict, snapshot: &snapshot)
             snapshot.pendingRemoteDownloads.removeAll { $0 == originalKey || $0 == key }
             snapshot.lastLibraryVersion = max(snapshot.lastLibraryVersion, created.libraryVersion)
             try saveUnlocked(snapshot)
+            removeConflictFile(at: conflictPath)
             return snapshot
         }
     }
@@ -1240,20 +1524,79 @@ final class ZoteroCacheStore: @unchecked Sendable {
         key: String,
         attachment: ZoteroAttachment,
         snapshot: inout ZoteroCacheSnapshot
-    ) {
+    ) -> String? {
         snapshot.attachments.removeValue(forKey: key)
         snapshot.items.removeValue(forKey: key)
         snapshot.pendingRemoteDownloads.removeAll { $0 == key }
-        let path = attachment.conflictLocalPath ?? attachment.localCachePath
-        if let path, FileManager.default.fileExists(atPath: path) {
-            try? FileManager.default.removeItem(atPath: path)
-        }
+        return attachment.conflictLocalPath ?? attachment.localCachePath
+    }
+
+    private func removeConflictFile(at path: String?) {
+        guard let path, FileManager.default.fileExists(atPath: path) else { return }
+        try? FileManager.default.removeItem(atPath: path)
     }
 
     func conflictOriginalKey(for conflictKey: String, userID: String) -> String? {
         let snapshot = load(userID: userID)
         guard let conflict = snapshot.attachments[conflictKey], conflict.isConflict else { return nil }
         return originalAttachmentKey(for: conflict, snapshot: snapshot)
+    }
+
+    func conflictDiagnosticID(forOriginalKey originalKey: String, userID: String) -> String? {
+        try? withCacheAccess {
+            var snapshot = loadUnlocked(userID: userID)
+            guard var conflict = snapshot.attachments.values.first(where: {
+                $0.isConflict && $0.conflictOriginalKey == originalKey
+            }) else { return nil }
+            if conflict.conflictDiagnosticID == nil {
+                conflict.conflictDiagnosticID = UUID().uuidString
+                snapshot.attachments[conflict.key] = conflict
+                try saveUnlocked(snapshot)
+            }
+            return conflict.conflictDiagnosticID
+        }
+    }
+
+    func ensureConflictDiagnosticID(key: String, userID: String) throws -> String {
+        try withCacheAccess {
+            var snapshot = loadUnlocked(userID: userID)
+            guard var conflict = snapshot.attachments[key], conflict.isConflict else {
+                throw Failure.conflictNotFound
+            }
+            if let conflictDiagnosticID = conflict.conflictDiagnosticID { return conflictDiagnosticID }
+            let conflictDiagnosticID = UUID().uuidString
+            conflict.conflictDiagnosticID = conflictDiagnosticID
+            snapshot.attachments[key] = conflict
+            try saveUnlocked(snapshot)
+            return conflictDiagnosticID
+        }
+    }
+
+    func reserveKeepBothTargetKeys(key: String, userID: String) throws -> (parentItemKey: String, attachmentKey: String) {
+        try withCacheAccess {
+            var snapshot = loadUnlocked(userID: userID)
+            guard var conflict = snapshot.attachments[key], conflict.isConflict,
+                  snapshot.items[key] != nil else { throw Failure.conflictNotFound }
+            if let parentItemKey = conflict.conflictResolutionParentItemKey,
+               let attachmentKey = conflict.conflictResolutionAttachmentKey,
+               ZoteroSyncService.isValidKey(parentItemKey),
+               ZoteroSyncService.isValidKey(attachmentKey),
+               parentItemKey != attachmentKey {
+                return (parentItemKey, attachmentKey)
+            }
+            let parentItemKey = conflict.conflictResolutionParentItemKey.flatMap {
+                ZoteroSyncService.isValidKey($0) ? $0 : nil
+            } ?? ZoteroAPIClient.generateItemKey()
+            let attachmentKey = conflict.conflictResolutionAttachmentKey.flatMap {
+                ZoteroSyncService.isValidKey($0) && $0 != parentItemKey ? $0 : nil
+            } ?? ZoteroAPIClient.generateItemKey()
+            conflict.conflictResolutionParentItemKey = parentItemKey
+            conflict.conflictResolutionAttachmentKey = attachmentKey
+            if conflict.conflictDiagnosticID == nil { conflict.conflictDiagnosticID = UUID().uuidString }
+            snapshot.attachments[key] = conflict
+            try saveUnlocked(snapshot)
+            return (parentItemKey, attachmentKey)
+        }
     }
 
     private func originalAttachmentKey(
@@ -1276,13 +1619,48 @@ final class ZoteroCacheStore: @unchecked Sendable {
         load(userID: userID).keyAliases[key] ?? key
     }
 
+    func queueRemoteVerification(key: String, userID: String, expectedRemoteMD5: String? = nil) throws {
+        try withCacheAccess {
+            var snapshot = loadUnlocked(userID: userID)
+            guard var attachment = snapshot.attachments[key] else { throw Failure.attachmentNotFound }
+            attachment.verificationRemoteMD5 = Self.normalizedMD5(expectedRemoteMD5)
+            attachment.verificationRemoteMD5WasChecked = true
+            snapshot.attachments[key] = attachment
+            if !snapshot.pendingRemoteDownloads.contains(key) {
+                snapshot.pendingRemoteDownloads.append(key)
+            }
+            try saveUnlocked(snapshot)
+        }
+    }
+
     private func preserveConflictCopy(
         _ attachment: ZoteroAttachment,
         snapshot: inout ZoteroCacheSnapshot
-    ) throws {
+    ) throws -> (key: String, conflictDiagnosticID: String) {
         guard let source = attachment.localCachePath,
-              FileManager.default.fileExists(atPath: source) else { return }
+              FileManager.default.fileExists(atPath: source),
+              let sourceData = try? Data(contentsOf: URL(fileURLWithPath: source)),
+              Self.isValidPDFAttachment(sourceData) else {
+            throw Failure.conflictLocalFileUnavailable
+        }
+        let sourceMD5 = ZoteroSyncService.md5Hex(sourceData)
+        if var existing = snapshot.attachments.values.first(where: { candidate in
+            candidate.isConflict && candidate.isLocalOnly
+                && candidate.conflictOriginalKey == attachment.key
+                && candidate.md5 == sourceMD5
+                && (candidate.conflictLocalPath ?? candidate.localCachePath).map {
+                    FileManager.default.fileExists(atPath: $0)
+                } == true
+        }) {
+            let conflictDiagnosticID = existing.conflictDiagnosticID ?? UUID().uuidString
+            if existing.conflictDiagnosticID == nil {
+                existing.conflictDiagnosticID = conflictDiagnosticID
+                snapshot.attachments[existing.key] = existing
+            }
+            return (existing.key, conflictDiagnosticID)
+        }
         let conflictKey = "local_\(UUID().uuidString)"
+        let conflictDiagnosticID = UUID().uuidString
         let name = URL(fileURLWithPath: attachment.filename)
         let conflictName = "\(name.deletingPathExtension().lastPathComponent) (iPad Conflict Copy).pdf"
         let destination = defaultPDFCacheURL(for: conflictKey)
@@ -1311,16 +1689,44 @@ final class ZoteroCacheStore: @unchecked Sendable {
             localCachePath: destination.path,
             syncStatus: .dirty,
             version: 0,
-            md5: attachment.md5,
+            md5: sourceMD5,
             modificationTimeMilliseconds: attachment.modificationTimeMilliseconds,
             isLocalOnly: true,
             isConflict: true,
             conflictLocalPath: destination.path,
             conflictCreatedAt: Date(),
-            conflictOriginalKey: attachment.key
+            conflictOriginalKey: attachment.key,
+            conflictDiagnosticID: conflictDiagnosticID
         )
         snapshot.items[conflictKey] = localItem
         snapshot.attachments[conflictKey] = localAttachment
+        recordConflictEvent(
+            "zotero.conflict.copyCreated",
+            reason: "localDirtyVersionPreserved",
+            conflictDiagnosticID: conflictDiagnosticID,
+            details: ["fileBytes": sourceData.count]
+        )
+        return (conflictKey, conflictDiagnosticID)
+    }
+
+    private func recordConflictEvent(
+        _ name: String,
+        reason: String,
+        conflictDiagnosticID: String?,
+        context: ZoteroDownloadContext? = nil,
+        details extra: [String: Any] = [:]
+    ) {
+        var details = context?.eventDetails ?? [
+            "requestID": UUID().uuidString,
+            "attachmentID": UUID().uuidString
+        ]
+        details.merge([
+            "stage": "conflict",
+            "reason": reason
+        ]) { _, new in new }
+        if let conflictDiagnosticID { details["conflictRelationID"] = conflictDiagnosticID }
+        details.merge(extra) { _, new in new }
+        JottreDiagnostics.shared.record(name, details: details)
     }
 
     /// Removes local PDF copies and returns their attachment records to cloud-only state.
@@ -1416,5 +1822,7 @@ final class ZoteroCacheStore: @unchecked Sendable {
         case cacheAdvancedDuringSync, attachmentNotFound, dirtyAttachmentCannotBeOffloaded
         case invalidPendingDraft, pendingDraftNotFound, itemNotFound, conflictNotFound
         case invalidLocalAttachmentFile, remoteDownloadWouldOverwriteDirtyAttachment
+        case conflictLocalFileUnavailable, conflictResolutionReservationMismatch
+        case conflictResolutionInProgress, remoteDownloadMetadataMismatch
     }
 }

@@ -170,6 +170,8 @@ private final class ZoteroLibraryViewModel: ObservableObject {
         do {
             let syncService = makeSyncService()
             let documentSync = ZoteroDocumentSyncService(defaultsService: defaults, cacheStore: cacheStore)
+            let syncUserID = userID
+            let syncCacheStore = cacheStore
             let synchronizedSnapshot = try await engine.synchronize(
                 apiClient: ZoteroAPIClient(apiKey: apiKey, userID: userID),
                 userID: userID,
@@ -177,7 +179,20 @@ private final class ZoteroLibraryViewModel: ObservableObject {
                     await documentSync.uploadCachedAttachment(key: key, fallbackModificationDate: nil)
                 },
                 downloadAttachment: { key, context in
-                    try await syncService.download(documentID: key, context: context)
+                    let attachment = syncCacheStore.load(userID: syncUserID).attachments[key]
+                    let expectedRemoteMD5: String?
+                    if attachment?.verificationRemoteMD5WasChecked == true {
+                        expectedRemoteMD5 = attachment?.verificationRemoteMD5
+                    } else {
+                        expectedRemoteMD5 = attachment?.syncStatus == .cloudOnly && attachment?.remoteMD5IsPDF == true
+                            ? attachment?.remoteMD5
+                            : nil
+                    }
+                    return try await syncService.download(
+                        documentID: key,
+                        context: context,
+                        expectedRemoteMD5: expectedRemoteMD5
+                    )
                 }
             )
             snapshot = synchronizedSnapshot
@@ -329,46 +344,170 @@ private final class ZoteroLibraryViewModel: ObservableObject {
     }
 
     func keepConflictLocal(_ conflictKey: String) async -> Bool {
+        guard await ZoteroEditingSessionGate.shared.beginSynchronization() else {
+            errorMessage = ZoteroCacheStore.Failure.conflictResolutionInProgress.localizedDescription
+            return false
+        }
+        var context: ZoteroDownloadContext?
+        var shouldSynchronizeAfterFailure = false
+        var uploadCompleted = false
         do {
             guard let originalKey = cacheStore.conflictOriginalKey(for: conflictKey, userID: userID) else {
                 throw ZoteroCacheStore.Failure.conflictNotFound
+            }
+            let diagnosticID = try cacheStore.ensureConflictDiagnosticID(key: conflictKey, userID: userID)
+            let resolutionContext = ZoteroDownloadContext(
+                source: .conflictResolution,
+                relatedAttachmentID: diagnosticID
+            )
+            context = resolutionContext
+            recordConflictResolutionEvent(
+                "zotero.conflict.resolutionStarted",
+                context: resolutionContext,
+                resolution: "keepLocal"
+            )
+            let currentOriginal = cacheStore.load(userID: userID).attachments[originalKey]
+            guard let expectedRemoteMD5 = currentOriginal?.remoteMD5,
+                  currentOriginal?.remoteMD5IsPDF == true else {
+                throw ZoteroDocumentSyncService.Failure.remoteVersionChanged
+            }
+            let latestRemoteState = try await ZoteroAPIClient(apiKey: apiKey, userID: userID)
+                .fetchAttachmentRemoteState(key: originalKey)
+            guard latestRemoteState.md5?.lowercased() == expectedRemoteMD5.lowercased() else {
+                try cacheStore.queueRemoteVerification(
+                    key: originalKey,
+                    userID: userID,
+                    expectedRemoteMD5: latestRemoteState.md5
+                )
+                snapshot = cacheStore.load(userID: userID)
+                shouldSynchronizeAfterFailure = true
+                throw ZoteroDocumentSyncService.Failure.remoteVersionChanged
             }
             snapshot = try cacheStore.resolveConflictKeepingLocal(key: conflictKey, userID: userID)
             let documentSync = ZoteroDocumentSyncService(defaultsService: defaults, cacheStore: cacheStore)
             if let error = await documentSync.uploadCachedAttachment(
                 key: originalKey,
-                fallbackModificationDate: nil
+                fallbackModificationDate: nil,
+                expectedRemoteMD5: expectedRemoteMD5,
+                conflictContext: resolutionContext,
+                conflictResolution: "keepLocal"
             ) {
                 errorMessage = error
+            } else {
+                uploadCompleted = true
             }
             refreshCacheState()
             NotificationCenter.default.post(name: .zoteroAttachmentCacheChanged, object: conflictKey)
+            recordConflictResolutionEvent(
+                "zotero.conflict.resolutionCompleted",
+                context: resolutionContext,
+                resolution: "keepLocal",
+                details: [
+                    "localRecoveryCompleted": true,
+                    "remoteUploadCompleted": uploadCompleted,
+                    "syncStatus": cacheStore.load(userID: userID).attachments[originalKey]?.syncStatus.rawValue ?? "unknown"
+                ]
+            )
+            await ZoteroEditingSessionGate.shared.endSynchronization()
             return true
         } catch {
+            if let context {
+                recordConflictResolutionEvent(
+                    "zotero.conflict.resolutionFailed",
+                    context: context,
+                    resolution: "keepLocal",
+                    error: error
+                )
+            }
             errorMessage = error.localizedDescription
+            await ZoteroEditingSessionGate.shared.endSynchronization()
+            if shouldSynchronizeAfterFailure { await synchronize() }
             return false
         }
     }
 
     func keepConflictServer(_ conflictKey: String) async -> Bool {
+        guard await ZoteroEditingSessionGate.shared.beginSynchronization() else {
+            errorMessage = ZoteroCacheStore.Failure.conflictResolutionInProgress.localizedDescription
+            return false
+        }
+        var context: ZoteroDownloadContext?
+        var remoteDownloadStarted = false
+        var remoteDownloadCompleted = false
         do {
             guard snapshot.attachments[conflictKey] != nil,
                   let originalKey = cacheStore.conflictOriginalKey(for: conflictKey, userID: userID) else {
                 throw ZoteroCacheStore.Failure.conflictNotFound
             }
-            let serverData = try await makeSyncService().download(documentID: originalKey)
+            let diagnosticID = try cacheStore.ensureConflictDiagnosticID(key: conflictKey, userID: userID)
+            let resolutionContext = ZoteroDownloadContext(
+                source: .conflictResolution,
+                relatedAttachmentID: diagnosticID
+            )
+            context = resolutionContext
+            recordConflictResolutionEvent(
+                "zotero.conflict.resolutionStarted",
+                context: resolutionContext,
+                resolution: "keepServer"
+            )
+            recordConflictResolutionEvent(
+                "zotero.conflict.remoteDownloadStarted",
+                context: resolutionContext,
+                resolution: "keepServer"
+            )
+            remoteDownloadStarted = true
+            let (serverData, _) = try await downloadStableConflictVersion(key: originalKey, context: resolutionContext)
+            remoteDownloadCompleted = true
             snapshot = try cacheStore.resolveConflictKeepingServer(
                 key: conflictKey, serverData: serverData, userID: userID
             )
             NotificationCenter.default.post(name: .zoteroAttachmentCacheChanged, object: conflictKey)
+            recordConflictResolutionEvent(
+                "zotero.conflict.remoteInstalled",
+                context: resolutionContext,
+                resolution: "keepServer",
+                details: ["syncStatus": snapshot.attachments[originalKey]?.syncStatus.rawValue ?? "unknown"]
+            )
+            recordConflictResolutionEvent(
+                "zotero.conflict.resolutionCompleted",
+                context: resolutionContext,
+                resolution: "keepServer",
+                details: ["syncStatus": snapshot.attachments[originalKey]?.syncStatus.rawValue ?? "unknown"]
+            )
+            await ZoteroEditingSessionGate.shared.endSynchronization()
             return true
         } catch {
+            if let context {
+                if remoteDownloadStarted && !remoteDownloadCompleted {
+                    recordConflictResolutionEvent(
+                        "zotero.conflict.remoteDownloadFailed",
+                        context: context,
+                        resolution: "keepServer",
+                        error: error
+                    )
+                }
+                recordConflictResolutionEvent(
+                    "zotero.conflict.resolutionFailed",
+                    context: context,
+                    resolution: "keepServer",
+                    error: error
+                )
+            }
             errorMessage = error.localizedDescription
+            await ZoteroEditingSessionGate.shared.endSynchronization()
             return false
         }
     }
 
     func keepConflictBoth(_ conflictKey: String) async -> Bool {
+        guard await ZoteroEditingSessionGate.shared.beginSynchronization() else {
+            errorMessage = ZoteroCacheStore.Failure.conflictResolutionInProgress.localizedDescription
+            return false
+        }
+        var context: ZoteroDownloadContext?
+        var remoteDownloadStarted = false
+        var remoteDownloadCompleted = false
+        var uploadCompleted = false
         do {
             guard let conflict = snapshot.attachments[conflictKey],
                   let originalKey = conflict.conflictOriginalKey
@@ -376,15 +515,49 @@ private final class ZoteroLibraryViewModel: ObservableObject {
                   let item = snapshot.items[conflictKey] else {
                 throw ZoteroCacheStore.Failure.conflictNotFound
             }
-            let serverData = try await makeSyncService().download(documentID: originalKey)
+            let reservation = try cacheStore.reserveKeepBothTargetKeys(key: conflictKey, userID: userID)
+            let diagnosticID = try cacheStore.ensureConflictDiagnosticID(key: conflictKey, userID: userID)
+            let resolutionContext = ZoteroDownloadContext(
+                source: .conflictResolution,
+                relatedAttachmentID: diagnosticID
+            )
+            context = resolutionContext
+            recordConflictResolutionEvent(
+                "zotero.conflict.resolutionStarted",
+                context: resolutionContext,
+                resolution: "keepBoth"
+            )
+            recordConflictResolutionEvent(
+                "zotero.conflict.remoteDownloadStarted",
+                context: resolutionContext,
+                resolution: "keepBoth"
+            )
+            remoteDownloadStarted = true
+            let (serverData, serverState) = try await downloadStableConflictVersion(key: originalKey, context: resolutionContext)
+            remoteDownloadCompleted = true
             let created = try await ZoteroAPIClient(apiKey: apiKey, userID: userID).createNoteDocument(
                 title: item.title,
                 filename: conflict.filename,
                 collectionKeys: item.collectionKeys,
                 firstName: "",
                 lastName: "",
-                fullName: item.creators.first ?? ""
+                fullName: item.creators.first ?? "",
+                date: item.dateAdded ?? conflict.conflictCreatedAt ?? Date(),
+                parentItemKey: reservation.parentItemKey,
+                pdfAttachmentKey: reservation.attachmentKey
             )
+            let latestServerState = try await ZoteroAPIClient(apiKey: apiKey, userID: userID)
+                .fetchAttachmentRemoteState(key: originalKey)
+            let originalRemoteStillMatches = if let initialMD5 = serverState.md5,
+                let latestMD5 = latestServerState.md5 {
+                initialMD5.lowercased() == latestMD5.lowercased()
+            } else {
+                serverState.md5 == nil && latestServerState.md5 == nil
+                    && latestServerState.version == serverState.version
+            }
+            guard originalRemoteStillMatches else {
+                throw ZoteroDocumentSyncService.Failure.remoteVersionChanged
+            }
             snapshot = try cacheStore.keepConflictAsNewDocument(
                 key: conflictKey,
                 serverData: serverData,
@@ -394,17 +567,93 @@ private final class ZoteroLibraryViewModel: ObservableObject {
             let documentSync = ZoteroDocumentSyncService(defaultsService: defaults, cacheStore: cacheStore)
             if let error = await documentSync.uploadCachedAttachment(
                 key: created.attachmentKey,
-                fallbackModificationDate: nil
+                fallbackModificationDate: nil,
+                conflictContext: resolutionContext,
+                conflictResolution: "keepBoth"
             ) {
                 errorMessage = error
+            } else {
+                uploadCompleted = true
             }
             refreshCacheState()
             NotificationCenter.default.post(name: .zoteroAttachmentCacheChanged, object: created.attachmentKey)
+            recordConflictResolutionEvent(
+                "zotero.conflict.resolutionCompleted",
+                context: resolutionContext,
+                resolution: "keepBoth",
+                details: [
+                    "localRecoveryCompleted": true,
+                    "remoteUploadCompleted": uploadCompleted,
+                    "syncStatus": cacheStore.load(userID: userID).attachments[created.attachmentKey]?.syncStatus.rawValue ?? "unknown"
+                ]
+            )
+            await ZoteroEditingSessionGate.shared.endSynchronization()
             return true
         } catch {
+            if let context {
+                if remoteDownloadStarted && !remoteDownloadCompleted {
+                    recordConflictResolutionEvent(
+                        "zotero.conflict.remoteDownloadFailed",
+                        context: context,
+                        resolution: "keepBoth",
+                        error: error
+                    )
+                }
+                recordConflictResolutionEvent(
+                    "zotero.conflict.resolutionFailed",
+                    context: context,
+                    resolution: "keepBoth",
+                    error: error
+                )
+            }
             errorMessage = error.localizedDescription
+            await ZoteroEditingSessionGate.shared.endSynchronization()
             return false
         }
+    }
+
+    private func downloadStableConflictVersion(
+        key: String,
+        context: ZoteroDownloadContext
+    ) async throws -> (Data, ZoteroAttachmentRemoteState) {
+        let api = ZoteroAPIClient(apiKey: apiKey, userID: userID)
+        let before = try await api.fetchAttachmentRemoteState(key: key)
+        let data = try await makeSyncService().download(
+            documentID: key,
+            context: context,
+            expectedRemoteMD5: before.md5
+        )
+        let after = try await api.fetchAttachmentRemoteState(key: key)
+        let pdfMD5 = ZoteroSyncService.md5Hex(HybridPDFManager.pdfData(in: data))
+        let responseMatchesLatestMD5 = after.md5?.lowercased() == pdfMD5
+        let metadataWasStableWithoutMD5 = before.md5 == nil && after.md5 == nil && before.version == after.version
+        guard responseMatchesLatestMD5 || metadataWasStableWithoutMD5 else {
+            throw ZoteroDocumentSyncService.Failure.remoteVersionChanged
+        }
+        return (data, after)
+    }
+
+    private func recordConflictResolutionEvent(
+        _ name: String,
+        context: ZoteroDownloadContext,
+        resolution: String,
+        details extra: [String: Any] = [:],
+        error: Error? = nil
+    ) {
+        var details = context.eventDetails
+        details["stage"] = "resolution"
+        details["resolution"] = resolution
+        details.merge(extra) { _, new in new }
+        if let error {
+            let nsError = error as NSError
+            details["errorType"] = String(reflecting: type(of: error))
+            details["errorDomain"] = nsError.domain
+            details["errorCode"] = nsError.code
+            if case ZoteroAPIClient.Failure.http(let status) = error { details["httpStatus"] = status }
+            if case ZoteroAPIClient.Failure.requestFailed(_, let status, _) = error { details["httpStatus"] = status }
+            if case ZoteroAPIClient.Failure.itemCreation(_, let status?, _) = error { details["httpStatus"] = status }
+        }
+        JottreDiagnostics.shared.record(name, details: details)
     }
 
     func selectSortOrder(_ order: ZoteroAttachmentSortOrder) {
@@ -865,13 +1114,21 @@ private final class ZoteroLibraryViewModel: ObservableObject {
                 } else {
                     let context = ZoteroDownloadContext(source: .documentOpen)
                     downloadContext = context
-                    sourceData = try await makeSyncService().download(documentID: attachment.key, context: context)
+                    sourceData = try await makeSyncService().download(
+                        documentID: attachment.key,
+                        context: context,
+                        expectedRemoteMD5: currentAttachment.remoteMD5IsPDF ? currentAttachment.remoteMD5 : nil
+                    )
                     loadedFromLocalCache = false
                 }
             } else {
                 let context = ZoteroDownloadContext(source: .documentOpen)
                 downloadContext = context
-                sourceData = try await makeSyncService().download(documentID: attachment.key, context: context)
+                sourceData = try await makeSyncService().download(
+                    documentID: attachment.key,
+                    context: context,
+                    expectedRemoteMD5: currentAttachment.remoteMD5IsPDF ? currentAttachment.remoteMD5 : nil
+                )
                 loadedFromLocalCache = false
             }
             sourceDataReady = true

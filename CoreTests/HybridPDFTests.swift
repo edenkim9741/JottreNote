@@ -719,7 +719,10 @@ final class HybridPDFTests: XCTestCase {
         let userID = "conflict-\(UUID().uuidString)"
         let key = "ABCD2345"
         let parentKey = "PARENT23"
-        let localPDF = Data("local hybrid handwriting".utf8)
+        let localPDF = try HybridPDFManager.embedJotPreservingSourcePDF(
+            pdfData: makePDF(pageSize: CGSize(width: 240, height: 320), rotation: 0),
+            jotData: Data("local hybrid handwriting".utf8)
+        )
         let remotePDF = try makePDF(pageSize: CGSize(width: 240, height: 320), rotation: 0)
         let store = ZoteroCacheStore()
         let item = ZoteroItem(
@@ -765,7 +768,7 @@ final class HybridPDFTests: XCTestCase {
             localCachePath: nil,
             syncStatus: .cloudOnly,
             version: 2,
-            md5: "new-remote-md5",
+            md5: ZoteroSyncService.md5Hex(remotePDF),
             modificationTimeMilliseconds: nil
         )
         let delta = ZoteroLibraryDelta(
@@ -779,18 +782,275 @@ final class HybridPDFTests: XCTestCase {
         )
 
         let changed = try store.apply(delta, userID: userID)
-        let localConflict = try XCTUnwrap(changed.attachments.values.first(where: \.isLocalOnly))
-        XCTAssertEqual(localConflict.filename, "Conflict notes (iPad Conflict Copy).pdf")
-        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: try XCTUnwrap(localConflict.localCachePath))), localPDF)
-        XCTAssertEqual(changed.attachments[key]?.syncStatus, .cloudOnly)
-        XCTAssertNil(changed.attachments[key]?.localCachePath)
+        XCTAssertEqual(changed.attachments[key]?.syncStatus, .dirty)
+        XCTAssertEqual(changed.attachments[key]?.localCachePath, localURL.path)
+        XCTAssertFalse(changed.attachments.values.contains(where: { $0.isLocalOnly && $0.conflictOriginalKey == key }))
         XCTAssertTrue(changed.pendingRemoteDownloads.contains(key))
 
-        try store.installRemoteVersion(key: key, data: remotePDF, userID: userID)
+        let didInstallRemote = try store.verifyDirtyRemoteVersion(key: key, data: remotePDF, userID: userID)
+        XCTAssertTrue(didInstallRemote)
+        let afterRemoteVerification = store.load(userID: userID)
+        let localConflict = try XCTUnwrap(afterRemoteVerification.attachments.values.first(where: \.isLocalOnly))
+        XCTAssertEqual(localConflict.filename, "Conflict notes (iPad Conflict Copy).pdf")
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: try XCTUnwrap(localConflict.localCachePath))), localPDF)
+        XCTAssertEqual(afterRemoteVerification.attachments[key]?.syncStatus, .downloaded)
+        XCTAssertFalse(afterRemoteVerification.pendingRemoteDownloads.contains(key))
+
+        var retriedConflict = afterRemoteVerification
+        let retryLocalURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try Data(contentsOf: URL(fileURLWithPath: try XCTUnwrap(localConflict.localCachePath))).write(to: retryLocalURL)
+        defer { try? FileManager.default.removeItem(at: retryLocalURL) }
+        retriedConflict.attachments[key]?.syncStatus = .dirty
+        retriedConflict.attachments[key]?.remoteMD5 = "old-remote-md5"
+        retriedConflict.attachments[key]?.remoteMD5IsPDF = true
+        retriedConflict.attachments[key]?.localCachePath = retryLocalURL.path
+        retriedConflict.attachments[key]?.md5 = localConflict.md5
+        try store.save(retriedConflict)
+        let repeatedDelta = ZoteroLibraryDelta(
+            sinceVersion: 11,
+            libraryVersion: 12,
+            collections: [],
+            items: [item],
+            attachments: [updatedRemoteAttachment],
+            deletedCollectionKeys: [],
+            deletedItemKeys: []
+        )
+        let repeated = try store.apply(repeatedDelta, userID: userID)
+        _ = try store.verifyDirtyRemoteVersion(key: key, data: remotePDF, userID: userID)
+        let afterRepeatedVerification = store.load(userID: userID)
+        XCTAssertEqual(repeated.attachments.values.filter { $0.isLocalOnly && $0.conflictOriginalKey == key }.count, 1)
+        XCTAssertEqual(afterRepeatedVerification.attachments.values.filter { $0.isLocalOnly && $0.conflictOriginalKey == key }.count, 1)
+
         let refreshed = store.load(userID: userID)
         XCTAssertEqual(refreshed.attachments[key]?.syncStatus, .downloaded)
-        XCTAssertEqual(try Data(contentsOf: localURL), remotePDF)
+        XCTAssertEqual(
+            try Data(contentsOf: URL(fileURLWithPath: try XCTUnwrap(refreshed.attachments[key]?.localCachePath))),
+            remotePDF
+        )
         XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: try XCTUnwrap(refreshed.attachments[localConflict.key]?.localCachePath))), localPDF)
+    }
+
+    func testRemotePDFChangeCreatesConflictCopyWithoutMakingOriginalLocalFileUnavailable() throws {
+        let userID = "conflict-download-fallback-\(UUID().uuidString)"
+        let key = "ABCD2345"
+        let parentKey = "PARENT23"
+        let localPDF = try HybridPDFManager.embedJotPreservingSourcePDF(
+            pdfData: makePDF(pageSize: CGSize(width: 240, height: 320), rotation: 0),
+            jotData: Data("local dirty state".utf8)
+        )
+        let remotePDF = try makePDF(pageSize: CGSize(width: 320, height: 240), rotation: 0)
+        let store = ZoteroCacheStore()
+        let item = ZoteroItem(
+            key: parentKey, title: "Remote changed", creators: [], year: nil,
+            parentItemKey: nil, collectionKeys: [], itemType: "document",
+            dateAdded: Date(), dateModified: Date(), version: 1, isTrashed: false
+        )
+        let attachment = ZoteroAttachment(
+            key: key, parentItemKey: parentKey, contentType: "application/pdf",
+            filename: "Remote changed.pdf", localCachePath: nil, syncStatus: .dirty,
+            version: 1, md5: nil, modificationTimeMilliseconds: nil,
+            remoteMD5: "previous-server-md5", remoteMD5IsPDF: true
+        )
+        let localURL = try store.registerCreatedDocument(
+            item: item, attachment: attachment, hybridPDF: localPDF, libraryVersion: 1, userID: userID
+        )
+        var baseline = store.load(userID: userID)
+        baseline.attachments[key]?.remoteMD5 = "previous-server-md5"
+        baseline.attachments[key]?.remoteMD5IsPDF = true
+        try store.save(baseline)
+        let delta = ZoteroLibraryDelta(
+            sinceVersion: 1, libraryVersion: 2, collections: [], items: [item],
+            attachments: [ZoteroAttachment(
+                key: key, parentItemKey: parentKey, contentType: "application/pdf",
+                filename: attachment.filename, localCachePath: nil, syncStatus: .cloudOnly,
+                version: 2, md5: ZoteroSyncService.md5Hex(remotePDF), modificationTimeMilliseconds: nil
+            )],
+            deletedCollectionKeys: [], deletedItemKeys: []
+        )
+
+        let changed = try store.apply(delta, userID: userID)
+        XCTAssertEqual(changed.attachments[key]?.syncStatus, .cloudOnly)
+        XCTAssertEqual(changed.attachments[key]?.localCachePath, localURL.path)
+        XCTAssertEqual(try Data(contentsOf: localURL), localPDF)
+        XCTAssertTrue(changed.pendingRemoteDownloads.contains(key))
+        let conflict = try XCTUnwrap(changed.attachments.values.first { $0.isConflict && $0.conflictOriginalKey == key })
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: try XCTUnwrap(conflict.conflictLocalPath))), localPDF)
+    }
+
+    func testUnknownRemoteMD5VerifiesDownloadedContentBeforeAllowingDirtyUpload() throws {
+        let userID = "remote-verification-\(UUID().uuidString)"
+        let key = "ABCD2345"
+        let parentKey = "PARENT23"
+        let basePDF = try makePDF(pageSize: CGSize(width: 240, height: 320), rotation: 0)
+        let localHybrid = try HybridPDFManager.embedJotPreservingSourcePDF(
+            pdfData: basePDF,
+            jotData: Data("local jot state".utf8)
+        )
+        let item = ZoteroItem(
+            key: parentKey, title: "Unknown MD5", creators: [], year: nil,
+            parentItemKey: nil, collectionKeys: [], itemType: "document",
+            dateAdded: Date(), dateModified: Date(), version: 1, isTrashed: false
+        )
+        let attachment = ZoteroAttachment(
+            key: key, parentItemKey: parentKey, contentType: "application/pdf",
+            filename: "Unknown MD5.pdf", localCachePath: nil, syncStatus: .dirty,
+            version: 1, md5: nil, modificationTimeMilliseconds: nil
+        )
+        let store = ZoteroCacheStore()
+        let localURL = try store.registerCreatedDocument(
+            item: item,
+            attachment: attachment,
+            hybridPDF: localHybrid,
+            libraryVersion: 1,
+            userID: userID
+        )
+        var snapshot = store.load(userID: userID)
+        snapshot.attachments[key]?.remoteMD5 = nil
+        snapshot.attachments[key]?.remoteMD5IsPDF = false
+        snapshot.attachments[key]?.verificationRemoteMD5 = nil
+        snapshot.attachments[key]?.verificationRemoteMD5WasChecked = true
+        snapshot.pendingRemoteDownloads = [key]
+        try store.save(snapshot)
+
+        let noChange = try store.verifyDirtyRemoteVersion(key: key, data: localHybrid, userID: userID)
+        XCTAssertFalse(noChange, "Identical remote content should keep the local edits dirty for upload")
+        let verified = store.load(userID: userID)
+        XCTAssertEqual(verified.attachments[key]?.syncStatus, .dirty)
+        XCTAssertTrue(verified.attachments[key]?.remoteMD5IsPDF == true)
+        XCTAssertFalse(verified.pendingRemoteDownloads.contains(key))
+
+        var pendingAgain = verified
+        pendingAgain.attachments[key]?.verificationRemoteMD5 = nil
+        pendingAgain.attachments[key]?.verificationRemoteMD5WasChecked = true
+        pendingAgain.pendingRemoteDownloads = [key]
+        try store.save(pendingAgain)
+        let changedRemotePDF = try makePDF(pageSize: CGSize(width: 320, height: 240), rotation: 0)
+        let didInstall = try store.verifyDirtyRemoteVersion(key: key, data: changedRemotePDF, userID: userID)
+        XCTAssertTrue(didInstall)
+        let conflictResolved = store.load(userID: userID)
+        XCTAssertEqual(conflictResolved.attachments[key]?.syncStatus, .downloaded)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: try XCTUnwrap(conflictResolved.attachments[key]?.localCachePath))), changedRemotePDF)
+        let conflictCopy = try XCTUnwrap(conflictResolved.attachments.values.first { $0.isConflict && $0.conflictOriginalKey == key })
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: try XCTUnwrap(conflictCopy.localCachePath))), localHybrid)
+        XCTAssertTrue(conflictResolved.pendingRemoteDownloads.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: localURL.path))
+    }
+
+    func testMissingLocalChecksumBaselineQueuesVerificationAndDefersUpload() throws {
+        let userID = "missing-md5-baseline-\(UUID().uuidString)"
+        let key = "ABCD2345"
+        let parentKey = "PARENT23"
+        let pdf = try makePDF(pageSize: CGSize(width: 240, height: 320), rotation: 0)
+        let store = ZoteroCacheStore()
+        let item = ZoteroItem(
+            key: parentKey, title: "Missing baseline", creators: [], year: nil,
+            parentItemKey: nil, collectionKeys: [], itemType: "document",
+            dateAdded: Date(), dateModified: Date(), version: 1, isTrashed: false
+        )
+        let attachment = ZoteroAttachment(
+            key: key, parentItemKey: parentKey, contentType: "application/pdf",
+            filename: "Missing baseline.pdf", localCachePath: nil, syncStatus: .dirty,
+            version: 1, md5: nil, modificationTimeMilliseconds: nil,
+            remoteMD5: nil, remoteMD5IsPDF: false
+        )
+        _ = try store.registerCreatedDocument(
+            item: item, attachment: attachment, hybridPDF: pdf, libraryVersion: 5, userID: userID
+        )
+        let remoteAttachment = ZoteroAttachment(
+            key: key, parentItemKey: parentKey, contentType: "application/pdf",
+            filename: attachment.filename, localCachePath: nil, syncStatus: .cloudOnly,
+            version: 2, md5: ZoteroSyncService.md5Hex(pdf), modificationTimeMilliseconds: nil
+        )
+        let delta = ZoteroLibraryDelta(
+            sinceVersion: 5, libraryVersion: 6, collections: [], items: [item],
+            attachments: [remoteAttachment], deletedCollectionKeys: [], deletedItemKeys: []
+        )
+
+        let updated = try store.apply(delta, userID: userID)
+        XCTAssertEqual(updated.attachments[key]?.syncStatus, .dirty)
+        XCTAssertNotNil(updated.attachments[key]?.localCachePath)
+        XCTAssertEqual(updated.attachments[key]?.verificationRemoteMD5, ZoteroSyncService.md5Hex(pdf))
+        XCTAssertTrue(updated.pendingRemoteDownloads.contains(key))
+        XCTAssertFalse(updated.attachments.values.contains { $0.isConflict && $0.conflictOriginalKey == key })
+    }
+
+    func testRemoteChecksumChangeDoesNotCreateConflictWhenDirtyLocalMatchesRemoteContent() throws {
+        let userID = "matching-remote-content-\(UUID().uuidString)"
+        let key = "ABCD2345"
+        let parentKey = "PARENT23"
+        let pdf = try makePDF(pageSize: CGSize(width: 240, height: 320), rotation: 0)
+        let jot = Data("same visible and jot state".utf8)
+        let hybrid = try HybridPDFManager.embedJotPreservingSourcePDF(pdfData: pdf, jotData: jot)
+        let store = ZoteroCacheStore()
+        let item = ZoteroItem(
+            key: parentKey, title: "Already converged", creators: [], year: nil,
+            parentItemKey: nil, collectionKeys: [], itemType: "document",
+            dateAdded: Date(), dateModified: Date(), version: 1, isTrashed: false
+        )
+        let attachment = ZoteroAttachment(
+            key: key, parentItemKey: parentKey, contentType: "application/pdf",
+            filename: "Already converged.pdf", localCachePath: nil, syncStatus: .dirty,
+            version: 1, md5: nil, modificationTimeMilliseconds: nil,
+            remoteMD5: "previous-server-pdf", remoteMD5IsPDF: true,
+            verificationRemoteMD5: ZoteroSyncService.md5Hex(pdf),
+            verificationRemoteMD5WasChecked: true
+        )
+        _ = try store.registerCreatedDocument(
+            item: item, attachment: attachment, hybridPDF: hybrid, libraryVersion: 1, userID: userID
+        )
+        var snapshot = store.load(userID: userID)
+        snapshot.attachments[key]?.remoteMD5 = "previous-server-pdf"
+        snapshot.attachments[key]?.remoteMD5IsPDF = true
+        snapshot.attachments[key]?.verificationRemoteMD5 = ZoteroSyncService.md5Hex(pdf)
+        snapshot.attachments[key]?.verificationRemoteMD5WasChecked = true
+        snapshot.pendingRemoteDownloads = [key]
+        try store.save(snapshot)
+
+        XCTAssertFalse(try store.verifyDirtyRemoteVersion(key: key, data: hybrid, userID: userID))
+        let verified = store.load(userID: userID)
+        XCTAssertEqual(verified.attachments[key]?.syncStatus, .dirty)
+        XCTAssertFalse(verified.pendingRemoteDownloads.contains(key))
+        XCTAssertFalse(verified.attachments.values.contains { $0.isConflict && $0.conflictOriginalKey == key })
+    }
+
+    func testUnknownRemoteMD5MismatchLeavesDirtyLocalFileAndDownloadPending() throws {
+        let userID = "remote-metadata-mismatch-\(UUID().uuidString)"
+        let key = "ABCD2345"
+        let parentKey = "PARENT23"
+        let localPDF = try makePDF(pageSize: CGSize(width: 240, height: 320), rotation: 0)
+        let remotePDF = try makePDF(pageSize: CGSize(width: 320, height: 240), rotation: 0)
+        let item = ZoteroItem(
+            key: parentKey, title: "Metadata mismatch", creators: [], year: nil,
+            parentItemKey: nil, collectionKeys: [], itemType: "document",
+            dateAdded: Date(), dateModified: Date(), version: 1, isTrashed: false
+        )
+        let attachment = ZoteroAttachment(
+            key: key, parentItemKey: parentKey, contentType: "application/pdf",
+            filename: "Metadata mismatch.pdf", localCachePath: nil, syncStatus: .dirty,
+            version: 1, md5: nil, modificationTimeMilliseconds: nil,
+            verificationRemoteMD5: ZoteroSyncService.md5Hex(localPDF),
+            verificationRemoteMD5WasChecked: true
+        )
+        let store = ZoteroCacheStore()
+        let localURL = try store.registerCreatedDocument(
+            item: item,
+            attachment: attachment,
+            hybridPDF: localPDF,
+            libraryVersion: 1,
+            userID: userID
+        )
+        var snapshot = store.load(userID: userID)
+        snapshot.attachments[key]?.verificationRemoteMD5 = ZoteroSyncService.md5Hex(localPDF)
+        snapshot.attachments[key]?.verificationRemoteMD5WasChecked = true
+        snapshot.pendingRemoteDownloads = [key]
+        try store.save(snapshot)
+
+        XCTAssertThrowsError(try store.verifyDirtyRemoteVersion(key: key, data: remotePDF, userID: userID))
+        XCTAssertEqual(try Data(contentsOf: localURL), localPDF)
+        let unchanged = store.load(userID: userID)
+        XCTAssertEqual(unchanged.attachments[key]?.syncStatus, .dirty)
+        XCTAssertTrue(unchanged.pendingRemoteDownloads.contains(key))
+        XCTAssertFalse(unchanged.attachments.values.contains { $0.isConflict && $0.conflictOriginalKey == key })
     }
 
     func testDirtyAttachmentIgnoresVersionAndClockDriftWhenMD5IsUnchanged() throws {
@@ -879,8 +1139,8 @@ final class HybridPDFTests: XCTestCase {
             let conflictKey = "local_\(UUID().uuidString)"
             let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-            let originalData = Data("server-version-\(suffix)".utf8)
-            let localData = Data("ipad-handwritten-version-\(suffix)".utf8)
+            let originalData = try makePDF(pageSize: CGSize(width: 240, height: 320), rotation: 0)
+            let localData = try makePDF(pageSize: CGSize(width: 320, height: 240), rotation: 0)
             let originalURL = folder.appendingPathComponent("original.pdf")
             let conflictURL = folder.appendingPathComponent("conflict.pdf")
             try originalData.write(to: originalURL)
@@ -955,7 +1215,11 @@ final class HybridPDFTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: try XCTUnwrap(serverAttachment.localCachePath))), serverData)
 
         let (bothStore, bothUserID, bothConflictKey, bothServerData, bothLocalData) = try seededStore("both")
-        let bothResolved = try bothStore.keepConflictAsNewDocument(
+        let reservation = try bothStore.reserveKeepBothTargetKeys(key: bothConflictKey, userID: bothUserID)
+        let reloadedReservation = try ZoteroCacheStore().reserveKeepBothTargetKeys(key: bothConflictKey, userID: bothUserID)
+        XCTAssertEqual(reservation.parentItemKey, reloadedReservation.parentItemKey)
+        XCTAssertEqual(reservation.attachmentKey, reloadedReservation.attachmentKey)
+        XCTAssertThrowsError(try bothStore.keepConflictAsNewDocument(
             key: bothConflictKey,
             serverData: bothServerData,
             created: CreatedZoteroDocumentKeys(
@@ -964,12 +1228,23 @@ final class HybridPDFTests: XCTestCase {
                 libraryVersion: 12
             ),
             userID: bothUserID
+        ))
+        XCTAssertNotNil(bothStore.load(userID: bothUserID).attachments[bothConflictKey])
+        let bothResolved = try bothStore.keepConflictAsNewDocument(
+            key: bothConflictKey,
+            serverData: bothServerData,
+            created: CreatedZoteroDocumentKeys(
+                parentItemKey: reservation.parentItemKey,
+                attachmentKey: reservation.attachmentKey,
+                libraryVersion: 12
+            ),
+            userID: bothUserID
         )
         XCTAssertEqual(bothResolved.attachments["ABCD2345"]?.syncStatus, .downloaded)
-        XCTAssertEqual(bothResolved.attachments["NEWFILE2"]?.syncStatus, .dirty)
+        XCTAssertEqual(bothResolved.attachments[reservation.attachmentKey]?.syncStatus, .dirty)
         XCTAssertNil(bothResolved.attachments[bothConflictKey])
         XCTAssertEqual(
-            try Data(contentsOf: URL(fileURLWithPath: try XCTUnwrap(bothResolved.attachments["NEWFILE2"]?.localCachePath))),
+            try Data(contentsOf: URL(fileURLWithPath: try XCTUnwrap(bothResolved.attachments[reservation.attachmentKey]?.localCachePath))),
             bothLocalData
         )
     }
@@ -1040,7 +1315,10 @@ final class HybridPDFTests: XCTestCase {
         let userID = "deleted-conflict-\(UUID().uuidString)"
         let key = "DELE2345"
         let parentKey = "PAREN234"
-        let localPDF = Data("unsynced handwritten PDF".utf8)
+        let localPDF = try HybridPDFManager.embedJotPreservingSourcePDF(
+            pdfData: makePDF(pageSize: CGSize(width: 240, height: 320), rotation: 0),
+            jotData: Data("unsynced handwritten PDF".utf8)
+        )
         let store = ZoteroCacheStore()
         let item = ZoteroItem(
             key: parentKey,

@@ -6,25 +6,30 @@ import PDFKit
 enum ZoteroDownloadSource: String, Sendable {
     case documentOpen
     case librarySync
+    case conflictResolution
 }
 
 struct ZoteroDownloadContext: Sendable {
     let requestID: String
     let attachmentID: String
     let source: ZoteroDownloadSource
+    let relatedAttachmentID: String?
     private let attemptState = ZoteroDownloadAttemptState()
 
     var attempt: Int { attemptState.value }
     func setAttempt(_ attempt: Int) { attemptState.value = attempt }
 
-    init(source: ZoteroDownloadSource) {
+    init(source: ZoteroDownloadSource, relatedAttachmentID: String? = nil) {
         requestID = UUID().uuidString
         attachmentID = UUID().uuidString
         self.source = source
+        self.relatedAttachmentID = relatedAttachmentID
     }
 
     var eventDetails: [String: Any] {
-        ["requestID": requestID, "attachmentID": attachmentID, "downloadPath": source.rawValue]
+        var details: [String: Any] = ["requestID": requestID, "attachmentID": attachmentID, "downloadPath": source.rawValue]
+        if let relatedAttachmentID { details["relatedAttachmentID"] = relatedAttachmentID }
+        return details
     }
 }
 
@@ -59,7 +64,8 @@ struct ZoteroSyncService: Sendable {
 
     func download(
         documentID: String,
-        context: ZoteroDownloadContext? = nil
+        context: ZoteroDownloadContext? = nil,
+        expectedRemoteMD5: String? = nil
     ) async throws -> Data {
         try await AsyncResourceAccessCoordinator.shared.withAccess(to: resourceKey(for: documentID)) {
             let context = context ?? ZoteroDownloadContext(source: .documentOpen)
@@ -147,6 +153,19 @@ struct ZoteroSyncService: Sendable {
                             )
                             throw Failure.invalidPDF
                         }
+                        let actualRemoteMD5 = Self.md5Hex(HybridPDFManager.pdfData(in: hybridData))
+                        if let expectedRemoteMD5 = expectedRemoteMD5?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+                           !expectedRemoteMD5.isEmpty,
+                           expectedRemoteMD5 != actualRemoteMD5 {
+                            Self.recordDownloadEvent(
+                                "zotero.download.validationFailed",
+                                context: context,
+                                stage: "remoteMetadataValidation",
+                                attempt: context.attempt,
+                                extra: ["failureReason": "downloadedPDFChecksumDoesNotMatchAttachmentMetadata"]
+                            )
+                            throw Failure.remoteDownloadMetadataMismatch
+                        }
                         return hybridData
                     }
                 }.value
@@ -199,6 +218,10 @@ struct ZoteroSyncService: Sendable {
         if case Failure.invalidKey = error { stage = "keyValidation"; reason = "invalidAttachmentKey" }
         else if case Failure.pdfNotFound = error { stage = "pdfSelection"; reason = "pdfNotFound" }
         else if case Failure.invalidPDF = error { stage = "pdfValidation"; reason = "invalidPDF" }
+        else if case Failure.remoteDownloadMetadataMismatch = error {
+            stage = "remoteMetadataValidation"
+            reason = "downloadedPDFChecksumDoesNotMatchAttachmentMetadata"
+        }
         else if error is HybridPDFManager.Failure || (error as? Failure).map({ failure in
             if case .invalidHybridPDF = failure { return true }
             return false
@@ -212,6 +235,10 @@ struct ZoteroSyncService: Sendable {
             else if case .unsupportedCompression = archiveFailure { reason = "unsupportedCompression" }
             else if case .decompressionFailed = archiveFailure { reason = "decompressionFailed" }
             else { reason = "invalidArchive" }
+        }
+        else if case ZoteroCacheStore.Failure.remoteDownloadMetadataMismatch = error {
+            stage = "remoteMetadataValidation"
+            reason = "downloadedPDFChecksumDoesNotMatchAttachmentMetadata"
         }
         else if case WebDAVService.Failure.unexpectedResponse(let status) = error {
             stage = "webDAVHTTP"
@@ -424,6 +451,7 @@ struct ZoteroSyncService: Sendable {
         case invalidKey
         case invalidPDF
         case invalidHybridPDF
+        case remoteDownloadMetadataMismatch
     }
 }
 

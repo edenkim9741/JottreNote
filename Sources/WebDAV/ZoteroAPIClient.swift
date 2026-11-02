@@ -6,6 +6,11 @@ struct ZoteroItemTypeDefinition: Codable, Sendable, Hashable, Identifiable {
     var id: String { itemType }
 }
 
+struct ZoteroAttachmentRemoteState: Sendable, Hashable {
+    let version: Int
+    let md5: String?
+}
+
 struct ZoteroSchemaField: Codable, Sendable, Hashable, Identifiable {
     let field: String
     let localized: String
@@ -113,6 +118,27 @@ struct ZoteroAPIClient: Sendable {
             fields: fields,
             creatorTypes: creatorTypes,
             creatorUsesSingleName: creatorUsesSingleName
+        )
+    }
+
+    func fetchAttachmentRemoteState(key: String) async throws -> ZoteroAttachmentRemoteState {
+        guard ZoteroSyncService.isValidKey(key) else { throw Failure.invalidKey }
+        let (data, response) = try await performData(
+            for: request(path: "/users/\(userID)/items/\(key)?format=json")
+        )
+        try Self.validate(response)
+        guard let item = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let version = item["version"] as? Int,
+              let fields = item["data"] as? [String: Any],
+              fields["itemType"] as? String == "attachment" else {
+            throw Failure.invalidResponse
+        }
+        let normalizedMD5 = (fields["md5"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return ZoteroAttachmentRemoteState(
+            version: version,
+            md5: normalizedMD5?.isEmpty == false ? normalizedMD5 : nil
         )
     }
 

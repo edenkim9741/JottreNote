@@ -90,23 +90,61 @@ actor ZoteroSyncEngine {
                     for (index, key) in keys.enumerated() {
                         let progressValue = 0.35 + 0.2 * Double(index) / Double(max(1, keys.count))
                         await progress?.update(progressValue, message: String(localized: "zotero.sync.status.downloading"))
-                        let context = ZoteroDownloadContext(source: .librarySync)
+                        let conflictRelationID = cacheStore.conflictDiagnosticID(forOriginalKey: key, userID: userID)
+                        let isConflictRelatedDownload = conflictRelationID != nil
+                            || snapshot.attachments[key]?.syncStatus == .dirty
+                        let context = ZoteroDownloadContext(
+                            source: .librarySync,
+                            relatedAttachmentID: conflictRelationID
+                        )
+                        if isConflictRelatedDownload {
+                            var details = context.eventDetails
+                            details["stage"] = "remoteDownload"
+                            details["attempt"] = context.attempt
+                            JottreDiagnostics.shared.record("zotero.conflict.remoteDownloadStarted", details: details)
+                        }
                         var receivedDownload = false
                         var downloadedBytes = 0
                         do {
                             let data = try await downloadAttachment(key, context)
                             receivedDownload = true
                             downloadedBytes = data.count
-                            if try cacheStore.installRemoteVersion(key: key, data: data, userID: userID) {
+                            let didInstall: Bool
+                            if cacheStore.load(userID: userID).attachments[key]?.syncStatus == .dirty {
+                                didInstall = try cacheStore.verifyDirtyRemoteVersion(
+                                    key: key,
+                                    data: data,
+                                    userID: userID,
+                                    context: context
+                                )
+                            } else {
+                                didInstall = try cacheStore.installRemoteVersion(key: key, data: data, userID: userID)
+                            }
+                            if didInstall {
                                 var details = context.eventDetails
                                 details["stage"] = "localCache"
                                 details["attempt"] = context.attempt
                                 details["cacheSaved"] = true
                                 details["byteCount"] = data.count
                                 JottreDiagnostics.shared.record("zotero.download.cacheSaved", details: details)
+                                if conflictRelationID != nil {
+                                    details["stage"] = "remoteInstalled"
+                                    JottreDiagnostics.shared.record("zotero.conflict.remoteInstalled", details: details)
+                                }
                             }
                         } catch {
                             if isCancellation(error) { throw CancellationError() }
+                            if isConflictRelatedDownload || cacheStore.conflictDiagnosticID(forOriginalKey: key, userID: userID) != nil {
+                                var details = context.eventDetails
+                                if details["relatedAttachmentID"] == nil {
+                                    details["conflictRelationID"] = cacheStore.conflictDiagnosticID(forOriginalKey: key, userID: userID)
+                                }
+                                details["stage"] = "remoteDownload"
+                                details["errorType"] = String(reflecting: type(of: error))
+                                details["errorDomain"] = (error as NSError).domain
+                                details["errorCode"] = (error as NSError).code
+                                JottreDiagnostics.shared.record("zotero.conflict.remoteDownloadFailed", details: details)
+                            }
                             if receivedDownload {
                                 ZoteroSyncService.recordDownloadFailure(
                                     error,
@@ -199,10 +237,13 @@ actor ZoteroSyncEngine {
                 }
 
                 if let uploadAttachment {
-                    let dirtyKeys = cacheStore.load(userID: userID).attachments.values
+                    let uploadSnapshot = cacheStore.load(userID: userID)
+                    let pendingRemoteDownloadKeys = Set(uploadSnapshot.pendingRemoteDownloads)
+                    let dirtyKeys = uploadSnapshot.attachments.values
                         .filter {
                             $0.syncStatus == .dirty && !$0.isPendingSync
                                 && !$0.isLocalOnly && !$0.isConflict
+                                && !pendingRemoteDownloadKeys.contains($0.key)
                         }
                         .map(\.key)
                         .sorted()
