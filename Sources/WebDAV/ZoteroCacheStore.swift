@@ -56,6 +56,28 @@ struct ZoteroCollection: Codable, Sendable, Hashable, Identifiable {
     }
 }
 
+struct ZoteroCreator: Codable, Sendable, Hashable {
+    var creatorType: String
+    var firstName: String
+    var lastName: String
+    var name: String
+
+    init(creatorType: String, firstName: String = "", lastName: String = "", name: String = "") {
+        self.creatorType = creatorType
+        self.firstName = firstName
+        self.lastName = lastName
+        self.name = name
+    }
+
+    var displayName: String {
+        let personalName = [firstName, lastName]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        return personalName.isEmpty ? name : personalName
+    }
+}
+
 struct ZoteroItem: Codable, Sendable, Hashable, Identifiable {
     let key: String
     let title: String
@@ -64,6 +86,8 @@ struct ZoteroItem: Codable, Sendable, Hashable, Identifiable {
     let parentItemKey: String?
     let collectionKeys: [String]
     let itemType: String
+    var metadataFields: [String: String]
+    var creatorEntries: [ZoteroCreator]
     let dateAdded: Date?
     let dateModified: Date?
     let version: Int
@@ -74,7 +98,7 @@ struct ZoteroItem: Codable, Sendable, Hashable, Identifiable {
     var id: String { key }
 
     private enum CodingKeys: String, CodingKey {
-        case key, title, creators, year, parentItemKey, collectionKeys, itemType
+        case key, title, creators, year, parentItemKey, collectionKeys, itemType, metadataFields, creatorEntries
         case dateAdded, dateModified, version, isTrashed, isPendingSync, syncError, isConflict
     }
 
@@ -82,7 +106,9 @@ struct ZoteroItem: Codable, Sendable, Hashable, Identifiable {
         key: String, title: String, creators: [String], year: String?, parentItemKey: String?,
         collectionKeys: [String], itemType: String, dateAdded: Date?, dateModified: Date?,
         version: Int, isTrashed: Bool, isPendingSync: Bool = false, syncError: String? = nil,
-        isConflict: Bool = false
+        isConflict: Bool = false,
+        metadataFields: [String: String] = [:],
+        creatorEntries: [ZoteroCreator] = []
     ) {
         self.key = key
         self.title = title
@@ -91,6 +117,8 @@ struct ZoteroItem: Codable, Sendable, Hashable, Identifiable {
         self.parentItemKey = parentItemKey
         self.collectionKeys = collectionKeys
         self.itemType = itemType
+        self.metadataFields = metadataFields
+        self.creatorEntries = creatorEntries
         self.dateAdded = dateAdded
         self.dateModified = dateModified
         self.version = version
@@ -118,7 +146,9 @@ struct ZoteroItem: Codable, Sendable, Hashable, Identifiable {
             isPendingSync: try values.decodeIfPresent(Bool.self, forKey: .isPendingSync) ?? false,
             syncError: try values.decodeIfPresent(String.self, forKey: .syncError),
             isConflict: try values.decodeIfPresent(Bool.self, forKey: .isConflict)
-                ?? title.hasSuffix("(iPad Conflict Copy)")
+                ?? title.hasSuffix("(iPad Conflict Copy)"),
+            metadataFields: try values.decodeIfPresent([String: String].self, forKey: .metadataFields) ?? [:],
+            creatorEntries: try values.decodeIfPresent([ZoteroCreator].self, forKey: .creatorEntries) ?? []
         )
     }
 }
@@ -877,7 +907,9 @@ final class ZoteroCacheStore: @unchecked Sendable {
             snapshot.items.removeValue(forKey: temporaryParentKey)
             snapshot.items.removeValue(forKey: temporaryAttachmentKey)
             snapshot.attachments.removeValue(forKey: temporaryAttachmentKey)
-            snapshot.keyAliases[temporaryAttachmentKey] = created.attachmentKey
+            if temporaryAttachmentKey != created.attachmentKey {
+                snapshot.keyAliases[temporaryAttachmentKey] = created.attachmentKey
+            }
             let promotedItem = ZoteroItem(
                 key: created.parentItemKey,
                 title: oldItem.title,
@@ -889,7 +921,9 @@ final class ZoteroCacheStore: @unchecked Sendable {
                 dateAdded: oldItem.dateAdded,
                 dateModified: Date(),
                 version: version,
-                isTrashed: false
+                isTrashed: false,
+                metadataFields: oldItem.metadataFields,
+                creatorEntries: oldItem.creatorEntries
             )
             oldAttachment.key = created.attachmentKey
             oldAttachment.parentItemKey = created.parentItemKey

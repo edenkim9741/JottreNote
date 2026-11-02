@@ -49,6 +49,11 @@ struct ExternalFileImportService: ExternalFileImportServiceProtocol {
     }
 
     func readExternalFile(sourceURL: URL) throws -> Data {
+        try readExternalFile(sourceURL: sourceURL, maximumFileSize: Self.maximumFileSize)
+    }
+
+    func readExternalFile(sourceURL: URL, maximumFileSize: Int) throws -> Data {
+        guard maximumFileSize > 0 else { throw Failure.fileTooLarge }
         let granted = startAccessingSecurityScopedResource(sourceURL)
         defer {
             if granted {
@@ -67,14 +72,14 @@ struct ExternalFileImportService: ExternalFileImportServiceProtocol {
         ) { secureURL in
             result = Result(catching: {
                 let fileSize = try? secureURL.resourceValues(forKeys: [.fileSizeKey]).fileSize
-                guard fileSize.map({ $0 <= Self.maximumFileSize }) ?? true else {
+                guard fileSize.map({ $0 <= maximumFileSize }) ?? true else {
                     throw Failure.fileTooLarge
                 }
                 // File Provider URLs can be temporary. Return owned bytes before
                 // the coordination/security scope closes rather than a mapping
                 // whose backing file may disappear.
                 let data = try Data(contentsOf: secureURL)
-                guard data.count <= Self.maximumFileSize else { throw Failure.fileTooLarge }
+                guard data.count <= maximumFileSize else { throw Failure.fileTooLarge }
                 return data
             })
         }

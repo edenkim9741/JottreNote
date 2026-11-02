@@ -1,5 +1,30 @@
 import Foundation
 
+struct ZoteroItemTypeDefinition: Codable, Sendable, Hashable, Identifiable {
+    let itemType: String
+    let localized: String
+    var id: String { itemType }
+}
+
+struct ZoteroSchemaField: Codable, Sendable, Hashable, Identifiable {
+    let field: String
+    let localized: String
+    var id: String { field }
+}
+
+struct ZoteroCreatorTypeDefinition: Codable, Sendable, Hashable, Identifiable {
+    let creatorType: String
+    let localized: String
+    var id: String { creatorType }
+}
+
+struct ZoteroItemTypeSchema: Codable, Sendable, Hashable {
+    let type: ZoteroItemTypeDefinition
+    let fields: [ZoteroSchemaField]
+    let creatorTypes: [ZoteroCreatorTypeDefinition]
+    let creatorUsesSingleName: Bool
+}
+
 struct ZoteroAPIClient: Sendable {
     let apiKey: String
     let userID: String
@@ -24,6 +49,71 @@ struct ZoteroAPIClient: Sendable {
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let userID = object["userID"] as? Int else { throw Failure.invalidResponse }
         return String(userID)
+    }
+
+    func fetchItemTypes() async throws -> [ZoteroItemTypeDefinition] {
+        let query = [URLQueryItem(name: "locale", value: Locale.current.identifier.replacingOccurrences(of: "_", with: "-"))]
+        let (data, response) = try await performData(for: request(path: "/itemTypes", query: query))
+        try Self.validate(response)
+        guard let values = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            throw Failure.invalidResponse
+        }
+        return values.compactMap { value in
+            guard let itemType = value["itemType"] as? String,
+                  let localized = value["localized"] as? String,
+                  !["note", "attachment", "annotation"].contains(itemType) else { return nil }
+            return ZoteroItemTypeDefinition(itemType: itemType, localized: localized)
+        }
+    }
+
+    func fetchItemTypeSchema(_ type: ZoteroItemTypeDefinition) async throws -> ZoteroItemTypeSchema {
+        let typeQuery = [
+            URLQueryItem(name: "itemType", value: type.itemType),
+            URLQueryItem(name: "locale", value: Locale.current.identifier.replacingOccurrences(of: "_", with: "-")),
+        ]
+        async let templateResponse = performData(for: request(path: "/items/new", query: typeQuery))
+        async let fieldsResponse = performData(for: request(path: "/itemTypeFields", query: typeQuery))
+        async let creatorTypesResponse = performData(
+            for: request(path: "/itemTypeCreatorTypes", query: typeQuery)
+        )
+        let (templateData, templateHTTP) = try await templateResponse
+        let (fieldsData, fieldsHTTP) = try await fieldsResponse
+        let (creatorTypesData, creatorTypesHTTP) = try await creatorTypesResponse
+        try Self.validate(templateHTTP)
+        try Self.validate(fieldsHTTP)
+        try Self.validate(creatorTypesHTTP)
+        guard let template = try JSONSerialization.jsonObject(with: templateData) as? [String: Any],
+              template["itemType"] as? String == type.itemType,
+              let rawFields = try JSONSerialization.jsonObject(with: fieldsData) as? [[String: Any]],
+              let rawCreatorTypes = try JSONSerialization.jsonObject(with: creatorTypesData) as? [[String: Any]] else {
+            throw Failure.invalidResponse
+        }
+        let editableFields = Set(template.compactMap { key, value -> String? in
+            guard value is String,
+                  !["itemType", "creators", "tags", "collections", "relations", "key", "version"].contains(key)
+            else { return nil }
+            return key
+        })
+        let fields = rawFields.compactMap { value -> ZoteroSchemaField? in
+            guard let field = value["field"] as? String,
+                  editableFields.contains(field),
+                  let localized = value["localized"] as? String else { return nil }
+            return ZoteroSchemaField(field: field, localized: localized)
+        }
+        let creatorTypes = rawCreatorTypes.compactMap { value -> ZoteroCreatorTypeDefinition? in
+            guard let creatorType = value["creatorType"] as? String,
+                  let localized = value["localized"] as? String else { return nil }
+            return ZoteroCreatorTypeDefinition(creatorType: creatorType, localized: localized)
+        }
+        let templateCreators = template["creators"] as? [[String: Any]] ?? []
+        let creatorUsesSingleName = templateCreators.first?["name"] != nil
+            && templateCreators.first?["firstName"] == nil
+        return ZoteroItemTypeSchema(
+            type: type,
+            fields: fields,
+            creatorTypes: creatorTypes,
+            creatorUsesSingleName: creatorUsesSingleName
+        )
     }
 
     /// Fetches the complete collection tree using Zotero's offset pagination.
@@ -250,37 +340,62 @@ struct ZoteroAPIClient: Sendable {
         fullName: String,
         date: Date = Date()
     ) async throws -> CreatedZoteroDocumentKeys {
-        guard Int(userID) != nil else { throw Failure.invalidUserID }
-        let parentKey = Self.generateItemKey()
-        let attachmentKey = Self.generateItemKey()
         let trimmedFullName = fullName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedFirstName = firstName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedLastName = lastName.trimmingCharacters(in: .whitespacesAndNewlines)
-        var creators: [[String: String]] = []
-        if !trimmedFullName.isEmpty {
-            creators = [["creatorType": "author", "name": trimmedFullName]]
-        } else if !trimmedFirstName.isEmpty || !trimmedLastName.isEmpty {
-            creators = [[
-                "creatorType": "author",
-                "firstName": trimmedFirstName,
-                "lastName": trimmedLastName,
-            ]]
-        }
+        let creator = ZoteroCreator(
+            creatorType: "author",
+            firstName: firstName.trimmingCharacters(in: .whitespacesAndNewlines),
+            lastName: lastName.trimmingCharacters(in: .whitespacesAndNewlines),
+            name: trimmedFullName
+        )
         let dateFormatter = DateFormatter()
         dateFormatter.locale = Locale(identifier: "en_US_POSIX")
         dateFormatter.timeZone = .current
         dateFormatter.dateFormat = "yyyy-MM-dd"
-        let itemPayload: [String: Any] = [
-            "key": parentKey,
-            "version": 0,
-            "itemType": "document",
-            "title": title,
-            "creators": creators,
-            "date": dateFormatter.string(from: date),
-            "collections": collectionKeys,
-            "tags": [],
-            "relations": [:],
-        ]
+        return try await createItemWithPDFAttachment(
+            title: title,
+            filename: filename,
+            collectionKeys: collectionKeys,
+            itemType: "document",
+            metadataFields: ["date": dateFormatter.string(from: date)],
+            creators: [creator]
+        )
+    }
+
+    func createItemWithPDFAttachment(
+        title: String,
+        filename: String,
+        collectionKeys: [String],
+        itemType: String,
+        metadataFields: [String: String],
+        creators: [ZoteroCreator],
+        parentItemKey: String? = nil,
+        pdfAttachmentKey: String? = nil
+    ) async throws -> CreatedZoteroDocumentKeys {
+        guard Int(userID) != nil else { throw Failure.invalidUserID }
+        let parentKey = parentItemKey ?? Self.generateItemKey()
+        let attachmentKey = pdfAttachmentKey ?? Self.generateItemKey()
+        guard ZoteroSyncService.isValidKey(parentKey), ZoteroSyncService.isValidKey(attachmentKey),
+              parentKey != attachmentKey else { throw Failure.invalidKey }
+        var itemPayload: [String: Any] = metadataFields.reduce(into: [:]) { result, entry in
+            result[entry.key] = entry.value
+        }
+        itemPayload["key"] = parentKey
+        itemPayload["version"] = 0
+        itemPayload["itemType"] = itemType
+        itemPayload["title"] = title
+        itemPayload["creators"] = creators.compactMap { creator -> [String: String]? in
+            let creatorType = creator.creatorType.trimmingCharacters(in: .whitespacesAndNewlines)
+            let firstName = creator.firstName.trimmingCharacters(in: .whitespacesAndNewlines)
+            let lastName = creator.lastName.trimmingCharacters(in: .whitespacesAndNewlines)
+            let name = creator.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !firstName.isEmpty || !lastName.isEmpty || !name.isEmpty,
+                  !creatorType.isEmpty else { return nil }
+            if !name.isEmpty { return ["creatorType": creatorType, "name": name] }
+            return ["creatorType": creatorType, "firstName": firstName, "lastName": lastName]
+        }
+        itemPayload["collections"] = collectionKeys
+        itemPayload["tags"] = []
+        itemPayload["relations"] = [:]
         let attachmentPayload: [String: Any] = [
             "key": attachmentKey,
             "version": 0,
@@ -308,7 +423,51 @@ struct ZoteroAPIClient: Sendable {
         )
     }
 
+    func createPDFAttachment(parentItemKey: String, filename: String) async throws -> (key: String, libraryVersion: Int) {
+        guard Int(userID) != nil, ZoteroSyncService.isValidKey(parentItemKey) else {
+            throw Failure.invalidUserID
+        }
+        let attachmentKey = Self.generateItemKey()
+        let payload: [String: Any] = [
+            "key": attachmentKey,
+            "version": 0,
+            "itemType": "attachment",
+            "parentItem": parentItemKey,
+            "linkMode": "imported_file",
+            "title": URL(fileURLWithPath: filename).deletingPathExtension().lastPathComponent,
+            "note": "",
+            "tags": [],
+            "relations": [:],
+            "contentType": "application/pdf",
+            "charset": "",
+            "filename": filename,
+            "md5": NSNull(),
+            "mtime": NSNull(),
+        ]
+        let version = try await createItems([(stage: "PDF attachment", key: attachmentKey, payload: payload)])
+        return (attachmentKey, version)
+    }
+
     private func createItems(_ items: [(stage: String, key: String, payload: [String: Any])]) async throws -> Int {
+        do {
+            return try await postItems(items)
+        } catch {
+            guard Self.mayHavePartiallyCreatedItems(after: error) else { throw error }
+            let isItemCreationFailure: Bool
+            if let failure = error as? Failure, case .itemCreation = failure {
+                isItemCreationFailure = true
+            } else {
+                isItemCreationFailure = false
+            }
+            return try await recoverOrCreateMissingItems(
+                items,
+                originalError: error,
+                mayCreateMissingItems: !isItemCreationFailure
+            )
+        }
+    }
+
+    private func postItems(_ items: [(stage: String, key: String, payload: [String: Any])]) async throws -> Int {
         var urlRequest = request(path: "/users/\(userID)/items")
         urlRequest.httpMethod = "POST"
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -333,7 +492,9 @@ struct ZoteroAPIClient: Sendable {
                 throw Failure.itemCreation(stage: item.stage, status: code, message: message)
             }
         }
-        let successful = object["successful"] as? [String: Any] ?? [:]
+        let successful = object["successful"] as? [String: Any]
+            ?? object["success"] as? [String: Any]
+            ?? [:]
         for (index, item) in items.enumerated() {
             guard let key = Self.createdKey(from: successful[String(index)]),
                   key == item.key,
@@ -344,13 +505,81 @@ struct ZoteroAPIClient: Sendable {
         return http.value(forHTTPHeaderField: "Last-Modified-Version").flatMap(Int.init) ?? 0
     }
 
+    private func recoverOrCreateMissingItems(
+        _ items: [(stage: String, key: String, payload: [String: Any])],
+        originalError: Error,
+        mayCreateMissingItems: Bool
+    ) async throws -> Int {
+        let existing = try await inspectExistingItems(items)
+        let missingItems = items.filter { existing[$0.key] == nil }
+        if missingItems.isEmpty { return existing.values.max() ?? 0 }
+        if existing.isEmpty && !mayCreateMissingItems { throw originalError }
+
+        do {
+            _ = try await postItems(missingItems)
+        } catch {
+            let afterRetry = try await inspectExistingItems(items)
+            if afterRetry.count == items.count { return afterRetry.values.max() ?? 0 }
+            throw error
+        }
+        let completed = try await inspectExistingItems(items)
+        guard completed.count == items.count else { throw originalError }
+        return completed.values.max() ?? 0
+    }
+
+    private static func mayHavePartiallyCreatedItems(after error: Error) -> Bool {
+        if let failure = error as? Failure {
+            switch failure {
+            case .invalidResponse, .itemCreation:
+                return true
+            case .requestFailed(_, let status, _):
+                return status == 408 || status == 409 || status == 412 || (500...599).contains(status)
+            default:
+                return false
+            }
+        }
+        return error is URLError
+    }
+
+    private func inspectExistingItems(
+        _ items: [(stage: String, key: String, payload: [String: Any])]
+    ) async throws -> [String: Int] {
+        var versions: [String: Int] = [:]
+        for item in items {
+            let (data, response) = try await performData(
+                for: request(path: "/users/\(userID)/items/\(item.key)")
+            )
+            guard let http = response as? HTTPURLResponse else { throw Failure.invalidResponse }
+            if http.statusCode == 404 { continue }
+            try Self.validate(response)
+            guard let remote = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let remoteData = remote["data"] as? [String: Any] else { throw Failure.invalidResponse }
+            for (field, expected) in item.payload where field != "key" && field != "version" {
+                guard let actual = remoteData[field], Self.jsonValuesEqual(actual, expected) else {
+                    throw Failure.itemKeyCollision
+                }
+            }
+            guard let version = remote["version"] as? Int else { throw Failure.invalidResponse }
+            versions[item.key] = version
+        }
+        return versions
+    }
+
+    private static func jsonValuesEqual(_ lhs: Any, _ rhs: Any) -> Bool {
+        guard let left = try? JSONSerialization.data(withJSONObject: lhs, options: [.sortedKeys, .fragmentsAllowed]),
+              let right = try? JSONSerialization.data(withJSONObject: rhs, options: [.sortedKeys, .fragmentsAllowed]) else {
+            return false
+        }
+        return left == right
+    }
+
     private static func createdKey(from value: Any?) -> String? {
         if let key = value as? String { return key }
         if let object = value as? [String: Any] { return object["key"] as? String }
         return nil
     }
 
-    private static func generateItemKey() -> String {
+    static func generateItemKey() -> String {
         let alphabet = Array("23456789ABCDEFGHIJKLMNPQRSTUVWXYZ")
         return String((0..<8).compactMap { _ in alphabet.randomElement() })
     }
@@ -535,6 +764,21 @@ struct ZoteroAPIClient: Sendable {
             let formatted = [first, last].filter { !$0.isEmpty }.joined(separator: " ")
             return formatted.isEmpty ? (name.isEmpty ? nil : name) : formatted
         }
+        let creatorEntries = (data["creators"] as? [[String: Any]] ?? []).compactMap { creator -> ZoteroCreator? in
+            guard let creatorType = creator["creatorType"] as? String else { return nil }
+            return ZoteroCreator(
+                creatorType: creatorType,
+                firstName: creator["firstName"] as? String ?? "",
+                lastName: creator["lastName"] as? String ?? "",
+                name: creator["name"] as? String ?? ""
+            )
+        }
+        let metadataFields = data.reduce(into: [String: String]()) { fields, entry in
+            guard let value = entry.value as? String,
+                  !["itemType", "key", "version", "dateAdded", "dateModified"].contains(entry.key)
+            else { return }
+            fields[entry.key] = value
+        }
         let dateText = data["dateModified"] as? String
         let dateAddedText = data["dateAdded"] as? String
         let title = (data["title"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "Untitled"
@@ -549,7 +793,9 @@ struct ZoteroAPIClient: Sendable {
             dateAdded: dateAddedText.flatMap(ISO8601DateFormatter().date(from:)),
             dateModified: dateText.flatMap(ISO8601DateFormatter().date(from:)),
             version: version,
-            isTrashed: (data["deleted"] as? Bool) ?? false
+            isTrashed: (data["deleted"] as? Bool) ?? false,
+            metadataFields: metadataFields,
+            creatorEntries: creatorEntries
         )
         let contentType = data["contentType"] as? String
         let attachment: ZoteroAttachment?
@@ -582,6 +828,7 @@ struct ZoteroAPIClient: Sendable {
         case http(Int)
         case libraryChangedDuringSync
         case invalidKey
+        case itemKeyCollision
         case requestFailed(stage: String, status: Int, message: String?)
         case itemCreation(stage: String, status: Int?, message: String)
 
@@ -597,6 +844,8 @@ struct ZoteroAPIClient: Sendable {
                 return "The Zotero library changed while it was syncing."
             case .invalidKey:
                 return "The Zotero item key is invalid."
+            case .itemKeyCollision:
+                return "A Zotero item with this local key already exists with different contents."
             case let .requestFailed(stage, status, message):
                 return "Zotero \(stage) creation failed (HTTP \(status))\(message.map { ": \($0)" } ?? ".")"
             case let .itemCreation(stage, status, message):

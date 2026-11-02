@@ -1227,6 +1227,257 @@ final class HybridPDFTests: XCTestCase {
         XCTAssertEqual(attachment["filename"] as? String, "Lecture Notes.pdf")
     }
 
+    func testZoteroItemTypeSchemaUsesTemplateAllowedFieldsAndCreatorRoles() async throws {
+        ZoteroCreationURLProtocol.configure { request, _ in
+            let path = request.url?.path ?? ""
+            if path == "/itemTypes" {
+                return (200, Data(#"[{"itemType":"journalArticle","localized":"Journal Article"},{"itemType":"note","localized":"Note"},{"itemType":"attachment","localized":"Attachment"}]"#.utf8))
+            }
+            if path == "/items/new" {
+                return (200, Data(#"{"itemType":"journalArticle","title":"","date":"","publicationTitle":"","creators":[{"creatorType":"author","firstName":"","lastName":""}],"tags":[],"collections":[],"relations":{}}"#.utf8))
+            }
+            if path == "/itemTypeFields" {
+                return (200, Data(#"[{"field":"title","localized":"Title"},{"field":"date","localized":"Date"},{"field":"publicationTitle","localized":"Publication Title"},{"field":"publisher","localized":"Publisher"}]"#.utf8))
+            }
+            if path == "/itemTypeCreatorTypes" {
+                return (200, Data(#"[{"creatorType":"author","localized":"Author"},{"creatorType":"editor","localized":"Editor"}]"#.utf8))
+            }
+            return (404, Data())
+        }
+        defer { ZoteroCreationURLProtocol.configure(nil) }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ZoteroCreationURLProtocol.self]
+        let client = ZoteroAPIClient(
+            apiKey: "write-key",
+            userID: "1234",
+            session: URLSession(configuration: configuration)
+        )
+        let types = try await client.fetchItemTypes()
+        let type = try XCTUnwrap(types.first)
+        let schema = try await client.fetchItemTypeSchema(type)
+
+        XCTAssertEqual(types.map(\.itemType), ["journalArticle"])
+        XCTAssertEqual(Set(schema.fields.map(\.field)), Set(["title", "date", "publicationTitle"]))
+        XCTAssertEqual(schema.creatorTypes.map(\.creatorType), ["author", "editor"])
+        XCTAssertFalse(schema.creatorUsesSingleName)
+    }
+
+    func testPDFItemCreationPreservesSelectedTypeFieldsAndCreatorRoles() async throws {
+        let recorder = ZoteroRequestRecorder()
+        ZoteroCreationURLProtocol.configure { request, _ in
+            var captured = request
+            captured.httpBody = try Self.requestBody(from: request)
+            recorder.append(captured)
+            let items = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(captured.httpBody)) as? [[String: Any]])
+            let successful = Dictionary(uniqueKeysWithValues: items.enumerated().compactMap { index, item in
+                (item["key"] as? String).map { (String(index), $0) }
+            })
+            return (200, try JSONSerialization.data(withJSONObject: ["successful": successful]))
+        }
+        defer { ZoteroCreationURLProtocol.configure(nil) }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ZoteroCreationURLProtocol.self]
+        let client = ZoteroAPIClient(
+            apiKey: "write-key",
+            userID: "1234",
+            session: URLSession(configuration: configuration)
+        )
+
+        let created = try await client.createItemWithPDFAttachment(
+            title: "A Book Chapter",
+            filename: "chapter.pdf",
+            collectionKeys: ["COLL2345"],
+            itemType: "bookSection",
+            metadataFields: ["date": "2024", "bookTitle": "Collected Works"],
+            creators: [ZoteroCreator(creatorType: "translator", firstName: "Ada", lastName: "Lovelace")],
+            parentItemKey: "PARENT24",
+            pdfAttachmentKey: "ATTACH24"
+        )
+
+        let request = try XCTUnwrap(recorder.requests.first)
+        let items = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(request.httpBody)) as? [[String: Any]])
+        let parent = try XCTUnwrap(items.first)
+        XCTAssertEqual(parent["key"] as? String, "PARENT24")
+        XCTAssertEqual(parent["itemType"] as? String, "bookSection")
+        XCTAssertEqual(parent["date"] as? String, "2024")
+        XCTAssertEqual(parent["bookTitle"] as? String, "Collected Works")
+        XCTAssertEqual(parent["collections"] as? [String], ["COLL2345"])
+        let creators = try XCTUnwrap(parent["creators"] as? [[String: String]])
+        XCTAssertEqual(creators.first?["creatorType"], "translator")
+        XCTAssertEqual(creators.first?["firstName"], "Ada")
+        XCTAssertEqual(created.parentItemKey, "PARENT24")
+        XCTAssertEqual(created.attachmentKey, "ATTACH24")
+        XCTAssertEqual(items.last?["parentItem"] as? String, "PARENT24")
+    }
+
+    func testAddingPDFToExistingItemCreatesOnlyAChildAttachment() async throws {
+        let recorder = ZoteroRequestRecorder()
+        ZoteroCreationURLProtocol.configure { request, _ in
+            var captured = request
+            captured.httpBody = try Self.requestBody(from: request)
+            recorder.append(captured)
+            let submitted = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(captured.httpBody)) as? [[String: Any]])
+            let key = try XCTUnwrap(submitted.first?["key"] as? String)
+            return (200, try JSONSerialization.data(withJSONObject: ["successful": ["0": key]]))
+        }
+        defer { ZoteroCreationURLProtocol.configure(nil) }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ZoteroCreationURLProtocol.self]
+        let client = ZoteroAPIClient(
+            apiKey: "write-key",
+            userID: "1234",
+            session: URLSession(configuration: configuration)
+        )
+
+        let created = try await client.createPDFAttachment(parentItemKey: "PARENT24", filename: "supplement.pdf")
+        let request = try XCTUnwrap(recorder.requests.first)
+        let submitted = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(request.httpBody)) as? [[String: Any]])
+        let attachment = try XCTUnwrap(submitted.first)
+
+        XCTAssertEqual(submitted.count, 1)
+        XCTAssertEqual(attachment["itemType"] as? String, "attachment")
+        XCTAssertEqual(attachment["linkMode"] as? String, "imported_file")
+        XCTAssertEqual(attachment["parentItem"] as? String, "PARENT24")
+        XCTAssertEqual(attachment["filename"] as? String, "supplement.pdf")
+        XCTAssertEqual(created.key, attachment["key"] as? String)
+    }
+
+    func testPartialItemCreationRetriesOnlyTheMissingAttachment() async throws {
+        let recorder = ZoteroRequestRecorder()
+        var attachmentExists = false
+        ZoteroCreationURLProtocol.configure { request, _ in
+            if request.httpMethod == "POST" {
+                var captured = request
+                captured.httpBody = try Self.requestBody(from: request)
+                recorder.append(captured)
+                let submitted = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(captured.httpBody)) as? [[String: Any]])
+                if submitted.count == 2 {
+                    let parentKey = try XCTUnwrap(submitted[0]["key"] as? String)
+                    return (200, try JSONSerialization.data(withJSONObject: [
+                        "successful": ["0": parentKey],
+                        "failed": ["1": ["code": 400, "message": "Temporary attachment validation failure"]],
+                    ]))
+                }
+                let attachmentKey = try XCTUnwrap(submitted.first?["key"] as? String)
+                attachmentExists = true
+                return (200, try JSONSerialization.data(withJSONObject: ["successful": ["0": attachmentKey]]))
+            }
+
+            recorder.append(request)
+            let key = request.url?.lastPathComponent ?? ""
+            let originalRequest = try XCTUnwrap(recorder.requests.first)
+            let originalItems = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: XCTUnwrap(originalRequest.httpBody)) as? [[String: Any]]
+            )
+            guard let item = originalItems.first(where: { $0["key"] as? String == key }) else {
+                return (404, Data())
+            }
+            if key == "ATTACH24" && !attachmentExists { return (404, Data()) }
+            var itemData = item
+            itemData.removeValue(forKey: "key")
+            itemData.removeValue(forKey: "version")
+            return (200, try JSONSerialization.data(withJSONObject: [
+                "key": key,
+                "version": 5,
+                "data": itemData,
+            ]))
+        }
+        defer { ZoteroCreationURLProtocol.configure(nil) }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ZoteroCreationURLProtocol.self]
+        let client = ZoteroAPIClient(
+            apiKey: "write-key",
+            userID: "1234",
+            session: URLSession(configuration: configuration)
+        )
+
+        let created = try await client.createItemWithPDFAttachment(
+            title: "Recovered Item",
+            filename: "source.pdf",
+            collectionKeys: [],
+            itemType: "journalArticle",
+            metadataFields: ["date": "2025"],
+            creators: [],
+            parentItemKey: "PARENT24",
+            pdfAttachmentKey: "ATTACH24"
+        )
+
+        let posts = recorder.requests.filter { $0.httpMethod == "POST" }
+        XCTAssertEqual(posts.count, 2)
+        let firstPost = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(posts.first?.httpBody)) as? [[String: Any]])
+        let retryPost = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(posts.last?.httpBody)) as? [[String: Any]])
+        XCTAssertEqual(firstPost.map { $0["key"] as? String }, ["PARENT24", "ATTACH24"])
+        XCTAssertEqual(retryPost.map { $0["key"] as? String }, ["ATTACH24"])
+        XCTAssertEqual(created.parentItemKey, "PARENT24")
+        XCTAssertEqual(created.attachmentKey, "ATTACH24")
+    }
+
+    func testOfflineDraftPromotionRetainsItemTypeMetadataAndCreatorRoles() throws {
+        let userID = "typed-draft-\(UUID().uuidString)"
+        let store = ZoteroCacheStore()
+        defer { _ = try? store.permanentlyDeleteItems(keys: ["PARENT24"], userID: userID) }
+        let temporaryParentKey = "temp-parent-\(UUID().uuidString)"
+        let temporaryAttachmentKey = "temp-attachment-\(UUID().uuidString)"
+        let filename = "chapter.pdf"
+        let creator = ZoteroCreator(creatorType: "translator", firstName: "Ada", lastName: "Lovelace")
+        let parent = ZoteroItem(
+            key: temporaryParentKey,
+            title: "A Book Chapter",
+            creators: [creator.displayName],
+            year: "2024",
+            parentItemKey: nil,
+            collectionKeys: ["COLL2345"],
+            itemType: "bookSection",
+            dateAdded: Date(),
+            dateModified: Date(),
+            version: 0,
+            isTrashed: false,
+            isPendingSync: true,
+            metadataFields: ["title": "A Book Chapter", "date": "2024", "bookTitle": "Collected Works"],
+            creatorEntries: [creator]
+        )
+        let attachment = ZoteroAttachment(
+            key: temporaryAttachmentKey,
+            parentItemKey: temporaryParentKey,
+            contentType: "application/pdf",
+            filename: filename,
+            localCachePath: nil,
+            syncStatus: .dirty,
+            version: 0,
+            md5: nil,
+            modificationTimeMilliseconds: nil,
+            isPendingSync: true
+        )
+        let sourcePDF = try makePDF(pageSize: CGSize(width: 240, height: 320), rotation: 0)
+        let hybrid = try JotHybridPDFBuilder.buildHybridPDF(jot: Jot(
+            drawing: Jot.makeEmpty().drawing,
+            width: Jot.defaultWidth,
+            pdfData: sourcePDF,
+            zoteroItemKey: temporaryAttachmentKey,
+            zoteroFileName: filename
+        ))
+        _ = try store.registerOfflineDraft(item: parent, attachment: attachment, hybridPDF: hybrid, userID: userID)
+        let created = CreatedZoteroDocumentKeys(
+            parentItemKey: "PARENT24",
+            attachmentKey: "ATTACH24",
+            libraryVersion: 1
+        )
+        try store.promoteOfflineDraft(
+            temporaryParentKey: temporaryParentKey,
+            temporaryAttachmentKey: temporaryAttachmentKey,
+            created: created,
+            version: 1,
+            userID: userID
+        )
+
+        let promoted = try XCTUnwrap(store.load(userID: userID).items[created.parentItemKey])
+        XCTAssertEqual(promoted.itemType, "bookSection")
+        XCTAssertEqual(promoted.metadataFields["bookTitle"], "Collected Works")
+        XCTAssertEqual(promoted.creatorEntries.first?.creatorType, "translator")
+        XCTAssertEqual(promoted.creators, ["Ada Lovelace"])
+    }
+
     func testZoteroTrashAndRestoreUseVersionedPartialUpdates() async throws {
         let recorder = ZoteroRequestRecorder()
         ZoteroCreationURLProtocol.configure { request, _ in
@@ -1553,6 +1804,7 @@ final class HybridPDFTests: XCTestCase {
 
     func testCreateNoteReportsAttachmentItemValidationFailure() async throws {
         ZoteroCreationURLProtocol.configure { request, _ in
+            if request.httpMethod == "GET" { return (404, Data()) }
             let payload = try Self.requestBody(from: request)
             let submitted = try XCTUnwrap(JSONSerialization.jsonObject(with: payload) as? [[String: Any]])
             let parentKey = try XCTUnwrap(submitted.first?["key"] as? String)

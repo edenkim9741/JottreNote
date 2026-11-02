@@ -111,15 +111,32 @@ actor ZoteroSyncEngine {
                         message: String(localized: "zotero.sync.status.creatingItems")
                     )
                     do {
-                        let author = draft.item.creators.first ?? ""
-                        let created = try await apiClient.createNoteDocument(
-                            title: draft.item.title,
-                            filename: draft.attachment.filename,
-                            collectionKeys: draft.item.collectionKeys,
-                            firstName: "",
-                            lastName: "",
-                            fullName: author
-                        )
+                        let created: CreatedZoteroDocumentKeys
+                        if draft.item.metadataFields.isEmpty {
+                            let author = draft.item.creators.first ?? ""
+                            created = try await apiClient.createNoteDocument(
+                                title: draft.item.title,
+                                filename: draft.attachment.filename,
+                                collectionKeys: draft.item.collectionKeys,
+                                firstName: "",
+                                lastName: "",
+                                fullName: author,
+                                date: draft.item.dateAdded ?? Date()
+                            )
+                        } else {
+                            created = try await apiClient.createItemWithPDFAttachment(
+                                title: draft.item.title,
+                                filename: draft.attachment.filename,
+                                collectionKeys: draft.item.collectionKeys,
+                                itemType: draft.item.itemType,
+                                metadataFields: draft.item.metadataFields,
+                                creators: draft.item.creatorEntries,
+                                parentItemKey: ZoteroSyncService.isValidKey(draft.item.key) ? draft.item.key : nil,
+                                pdfAttachmentKey: ZoteroSyncService.isValidKey(draft.attachment.key)
+                                    ? draft.attachment.key
+                                    : nil
+                            )
+                        }
                         try cacheStore.promoteOfflineDraft(
                             temporaryParentKey: draft.item.key,
                             temporaryAttachmentKey: draft.attachment.key,

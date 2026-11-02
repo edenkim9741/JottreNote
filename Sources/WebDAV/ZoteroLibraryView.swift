@@ -1,6 +1,8 @@
 import SwiftUI
 @preconcurrency import PencilKit
 import Network
+import PDFKit
+import UniformTypeIdentifiers
 
 enum ZoteroLibraryLocation: Hashable {
     case myLibrary
@@ -123,6 +125,7 @@ private final class ZoteroLibraryViewModel: ObservableObject {
     private let keychain = KeychainCredentialStore()
     private let networkMonitor = NWPathMonitor()
     private let networkQueue = DispatchQueue(label: "ZoteroLibraryNetworkMonitor")
+    private let schemaDefaults = UserDefaults.standard
     var onOpenJot: ((JotFile.Info) -> Void)?
 
     init(cacheStore: ZoteroCacheStore, engine: ZoteroSyncEngine, defaults: DefaultsService) {
@@ -499,6 +502,191 @@ private final class ZoteroLibraryViewModel: ObservableObject {
         }
     }
 
+    func itemTypes() async -> [ZoteroItemTypeDefinition] {
+        let locale = Locale.current.identifier.replacingOccurrences(of: "_", with: "-")
+        let cacheKey = "zotero.itemTypeCatalog.v1.\(locale)"
+        let dateKey = cacheKey + ".fetchedAt"
+        let cached = schemaDefaults.data(forKey: cacheKey)
+            .flatMap { try? JSONDecoder().decode([ZoteroItemTypeDefinition].self, from: $0) }
+        if let cached,
+           let fetchedAt = schemaDefaults.object(forKey: dateKey) as? Date,
+           Date().timeIntervalSince(fetchedAt) < 3_600 {
+            return cached
+        }
+        do {
+            let values = try await ZoteroAPIClient(apiKey: apiKey, userID: userID).fetchItemTypes()
+            if let data = try? JSONEncoder().encode(values) { schemaDefaults.set(data, forKey: cacheKey) }
+            schemaDefaults.set(Date(), forKey: dateKey)
+            return values
+        } catch {
+            return cached ?? []
+        }
+    }
+
+    func itemTypeSchema(for type: ZoteroItemTypeDefinition) async -> ZoteroItemTypeSchema? {
+        let locale = Locale.current.identifier.replacingOccurrences(of: "_", with: "-")
+        let cacheKey = "zotero.itemTypeSchema.v1.\(locale).\(type.itemType)"
+        let dateKey = cacheKey + ".fetchedAt"
+        let cached = schemaDefaults.data(forKey: cacheKey)
+            .flatMap { try? JSONDecoder().decode(ZoteroItemTypeSchema.self, from: $0) }
+        if let cached,
+           let fetchedAt = schemaDefaults.object(forKey: dateKey) as? Date,
+           Date().timeIntervalSince(fetchedAt) < 3_600 {
+            return cached
+        }
+        do {
+            let value = try await ZoteroAPIClient(apiKey: apiKey, userID: userID).fetchItemTypeSchema(type)
+            if let data = try? JSONEncoder().encode(value) { schemaDefaults.set(data, forKey: cacheKey) }
+            schemaDefaults.set(Date(), forKey: dateKey)
+            return value
+        } catch {
+            return cached
+        }
+    }
+
+    func createImportedPDF(
+        data sourcePDF: Data,
+        filename originalFilename: String,
+        schema: ZoteroItemTypeSchema,
+        metadata: [String: String],
+        creators: [ZoteroCreator]
+    ) async -> String? {
+        guard let pdf = PDFDocument(data: sourcePDF), pdf.pageCount > 0 else {
+            return String(localized: "zotero.import.invalidPDF")
+        }
+        let title = metadata["title"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !title.isEmpty else { return String(localized: "zotero.create.titleRequired") }
+        let now = Date()
+        let fileBase = URL(fileURLWithPath: originalFilename).deletingPathExtension().lastPathComponent
+        let filename = Self.safePDFFileName(from: fileBase.isEmpty ? title : fileBase)
+        let allowedFields = Set(schema.fields.map(\.field))
+        let validMetadata = metadata.filter { allowedFields.contains($0.key) }
+        guard creators.allSatisfy({ creator in
+            creator.displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || schema.creatorTypes.contains(where: { $0.creatorType == creator.creatorType })
+        }) else { return String(localized: "zotero.import.invalidCreatorRole") }
+        let validCreators = creators.filter {
+            !$0.displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        let temporaryParentKey = ZoteroAPIClient.generateItemKey()
+        let temporaryAttachmentKey = ZoteroAPIClient.generateItemKey()
+        guard temporaryParentKey != temporaryAttachmentKey else {
+            return String(localized: "zotero.create.failed")
+        }
+        let item = ZoteroItem(
+            key: temporaryParentKey,
+            title: title,
+            creators: validCreators.map(\.displayName),
+            year: validMetadata["date"].flatMap { $0.count >= 4 ? String($0.prefix(4)) : nil },
+            parentItemKey: nil,
+            collectionKeys: selectedCollectionKeys,
+            itemType: schema.type.itemType,
+            dateAdded: now,
+            dateModified: now,
+            version: snapshot.lastLibraryVersion,
+            isTrashed: false,
+            isPendingSync: true,
+            metadataFields: validMetadata,
+            creatorEntries: validCreators
+        )
+        let attachment = ZoteroAttachment(
+            key: temporaryAttachmentKey,
+            parentItemKey: temporaryParentKey,
+            contentType: "application/pdf",
+            filename: filename,
+            localCachePath: nil,
+            syncStatus: .dirty,
+            version: snapshot.lastLibraryVersion,
+            md5: nil,
+            modificationTimeMilliseconds: nil,
+            isPendingSync: true
+        )
+        do {
+            let jot = Jot(
+                drawing: Jot.makeEmpty().drawing,
+                width: Jot.defaultWidth,
+                pdfData: sourcePDF,
+                zoteroItemKey: temporaryAttachmentKey,
+                zoteroFileName: filename
+            )
+            let hybridPDF = try JotHybridPDFBuilder.buildHybridPDF(jot: jot)
+            _ = try cacheStore.registerOfflineDraft(
+                item: item,
+                attachment: attachment,
+                hybridPDF: hybridPDF,
+                userID: userID
+            )
+            snapshot = cacheStore.load(userID: userID)
+            selection = selectedCollectionKeys.first.map(ZoteroLibraryLocation.collection) ?? .myLibrary
+            NotificationCenter.default.post(name: .zoteroAttachmentCacheChanged, object: temporaryAttachmentKey)
+            guard !userID.isEmpty, !apiKey.isEmpty else {
+                return String(localized: "zotero.create.offlineDraft")
+            }
+            await synchronize()
+            return cacheStore.load(userID: userID).attachments[temporaryAttachmentKey]?.isPendingSync == true
+                ? String(localized: "zotero.create.offlineDraft")
+                : nil
+        } catch {
+            return "\(String(localized: "zotero.create.failed"))\n\(error.localizedDescription)"
+        }
+    }
+
+    func addPDFAttachment(data sourcePDF: Data, filename originalFilename: String, to parentItemKey: String) async -> String? {
+        guard Int(userID) != nil, !apiKey.isEmpty else {
+            return String(localized: "zotero.create.accountRequired")
+        }
+        guard let pdf = PDFDocument(data: sourcePDF), pdf.pageCount > 0,
+              let parent = snapshot.items[parentItemKey], parent.parentItemKey == nil,
+              !["attachment", "note", "annotation"].contains(parent.itemType) else {
+            return String(localized: "zotero.import.invalidPDF")
+        }
+        let filename = Self.safePDFFileName(from: URL(fileURLWithPath: originalFilename).lastPathComponent)
+        do {
+            let created = try await ZoteroAPIClient(apiKey: apiKey, userID: userID)
+                .createPDFAttachment(parentItemKey: parentItemKey, filename: filename)
+            let jot = Jot(
+                drawing: Jot.makeEmpty().drawing,
+                width: Jot.defaultWidth,
+                pdfData: sourcePDF,
+                zoteroItemKey: created.key,
+                zoteroFileName: filename
+            )
+            let hybridPDF = try JotHybridPDFBuilder.buildHybridPDF(jot: jot)
+            let attachment = ZoteroAttachment(
+                key: created.key,
+                parentItemKey: parentItemKey,
+                contentType: "application/pdf",
+                filename: filename,
+                localCachePath: nil,
+                syncStatus: .dirty,
+                version: created.libraryVersion,
+                md5: nil,
+                modificationTimeMilliseconds: nil
+            )
+            _ = try cacheStore.registerCreatedDocument(
+                item: parent,
+                attachment: attachment,
+                hybridPDF: hybridPDF,
+                libraryVersion: created.libraryVersion,
+                userID: userID
+            )
+            refreshCacheState()
+            let documentSync = ZoteroDocumentSyncService(defaultsService: defaults, cacheStore: cacheStore)
+            if let error = await documentSync.uploadCachedAttachment(key: created.key, fallbackModificationDate: nil) {
+                errorMessage = error
+                refreshCacheState()
+                return String(localized: "zotero.create.uploadFailed")
+            }
+            refreshCacheState()
+            NotificationCenter.default.post(name: .zoteroAttachmentCacheChanged, object: created.key)
+            return nil
+        } catch {
+            errorMessage = error.localizedDescription
+            refreshCacheState()
+            return error.localizedDescription
+        }
+    }
+
     private var selectedCollectionKeys: [String] {
         if case let .collection(key) = selection { return [key] }
         return []
@@ -738,6 +926,12 @@ struct ZoteroLibraryView: View {
     @ObservedObject private var syncProgress: ZoteroSyncProgress
     @State private var showingSettings = false
     @State private var showingNewDocument = false
+    @State private var showingPDFImporter = false
+    @State private var showingAttachmentImporter = false
+    @State private var showingPDFCreation = false
+    @State private var pendingAttachmentParentKey: String?
+    @State private var importedPDFData: Data?
+    @State private var importedPDFName: String?
     @State private var creationNotice: String?
     @State private var columnVisibility: NavigationSplitViewVisibility = .automatic
     @State private var expandedAttachmentGroups = Set<String>()
@@ -844,6 +1038,85 @@ struct ZoteroLibraryView: View {
                 return result
             }
         }
+        .sheet(isPresented: $showingPDFCreation, onDismiss: {
+            importedPDFData = nil
+            importedPDFName = nil
+        }) {
+            if let importedPDFData, let importedPDFName {
+                ZoteroPDFItemCreationSheet(
+                    filename: importedPDFName,
+                    loadTypes: { await model.itemTypes() },
+                    loadSchema: { await model.itemTypeSchema(for: $0) },
+                    onCreate: { schema, metadata, creators in
+                        let result = await model.createImportedPDF(
+                            data: importedPDFData,
+                            filename: importedPDFName,
+                            schema: schema,
+                            metadata: metadata,
+                            creators: creators
+                        )
+                        if result == String(localized: "zotero.create.offlineDraft") {
+                            creationNotice = result
+                            return nil
+                        }
+                        return result
+                    }
+                )
+            }
+        }
+        .fileImporter(isPresented: $showingPDFImporter, allowedContentTypes: [.pdf]) { result in
+            switch result {
+            case .success(let url):
+                do {
+                    let data = try ExternalFileImportService().readExternalFile(
+                        sourceURL: url,
+                        maximumFileSize: 128 * 1_024 * 1_024
+                    )
+                    guard let pdf = PDFDocument(data: data), pdf.pageCount > 0 else {
+                        creationNotice = String(localized: "zotero.import.invalidPDF")
+                        return
+                    }
+                    importedPDFData = data
+                    importedPDFName = url.lastPathComponent
+                    showingPDFCreation = true
+                } catch ExternalFileImportService.Failure.fileTooLarge {
+                    creationNotice = String(localized: "zotero.import.pdfTooLarge")
+                } catch {
+                    creationNotice = error.localizedDescription
+                }
+            case .failure(let error):
+                showImportErrorUnlessCancelled(error)
+            }
+        }
+        .fileImporter(isPresented: $showingAttachmentImporter, allowedContentTypes: [.pdf]) { result in
+            switch result {
+            case .success(let url):
+                guard let parentKey = pendingAttachmentParentKey else { return }
+                do {
+                    let data = try ExternalFileImportService().readExternalFile(
+                        sourceURL: url,
+                        maximumFileSize: 128 * 1_024 * 1_024
+                    )
+                    Task {
+                        if let message = await model.addPDFAttachment(
+                            data: data,
+                            filename: url.lastPathComponent,
+                            to: parentKey
+                        ) {
+                            creationNotice = message
+                        }
+                    }
+                } catch ExternalFileImportService.Failure.fileTooLarge {
+                    creationNotice = String(localized: "zotero.import.pdfTooLarge")
+                } catch {
+                    creationNotice = error.localizedDescription
+                }
+                pendingAttachmentParentKey = nil
+            case .failure(let error):
+                pendingAttachmentParentKey = nil
+                showImportErrorUnlessCancelled(error)
+            }
+        }
         .sheet(item: $editingItem) { item in
             ZoteroMetadataEditorSheet(item: item) { title, creators, date in
                 await model.updateMetadata(itemKey: item.key, title: title, creators: creators, date: date)
@@ -920,6 +1193,12 @@ struct ZoteroLibraryView: View {
         .buttonStyle(.plain)
     }
 
+    private func showImportErrorUnlessCancelled(_ error: Error) {
+        let cocoaError = error as NSError
+        guard cocoaError.domain != NSCocoaErrorDomain || cocoaError.code != NSUserCancelledError else { return }
+        creationNotice = error.localizedDescription
+    }
+
     private var attachmentList: some View {
         let groups = model.attachmentGroups(for: model.selection)
         return List {
@@ -935,7 +1214,18 @@ struct ZoteroLibraryView: View {
                     model.setSelectionMode(!model.isSelecting)
                 }
                 .buttonStyle(.borderless)
-                Button { showingNewDocument = true } label: {
+                Menu {
+                    Button {
+                        showingNewDocument = true
+                    } label: {
+                        Label(String(localized: "zotero.create.newDocument"), systemImage: "doc.badge.plus")
+                    }
+                    Button {
+                        showingPDFImporter = true
+                    } label: {
+                        Label(String(localized: "zotero.import.createItemFromPDF"), systemImage: "doc.viewfinder")
+                    }
+                } label: {
                     Image(systemName: "plus")
                 }
                 .buttonStyle(.borderless)
@@ -1019,7 +1309,6 @@ struct ZoteroLibraryView: View {
                                 documentContextMenu(itemKey: group.key)
                             }
                         }
-                    }
                 }
             }
         }
@@ -1167,6 +1456,15 @@ struct ZoteroLibraryView: View {
                     Label(String(localized: "zotero.document.deletePermanently"), systemImage: "trash")
                 }
             } else {
+                if item.parentItemKey == nil,
+                   !["attachment", "note", "annotation"].contains(item.itemType) {
+                    Button {
+                        pendingAttachmentParentKey = itemKey
+                        showingAttachmentImporter = true
+                    } label: {
+                        Label(String(localized: "zotero.import.addPDF"), systemImage: "doc.badge.plus")
+                    }
+                }
                 Button {
                     editingItem = item
                 } label: {
@@ -1330,6 +1628,261 @@ private struct ZoteroCreateDocumentSheet: View {
             }
         }
         .presentationDetents([.medium])
+    }
+}
+
+private struct ZoteroPDFItemCreationSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var types: [ZoteroItemTypeDefinition] = []
+    @State private var selectedTypeID = ""
+    @State private var schema: ZoteroItemTypeSchema?
+    @State private var metadata: [String: String]
+    @State private var creators: [CreatorDraft] = []
+    @State private var isLoading = true
+    @State private var isCreating = false
+    @State private var didConfirmItemType = false
+    @State private var errorMessage: String?
+
+    let filename: String
+    let loadTypes: @MainActor () async -> [ZoteroItemTypeDefinition]
+    let loadSchema: @MainActor (ZoteroItemTypeDefinition) async -> ZoteroItemTypeSchema?
+    let onCreate: @MainActor (ZoteroItemTypeSchema, [String: String], [ZoteroCreator]) async -> String?
+
+    init(
+        filename: String,
+        loadTypes: @escaping @MainActor () async -> [ZoteroItemTypeDefinition],
+        loadSchema: @escaping @MainActor (ZoteroItemTypeDefinition) async -> ZoteroItemTypeSchema?,
+        onCreate: @escaping @MainActor (ZoteroItemTypeSchema, [String: String], [ZoteroCreator]) async -> String?
+    ) {
+        self.filename = filename
+        self.loadTypes = loadTypes
+        self.loadSchema = loadSchema
+        self.onCreate = onCreate
+        let title = URL(fileURLWithPath: filename).deletingPathExtension().lastPathComponent
+        _metadata = State(initialValue: ["title": title])
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                if isLoading {
+                    ProgressView(String(localized: "zotero.import.loadingSchema"))
+                } else if types.isEmpty {
+                    ContentUnavailableView(
+                        String(localized: "zotero.import.schemaUnavailable"),
+                        systemImage: "wifi.exclamationmark",
+                        description: Text(String(localized: "zotero.import.schemaUnavailableDetail"))
+                    )
+                } else {
+                    Section(String(localized: "zotero.import.itemType")) {
+                        Picker(String(localized: "zotero.import.itemType"), selection: $selectedTypeID) {
+                            Text(String(localized: "zotero.import.selectItemType")).tag("")
+                            ForEach(types) { type in
+                                Text(type.localized).tag(type.itemType)
+                            }
+                        }
+                        .onChange(of: selectedTypeID) { _, typeID in
+                            Task { await selectType(typeID) }
+                        }
+                    }
+
+                    if didConfirmItemType, let schema {
+                        metadataSection(schema: schema)
+                        creatorSection(schema: schema)
+                    }
+                }
+
+                if let errorMessage {
+                    Text(errorMessage).foregroundStyle(.red)
+                }
+            }
+            .navigationTitle(String(localized: "zotero.import.createItemFromPDF"))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button(String(localized: "action.cancel")) { dismiss() }
+                        .disabled(isCreating)
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button {
+                        if didConfirmItemType {
+                            Task { await createItem() }
+                        } else {
+                            didConfirmItemType = true
+                        }
+                    } label: {
+                        if isCreating || isLoading { ProgressView() }
+                        else {
+                            Text(String(localized: didConfirmItemType
+                                ? "zotero.create.create"
+                                : "zotero.import.continue"))
+                        }
+                    }
+                    .disabled(
+                        isCreating || isLoading || schema == nil || selectedTypeID.isEmpty
+                            || (didConfirmItemType && (titleValue.isEmpty || !creatorsAreValid))
+                    )
+                }
+            }
+        }
+        .presentationDetents([.large])
+        .task { await loadSchemaCatalog() }
+    }
+
+    private var titleValue: String {
+        metadata["title"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    private var creatorsAreValid: Bool {
+        guard let schema else { return false }
+        return creators.allSatisfy { draft in
+            let hasName = !draft.displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            return !hasName || schema.creatorTypes.contains(where: { $0.creatorType == draft.creatorType })
+        }
+    }
+
+    private func metadataSection(schema: ZoteroItemTypeSchema) -> some View {
+        let supported = Set(schema.fields.map(\.field))
+        let hiddenFields = metadata.keys.filter { !supported.contains($0) }
+        return Group {
+            Section(String(localized: "zotero.import.metadata")) {
+                if supported.contains("title") {
+                    TextField(String(localized: "zotero.document.metadata.title"), text: textBinding(for: "title"))
+                        .textInputAutocapitalization(.sentences)
+                }
+                if supported.contains("date") {
+                    TextField(String(localized: "zotero.document.metadata.date"), text: textBinding(for: "date"))
+                        .keyboardType(.numbersAndPunctuation)
+                }
+                ForEach(schema.fields.filter { $0.field != "title" && $0.field != "date" }) { field in
+                    TextField(field.localized, text: textBinding(for: field.field))
+                }
+                if !hiddenFields.isEmpty {
+                    Text(String(localized: "zotero.import.fieldsNotSavedForType"))
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                }
+            }
+        }
+    }
+
+    private func creatorSection(schema: ZoteroItemTypeSchema) -> some View {
+        Section(String(localized: "zotero.import.creators")) {
+            ForEach($creators) { $draft in
+                VStack(alignment: .leading, spacing: 10) {
+                    Picker(String(localized: "zotero.import.creatorRole"), selection: $draft.creatorType) {
+                        ForEach(schema.creatorTypes) { type in
+                            Text(type.localized).tag(type.creatorType)
+                        }
+                        if !schema.creatorTypes.contains(where: { $0.creatorType == draft.creatorType }) {
+                            Text(String(localized: "zotero.import.unsupportedCreatorRole")).tag(draft.creatorType)
+                        }
+                    }
+                    Toggle(String(localized: "zotero.import.organizationCreator"), isOn: $draft.isOrganization)
+                    if draft.isOrganization {
+                        TextField(String(localized: "zotero.import.creatorName"), text: $draft.name)
+                    } else {
+                        TextField(String(localized: "zotero.import.creatorFirstName"), text: $draft.firstName)
+                        TextField(String(localized: "zotero.import.creatorLastName"), text: $draft.lastName)
+                    }
+                    Button(role: .destructive) {
+                        creators.removeAll { $0.id == draft.id }
+                    } label: {
+                        Label(String(localized: "zotero.import.removeCreator"), systemImage: "minus.circle")
+                    }
+                    .font(.footnote)
+                }
+                .padding(.vertical, 4)
+            }
+            if let firstCreatorType = schema.creatorTypes.first?.creatorType {
+                Button {
+                    creators.append(CreatorDraft(creatorType: firstCreatorType))
+                } label: {
+                    Label(String(localized: "zotero.import.addCreator"), systemImage: "plus.circle")
+                }
+            }
+            if !creators.isEmpty && !creatorsAreValid {
+                Text(String(localized: "zotero.import.invalidCreatorRole"))
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+            }
+        }
+    }
+
+    private func textBinding(for field: String) -> Binding<String> {
+        Binding(
+            get: { metadata[field] ?? "" },
+            set: { metadata[field] = $0 }
+        )
+    }
+
+    private func loadSchemaCatalog() async {
+        types = await loadTypes()
+        isLoading = false
+        guard !types.isEmpty else {
+            errorMessage = String(localized: "zotero.import.schemaUnavailableDetail")
+            return
+        }
+    }
+
+    private func selectType(_ typeID: String) async {
+        guard let type = types.first(where: { $0.itemType == typeID }) else {
+            schema = nil
+            return
+        }
+        isLoading = true
+        defer { isLoading = false }
+        guard let loaded = await loadSchema(type) else {
+            schema = nil
+            errorMessage = String(localized: "zotero.import.schemaUnavailableDetail")
+            return
+        }
+        schema = loaded
+        errorMessage = nil
+        if creators.isEmpty, let firstCreatorType = loaded.creatorTypes.first?.creatorType {
+            creators = [CreatorDraft(creatorType: firstCreatorType, isOrganization: loaded.creatorUsesSingleName)]
+        }
+    }
+
+    private func createItem() async {
+        guard let schema else { return }
+        isCreating = true
+        defer { isCreating = false }
+        let validFields = Set(schema.fields.map(\.field))
+        let payload = metadata.filter { validFields.contains($0.key) }
+        let creatorValues = creators.map(\.zoteroCreator)
+        if let message = await onCreate(schema, payload, creatorValues) {
+            errorMessage = message
+        } else {
+            dismiss()
+        }
+    }
+
+    private struct CreatorDraft: Identifiable {
+        let id = UUID()
+        var creatorType: String
+        var firstName = ""
+        var lastName = ""
+        var name = ""
+        var isOrganization = false
+
+        init(creatorType: String, isOrganization: Bool = false) {
+            self.creatorType = creatorType
+            self.isOrganization = isOrganization
+        }
+
+        var displayName: String {
+            isOrganization ? name : [firstName, lastName].filter { !$0.isEmpty }.joined(separator: " ")
+        }
+
+        var zoteroCreator: ZoteroCreator {
+            ZoteroCreator(
+                creatorType: creatorType,
+                firstName: isOrganization ? "" : firstName,
+                lastName: isOrganization ? "" : lastName,
+                name: isOrganization ? name : ""
+            )
+        }
     }
 }
 
