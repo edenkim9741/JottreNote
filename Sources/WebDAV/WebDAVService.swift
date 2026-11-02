@@ -51,12 +51,12 @@ struct WebDAVService: Sendable {
         return http.statusCode
     }
 
-    func download(remotePath: String) async throws -> Data {
+    func download(remotePath: String, diagnosticContext: ZoteroDownloadContext? = nil) async throws -> Data {
         var request = URLRequest(url: baseURL.appendingPathComponent(remotePath))
         request.timeoutInterval = 60
         request.httpMethod = "GET"
         addAuthHeader(to: &request)
-        let (data, response) = try await send(request)
+        let (data, response) = try await send(request, diagnosticContext: diagnosticContext)
         guard let http = response as? HTTPURLResponse else { throw Failure.badURL }
         guard (200...299).contains(http.statusCode) else { throw Failure.unexpectedResponse(http.statusCode) }
         return data
@@ -84,22 +84,63 @@ struct WebDAVService: Sendable {
         }
     }
 
-    private func send(_ request: URLRequest) async throws -> (Data, URLResponse) {
+    private func send(
+        _ request: URLRequest,
+        diagnosticContext: ZoteroDownloadContext? = nil
+    ) async throws -> (Data, URLResponse) {
         for attempt in 0..<3 {
+            diagnosticContext?.setAttempt(attempt + 1)
             do {
                 let result = try await session.data(for: request)
-                if let response = result.1 as? HTTPURLResponse,
-                   Self.isTransientStatus(response.statusCode), attempt < 2 {
-                    try await Task.sleep(for: .seconds(attempt + 1))
-                    continue
+                if let response = result.1 as? HTTPURLResponse {
+                    Self.recordHTTPResponse(response.statusCode, context: diagnosticContext, attempt: attempt + 1)
+                    if Self.isTransientStatus(response.statusCode), attempt < 2 {
+                        let delay = Self.retryAfter(response) ?? TimeInterval(1 << attempt)
+                        Self.recordRetry(context: diagnosticContext, attempt: attempt + 1, delay: delay, reason: "http_\(response.statusCode)")
+                        try await Task.sleep(for: .seconds(delay))
+                        continue
+                    }
                 }
                 return result
             } catch {
-                guard attempt < 2, Self.isTransientNetworkError(error) else { throw error }
-                try await Task.sleep(for: .seconds(attempt + 1))
+                guard attempt < 2, Self.isTransientNetworkError(error), !Task.isCancelled else { throw error }
+                let delay = TimeInterval(1 << attempt)
+                Self.recordRetry(context: diagnosticContext, attempt: attempt + 1, delay: delay, reason: "urlSession_\((error as? URLError)?.code.rawValue ?? 0)")
+                try await Task.sleep(for: .seconds(delay))
             }
         }
         throw Failure.badURL
+    }
+
+    private static func recordHTTPResponse(_ status: Int, context: ZoteroDownloadContext?, attempt: Int) {
+        guard let context else { return }
+        var details = context.eventDetails
+        details["stage"] = "webDAVHTTP"
+        details["attempt"] = attempt
+        details["httpStatus"] = status
+        JottreDiagnostics.shared.record("zotero.download.httpResponse", details: details)
+    }
+
+    private static func recordRetry(context: ZoteroDownloadContext?, attempt: Int, delay: TimeInterval, reason: String) {
+        guard let context else { return }
+        var details = context.eventDetails
+        details["stage"] = "webDAVRequest"
+        details["attempt"] = attempt
+        details["nextAttempt"] = attempt + 1
+        details["delaySeconds"] = delay
+        details["failureReason"] = reason
+        JottreDiagnostics.shared.record("zotero.download.retryScheduled", details: details)
+    }
+
+    private static func retryAfter(_ response: HTTPURLResponse) -> TimeInterval? {
+        guard let value = response.value(forHTTPHeaderField: "Retry-After") else { return nil }
+        if let seconds = TimeInterval(value), seconds >= 0 { return min(seconds, 60) }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss z"
+        guard let date = formatter.date(from: value) else { return nil }
+        return min(max(0, date.timeIntervalSinceNow), 60)
     }
 
     private static func isTransientStatus(_ status: Int) -> Bool {

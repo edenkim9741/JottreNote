@@ -1027,7 +1027,7 @@ final class HybridPDFTests: XCTestCase {
             apiClient: client,
             userID: userID,
             uploadAttachment: { _ in await counter.recordUpload(); return nil },
-            downloadAttachment: { _ in await counter.recordDownload(); return Data() }
+            downloadAttachment: { _, _ in await counter.recordDownload(); return Data() }
         )
         let counts = await counter.counts
         XCTAssertEqual(counts.uploads, 0)
@@ -2234,6 +2234,126 @@ final class HybridPDFTests: XCTestCase {
         }
     }
 
+    func testZoteroDownloadRejectsArchivesWithoutPDFInsteadOfSelectingFirstEntry() async throws {
+        let archive = try ZoteroZIPArchive.archive(files: [
+            ZoteroZIPArchive.Entry(path: "ABCD2345.pdf.jot", data: Data("not a PDF".utf8))
+        ])
+        ZoteroCreationURLProtocol.configure { _, _ in (200, archive) }
+        defer { ZoteroCreationURLProtocol.configure(nil) }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ZoteroCreationURLProtocol.self]
+        let service = ZoteroSyncService(
+            service: WebDAVService(
+                baseURL: URL(string: "https://webdav.test/")!,
+                username: "user",
+                password: "password",
+                session: URLSession(configuration: configuration)
+            ),
+            apiClient: ZoteroAPIClient(apiKey: "test", userID: "1234")
+        )
+
+        do {
+            _ = try await service.download(documentID: "ABCD2345")
+            XCTFail("A ZIP sidecar must not be treated as a PDF")
+        } catch let error as ZoteroSyncService.Failure {
+            guard case .pdfNotFound = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+    }
+
+    func testZoteroDownloadDoesNotRetryPermanentHTTP404() async throws {
+        ZoteroCreationURLProtocol.configure { _, _ in (404, Data()) }
+        defer { ZoteroCreationURLProtocol.configure(nil) }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ZoteroCreationURLProtocol.self]
+        let webDAV = WebDAVService(
+            baseURL: URL(string: "https://webdav.test/")!,
+            username: "user",
+            password: "password",
+            session: URLSession(configuration: configuration)
+        )
+
+        do {
+            _ = try await webDAV.download(
+                remotePath: "zotero/ABCD2345.zip",
+                diagnosticContext: ZoteroDownloadContext(source: .documentOpen)
+            )
+            XCTFail("HTTP 404 must be returned as a permanent download failure")
+        } catch let error as WebDAVService.Failure {
+            guard case .unexpectedResponse(404) = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+        XCTAssertEqual(ZoteroCreationURLProtocol.numberOfRequests, 1)
+    }
+
+    func testZoteroDownloadHonorsRetryAfterForHTTP429() async throws {
+        ZoteroCreationURLProtocol.configure(
+            { _, attempt in (attempt == 0 ? 429 : 200, Data("archive".utf8)) },
+            retryAfter: "0"
+        )
+        defer { ZoteroCreationURLProtocol.configure(nil) }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ZoteroCreationURLProtocol.self]
+        let webDAV = WebDAVService(
+            baseURL: URL(string: "https://webdav.test/")!,
+            username: "user",
+            password: "password",
+            session: URLSession(configuration: configuration)
+        )
+
+        let data = try await webDAV.download(
+            remotePath: "zotero/ABCD2345.zip",
+            diagnosticContext: ZoteroDownloadContext(source: .librarySync)
+        )
+        XCTAssertEqual(data, Data("archive".utf8))
+        XCTAssertEqual(ZoteroCreationURLProtocol.numberOfRequests, 2)
+    }
+
+    func testZoteroZipExtractionRejectsCorruptPayloadAndTruncatedDirectory() throws {
+        let archive = try ZoteroZIPArchive.archive(files: [
+            ZoteroZIPArchive.Entry(path: "ABCD2345.pdf", data: try makePDF(pageSize: CGSize(width: 240, height: 320), rotation: 0))
+        ])
+        let payloadOffset = 30 + "ABCD2345.pdf".utf8.count
+        var corruptPayload = archive
+        corruptPayload[payloadOffset] ^= 0x01
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        XCTAssertThrowsError(try ZoteroZIPArchive.extract(corruptPayload, to: directory))
+        XCTAssertThrowsError(try ZoteroZIPArchive.extract(Data(archive.dropLast(12)), to: directory))
+    }
+
+    func testFailedRemoteInstallPreservesDirtyLocalAttachmentAndPendingDownload() throws {
+        let userID = "dirty-download-\(UUID().uuidString)"
+        let key = "ABCD2345"
+        let localFile = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let localBytes = Data("local handwritten version".utf8)
+        try localBytes.write(to: localFile)
+        defer { try? FileManager.default.removeItem(at: localFile) }
+
+        let attachment = ZoteroAttachment(
+            key: key,
+            parentItemKey: "PARENT23",
+            contentType: "application/pdf",
+            filename: "Notes.pdf",
+            localCachePath: localFile.path,
+            syncStatus: .dirty,
+            version: 1,
+            md5: "local",
+            modificationTimeMilliseconds: nil
+        )
+        var snapshot = ZoteroCacheSnapshot.empty(userID: userID)
+        snapshot.attachments[key] = attachment
+        snapshot.pendingRemoteDownloads = [key]
+        let store = ZoteroCacheStore()
+        try store.save(snapshot)
+
+        XCTAssertThrowsError(try store.installRemoteVersion(key: key, data: Data("remote".utf8), userID: userID))
+        XCTAssertEqual(try Data(contentsOf: localFile), localBytes)
+        let afterFailure = store.load(userID: userID)
+        XCTAssertEqual(afterFailure.attachments[key]?.syncStatus, .dirty)
+        XCTAssertTrue(afterFailure.pendingRemoteDownloads.contains(key))
+    }
+
     private func makeTwoPagePDF() throws -> Data {
         let size = CGSize(width: 240, height: 320)
         let renderer = UIGraphicsPDFRenderer(bounds: CGRect(origin: .zero, size: size))
@@ -2358,12 +2478,18 @@ private func requestHasStartParameter(_ request: URLRequest) -> Bool {
 
 private final class ZoteroCreationURLProtocol: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) private static var responder: ((URLRequest, Int) throws -> (Int, Data))?
+    nonisolated(unsafe) private static var retryAfterHeader: String?
     private static let lock = NSLock()
     nonisolated(unsafe) private static var requestCount = 0
 
-    static func configure(_ handler: ((URLRequest, Int) throws -> (Int, Data))?) {
+    static var numberOfRequests: Int {
+        lock.withLock { requestCount }
+    }
+
+    static func configure(_ handler: ((URLRequest, Int) throws -> (Int, Data))?, retryAfter: String? = nil) {
         lock.withLock {
             responder = handler
+            retryAfterHeader = retryAfter
             requestCount = 0
         }
     }
@@ -2379,14 +2505,16 @@ private final class ZoteroCreationURLProtocol: URLProtocol, @unchecked Sendable 
                 guard let responder = Self.responder else { throw URLError(.badServerResponse) }
                 return try responder(request, index)
             }
+            var headers = [
+                "Content-Type": "application/json",
+                "Last-Modified-Version": "101"
+            ]
+            if let retryAfterHeader = Self.retryAfterHeader { headers["Retry-After"] = retryAfterHeader }
             let response = HTTPURLResponse(
                 url: request.url!,
                 statusCode: statusCode,
                 httpVersion: "HTTP/1.1",
-                headerFields: [
-                    "Content-Type": "application/json",
-                    "Last-Modified-Version": "101"
-                ]
+                headerFields: headers
             )!
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
             client?.urlProtocol(self, didLoad: data)

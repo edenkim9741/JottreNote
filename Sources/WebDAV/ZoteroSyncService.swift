@@ -3,6 +3,40 @@ import CryptoKit
 import Foundation
 import PDFKit
 
+enum ZoteroDownloadSource: String, Sendable {
+    case documentOpen
+    case librarySync
+}
+
+struct ZoteroDownloadContext: Sendable {
+    let requestID: String
+    let attachmentID: String
+    let source: ZoteroDownloadSource
+    private let attemptState = ZoteroDownloadAttemptState()
+
+    var attempt: Int { attemptState.value }
+    func setAttempt(_ attempt: Int) { attemptState.value = attempt }
+
+    init(source: ZoteroDownloadSource) {
+        requestID = UUID().uuidString
+        attachmentID = UUID().uuidString
+        self.source = source
+    }
+
+    var eventDetails: [String: Any] {
+        ["requestID": requestID, "attachmentID": attachmentID, "downloadPath": source.rawValue]
+    }
+}
+
+private final class ZoteroDownloadAttemptState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValue = 1
+    var value: Int {
+        get { lock.withLock { storedValue } }
+        set { lock.withLock { storedValue = newValue } }
+    }
+}
+
 struct ZoteroSyncService: Sendable {
 
     private let service: WebDAVService
@@ -23,23 +57,192 @@ struct ZoteroSyncService: Sendable {
         self.apiClient = apiClient
     }
 
-    func download(documentID: String) async throws -> Data {
+    func download(
+        documentID: String,
+        context: ZoteroDownloadContext? = nil
+    ) async throws -> Data {
         try await AsyncResourceAccessCoordinator.shared.withAccess(to: resourceKey(for: documentID)) {
-
-            guard Self.isValidKey(documentID) else { throw Failure.invalidKey }
-            let archiveData = try await service.download(remotePath: zipPath(for: documentID))
-            return try await Task.detached(priority: .utility) {
-                try TemporaryFileWorkspace.withDirectory(in: cacheDirectory) { extractedDirectory in
-                    let entries = try ZoteroZIPArchive.extract(archiveData, to: extractedDirectory)
-                    guard let pdfURL = entries.first(where: { $0.pathExtension.lowercased() == "pdf" }) ?? entries.first
-                    else {
-                        throw Failure.pdfNotFound
+            let context = context ?? ZoteroDownloadContext(source: .documentOpen)
+            let startedAt = Date()
+            var currentStage = "webDAVRequest"
+            var archiveByteCount: Int?
+            let webDAVStartedAt = Date()
+            Self.recordDownloadEvent("zotero.download.started", context: context, stage: "keyValidation", attempt: context.attempt)
+            do {
+                guard Self.isValidKey(documentID) else { throw Failure.invalidKey }
+                let archiveData = try await service.download(
+                    remotePath: zipPath(for: documentID),
+                    diagnosticContext: context
+                )
+                Self.recordDownloadEvent(
+                    "zotero.download.archiveReceived",
+                    context: context,
+                    stage: "archiveReceived",
+                    attempt: context.attempt,
+                    extra: [
+                        "zipBytes": archiveData.count,
+                        "downloadDurationMilliseconds": Date().timeIntervalSince(webDAVStartedAt) * 1_000
+                    ]
+                )
+                archiveByteCount = archiveData.count
+                currentStage = "zipExtraction"
+                let extractionStartedAt = Date()
+                Self.recordDownloadEvent("zotero.download.extractionStarted", context: context, stage: "zipExtraction", attempt: context.attempt)
+                let result = try await Task.detached(priority: .utility) {
+                    try TemporaryFileWorkspace.withDirectory(in: cacheDirectory) { extractedDirectory in
+                        let entries = try ZoteroZIPArchive.extract(archiveData, to: extractedDirectory)
+                        Self.recordDownloadEvent(
+                            "zotero.download.extractionCompleted",
+                            context: context,
+                            stage: "zipExtraction",
+                            attempt: context.attempt,
+                            extra: [
+                                "extractedFileCount": entries.count,
+                                "extractionDurationMilliseconds": Date().timeIntervalSince(extractionStartedAt) * 1_000
+                            ]
+                        )
+                        let pdfEntries = entries.filter { $0.pathExtension.lowercased() == "pdf" }
+                            .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+                        guard let pdfURL = pdfEntries.first else {
+                            Self.recordDownloadEvent(
+                                "zotero.download.validationFailed",
+                                context: context,
+                                stage: "pdfSelection",
+                                attempt: context.attempt,
+                                extra: ["failureReason": "pdfNotFound"]
+                            )
+                            throw Failure.pdfNotFound
+                        }
+                        let standardPDF = try Data(contentsOf: pdfURL)
+                        guard let pdf = PDFDocument(data: standardPDF), pdf.pageCount > 0 else {
+                            Self.recordDownloadEvent(
+                                "zotero.download.validationFailed",
+                                context: context,
+                                stage: "pdfValidation",
+                                attempt: context.attempt,
+                                extra: ["failureReason": "invalidPDF", "pdfBytes": standardPDF.count]
+                            )
+                            throw Failure.invalidPDF
+                        }
+                        let hybridData: Data
+                        do {
+                            hybridData = try Self.restoreHybridPDF(fromPDFAt: pdfURL, extractedFiles: entries)
+                        } catch {
+                            Self.recordDownloadEvent(
+                                "zotero.download.validationFailed",
+                                context: context,
+                                stage: "hybridPDFValidation",
+                                attempt: context.attempt,
+                                extra: ["errorType": String(reflecting: type(of: error))]
+                            )
+                            throw error
+                        }
+                        guard let restoredPDF = PDFDocument(data: HybridPDFManager.pdfData(in: hybridData)), restoredPDF.pageCount > 0 else {
+                            Self.recordDownloadEvent(
+                                "zotero.download.validationFailed",
+                                context: context,
+                                stage: "hybridPDFValidation",
+                                attempt: context.attempt,
+                                extra: ["failureReason": "invalidPDF"]
+                            )
+                            throw Failure.invalidPDF
+                        }
+                        return hybridData
                     }
-                    return try Self.restoreHybridPDF(fromPDFAt: pdfURL, extractedFiles: entries)
-                }
-            }.value
-
+                }.value
+                Self.recordDownloadEvent(
+                    "zotero.download.completed",
+                    context: context,
+                    stage: "complete",
+                    attempt: context.attempt,
+                    extra: ["durationMilliseconds": Date().timeIntervalSince(startedAt) * 1_000, "pdfValid": true]
+                )
+                return result
+            } catch {
+                if Self.isCancellation(error) { throw error }
+                Self.recordDownloadFailure(
+                    error,
+                    context: context,
+                    stageOverride: currentStage,
+                    startedAt: startedAt,
+                    byteCount: archiveByteCount
+                )
+                throw error
+            }
         }
+    }
+
+    private static func recordDownloadEvent(
+        _ name: String,
+        context: ZoteroDownloadContext,
+        stage: String,
+        attempt: Int,
+        extra: [String: Any] = [:]
+    ) {
+        var details = context.eventDetails
+        details["stage"] = stage
+        details["attempt"] = attempt
+        details.merge(extra) { _, new in new }
+        JottreDiagnostics.shared.record(name, details: details)
+    }
+
+    static func recordDownloadFailure(
+        _ error: Error,
+        context: ZoteroDownloadContext,
+        stageOverride: String? = nil,
+        startedAt: Date? = nil,
+        byteCount: Int? = nil
+    ) {
+        let nsError = error as NSError
+        var stage = stageOverride ?? "webDAVRequest"
+        var reason = "downloadFailed"
+        if case Failure.invalidKey = error { stage = "keyValidation"; reason = "invalidAttachmentKey" }
+        else if case Failure.pdfNotFound = error { stage = "pdfSelection"; reason = "pdfNotFound" }
+        else if case Failure.invalidPDF = error { stage = "pdfValidation"; reason = "invalidPDF" }
+        else if error is HybridPDFManager.Failure || (error as? Failure).map({ failure in
+            if case .invalidHybridPDF = failure { return true }
+            return false
+        }) == true {
+            stage = "hybridPDFValidation"
+            reason = "invalidHybridPDF"
+        }
+        else if let archiveFailure = error as? ZoteroZIPArchive.Failure {
+            stage = "zipExtraction"
+            if case .checksumMismatch = archiveFailure { reason = "archiveChecksumMismatch" }
+            else if case .unsupportedCompression = archiveFailure { reason = "unsupportedCompression" }
+            else if case .decompressionFailed = archiveFailure { reason = "decompressionFailed" }
+            else { reason = "invalidArchive" }
+        }
+        else if case WebDAVService.Failure.unexpectedResponse(let status) = error {
+            stage = "webDAVHTTP"
+            reason = status == 404 ? "httpNotFound" : status == 401 ? "authenticationFailed" : status == 403 ? "permissionDenied" : (500...599).contains(status) ? "serverError" : "httpFailure"
+        } else if let urlError = error as? URLError {
+            reason = "urlSession.\(urlError.code.rawValue)"
+        }
+        var underlyingErrors: [[String: Any]] = []
+        var underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError
+        for _ in 0..<3 {
+            guard let current = underlying else { break }
+            underlyingErrors.append(["errorDomain": current.domain, "errorCode": current.code])
+            underlying = current.userInfo[NSUnderlyingErrorKey] as? NSError
+        }
+        var details = context.eventDetails
+        details["stage"] = stage
+        details["attempt"] = context.attempt
+        details["errorType"] = String(reflecting: type(of: error))
+        details["errorDomain"] = nsError.domain
+        details["errorCode"] = nsError.code
+        if let urlError = error as? URLError { details["urlSessionErrorCode"] = urlError.code.rawValue }
+        details["failureReason"] = reason
+        if !underlyingErrors.isEmpty { details["underlyingErrors"] = underlyingErrors }
+        if let startedAt { details["durationMilliseconds"] = Date().timeIntervalSince(startedAt) * 1_000 }
+        if case WebDAVService.Failure.unexpectedResponse(let status) = error { details["httpStatus"] = status }
+        if let byteCount { details["zipBytes"] = byteCount }
+        JottreDiagnostics.shared.record("zotero.download.failed", details: details)
+    }
+
+    private static func isCancellation(_ error: Error) -> Bool {
+        Task.isCancelled || (error as? URLError)?.code == .cancelled || error is CancellationError
     }
 
     func deleteRemoteAttachment(documentID: String) async throws {
@@ -187,10 +390,12 @@ struct ZoteroSyncService: Sendable {
             // Existing WebDAV archives contain a hybrid PDF directly.
             return pdfData
         }
-        return try HybridPDFManager.embedJotPreservingSourcePDF(
+        let hybrid = try HybridPDFManager.embedJotPreservingSourcePDF(
             pdfData: pdfData,
             jotData: Data(contentsOf: sidecarURL)
         )
+        _ = try HybridPDFManager.load(data: hybrid)
+        return hybrid
     }
 
     private func zipPath(for key: String) -> String { rootPath.isEmpty ? "\(key).zip" : "\(rootPath)/\(key).zip" }
@@ -218,6 +423,7 @@ struct ZoteroSyncService: Sendable {
         case pdfNotFound
         case invalidKey
         case invalidPDF
+        case invalidHybridPDF
     }
 }
 
@@ -294,10 +500,32 @@ enum ZoteroZIPArchive {
     }
 
     static func extract(_ archive: Data, to directory: URL) throws -> [URL] {
+        guard archive.count >= 22 else { throw Failure.invalidArchive }
+        let minimumEndOffset = max(0, archive.count - 65_557)
+        var endOffset = archive.count - 22
+        while endOffset >= minimumEndOffset, readUInt32(archive, at: endOffset) != 0x0605_4b50 {
+            endOffset -= 1
+        }
+        guard endOffset >= minimumEndOffset else { throw Failure.invalidArchive }
+        let diskNumber = readUInt16(archive, at: endOffset + 4)
+        let centralDiskNumber = readUInt16(archive, at: endOffset + 6)
+        let entriesOnDisk = Int(readUInt16(archive, at: endOffset + 8))
+        let expectedEntryCount = Int(readUInt16(archive, at: endOffset + 10))
+        let centralSize = Int(readUInt32(archive, at: endOffset + 12))
+        let centralOffset = Int(readUInt32(archive, at: endOffset + 16))
+        let commentLength = Int(readUInt16(archive, at: endOffset + 20))
+        guard diskNumber == 0, centralDiskNumber == 0,
+            entriesOnDisk == expectedEntryCount,
+            endOffset + 22 + commentLength == archive.count,
+            centralOffset + centralSize == endOffset
+        else { throw Failure.invalidArchive }
+
         var cursor = 0
         var urls: [URL] = []
+        var localEntryCount = 0
         while cursor + 30 <= archive.count {
             guard readUInt32(archive, at: cursor) == 0x0403_4b50 else { break }
+            localEntryCount += 1
             let flags = readUInt16(archive, at: cursor + 6)
             let method = readUInt16(archive, at: cursor + 8)
             let compressedSize = Int(readUInt32(archive, at: cursor + 18))
@@ -331,6 +559,10 @@ enum ZoteroZIPArchive {
             else {
                 throw Failure.invalidArchive
             }
+            let expectedCRC = readUInt32(archive, at: cursor + 14)
+            guard data.count == Int(readUInt32(archive, at: cursor + 22)), crc32(data) == expectedCRC else {
+                throw Failure.checksumMismatch
+            }
             let outputURL = directory.appendingPathComponent(normalizedName)
             try FileManager.default.createDirectory(
                 at: outputURL.deletingLastPathComponent(),
@@ -340,7 +572,9 @@ enum ZoteroZIPArchive {
             urls.append(outputURL)
             cursor = dataEnd
         }
-        guard !urls.isEmpty else { throw Failure.invalidArchive }
+        guard !urls.isEmpty, cursor == centralOffset, localEntryCount == expectedEntryCount,
+            readUInt32(archive, at: cursor) == 0x0201_4b50
+        else { throw Failure.invalidArchive }
         return urls
     }
 
@@ -348,6 +582,7 @@ enum ZoteroZIPArchive {
         case invalidArchive
         case unsupportedCompression
         case decompressionFailed
+        case checksumMismatch
     }
 
     private static func inflate(_ data: Data, expectedSize: Int) throws -> Data {

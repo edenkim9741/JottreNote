@@ -54,7 +54,7 @@ actor ZoteroSyncEngine {
         apiClient: ZoteroAPIClient,
         userID: String,
         uploadAttachment: (@Sendable (String) async -> String?)? = nil,
-        downloadAttachment: (@Sendable (String) async throws -> Data)? = nil
+        downloadAttachment: (@Sendable (String, ZoteroDownloadContext) async throws -> Data)? = nil
     ) async throws -> ZoteroCacheSnapshot {
         await progress?.begin()
         do {
@@ -90,10 +90,31 @@ actor ZoteroSyncEngine {
                     for (index, key) in keys.enumerated() {
                         let progressValue = 0.35 + 0.2 * Double(index) / Double(max(1, keys.count))
                         await progress?.update(progressValue, message: String(localized: "zotero.sync.status.downloading"))
+                        let context = ZoteroDownloadContext(source: .librarySync)
+                        var receivedDownload = false
+                        var downloadedBytes = 0
                         do {
-                            let data = try await downloadWithBackoff(key: key, operation: downloadAttachment)
-                            try cacheStore.installRemoteVersion(key: key, data: data, userID: userID)
+                            let data = try await downloadAttachment(key, context)
+                            receivedDownload = true
+                            downloadedBytes = data.count
+                            if try cacheStore.installRemoteVersion(key: key, data: data, userID: userID) {
+                                var details = context.eventDetails
+                                details["stage"] = "localCache"
+                                details["attempt"] = context.attempt
+                                details["cacheSaved"] = true
+                                details["byteCount"] = data.count
+                                JottreDiagnostics.shared.record("zotero.download.cacheSaved", details: details)
+                            }
                         } catch {
+                            if isCancellation(error) { throw CancellationError() }
+                            if receivedDownload {
+                                ZoteroSyncService.recordDownloadFailure(
+                                    error,
+                                    context: context,
+                                    stageOverride: "localCacheInstall",
+                                    byteCount: downloadedBytes
+                                )
+                            }
                             try? cacheStore.recordPendingSyncError(
                                 key: key,
                                 message: error.localizedDescription,
@@ -231,20 +252,8 @@ actor ZoteroSyncEngine {
         return lastMessage ?? "Upload retry limit reached for attachment \(key)."
     }
 
-    private func downloadWithBackoff(
-        key: String,
-        operation: @Sendable (String) async throws -> Data
-    ) async throws -> Data {
-        var lastError: (any Error)?
-        for attempt in 0..<3 {
-            do { return try await operation(key) }
-            catch {
-                lastError = error
-                guard attempt < 2, !Task.isCancelled else { throw error }
-                try await Task.sleep(for: .seconds(1 << attempt))
-            }
-        }
-        throw lastError ?? ZoteroAPIClient.Failure.libraryChangedDuringSync
+    private func isCancellation(_ error: Error) -> Bool {
+        Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled
     }
 
     enum Failure: Error { case libraryContinuouslyChanging }

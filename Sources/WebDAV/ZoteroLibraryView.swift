@@ -176,8 +176,8 @@ private final class ZoteroLibraryViewModel: ObservableObject {
                 uploadAttachment: { key in
                     await documentSync.uploadCachedAttachment(key: key, fallbackModificationDate: nil)
                 },
-                downloadAttachment: { key in
-                    try await syncService.download(documentID: key)
+                downloadAttachment: { key, context in
+                    try await syncService.download(documentID: key, context: context)
                 }
             )
             snapshot = synchronizedSnapshot
@@ -845,6 +845,9 @@ private final class ZoteroLibraryViewModel: ObservableObject {
         let sessionID = jotSessionID(for: attachment.key)
         await ZoteroEditingSessionGate.shared.beginEditing(key: attachment.key, sessionID: sessionID)
         let currentAttachment = cacheStore.load(userID: userID).attachments[attachment.key] ?? attachment
+        var downloadContext: ZoteroDownloadContext?
+        var sourceDataReady = false
+        var failureStage = "localCacheRead"
         do {
             let sourceData: Data
             let loadedFromLocalCache: Bool
@@ -860,18 +863,31 @@ private final class ZoteroLibraryViewModel: ObservableObject {
                 } else if currentAttachment.syncStatus == .dirty {
                     throw ZoteroCacheStore.Failure.invalidLocalAttachmentFile
                 } else {
-                    sourceData = try await makeSyncService().download(documentID: attachment.key)
+                    let context = ZoteroDownloadContext(source: .documentOpen)
+                    downloadContext = context
+                    sourceData = try await makeSyncService().download(documentID: attachment.key, context: context)
                     loadedFromLocalCache = false
                 }
             } else {
-                sourceData = try await makeSyncService().download(documentID: attachment.key)
+                let context = ZoteroDownloadContext(source: .documentOpen)
+                downloadContext = context
+                sourceData = try await makeSyncService().download(documentID: attachment.key, context: context)
                 loadedFromLocalCache = false
             }
+            sourceDataReady = true
 
+            failureStage = "hybridPDFValidation"
             let fileURL = try localJotURL(for: attachment.key)
+            let hasEmbeddedJot = HybridPDFManager.embeddedJotData(in: sourceData) != nil
             let unpacked = try? HybridPDFManager.load(data: sourceData)
+            if hasEmbeddedJot, case nil = unpacked {
+                throw ZoteroSyncService.Failure.invalidHybridPDF
+            }
             print("[ZoteroLoad] Unpacking hybrid PDF from local cache... Strokes restored: \(unpacked.flatMap { try? PKDrawing(data: $0.jot.drawing).strokes.count } ?? 0)")
             let sourcePDF = unpacked?.pdfData ?? HybridPDFManager.pdfData(in: sourceData)
+            guard let validatedPDF = PDFDocument(data: sourcePDF), validatedPDF.pageCount > 0 else {
+                throw ZoteroSyncService.Failure.invalidPDF
+            }
             let title = title(for: currentAttachment)
             let jot = Jot(
                 drawing: unpacked?.jot.drawing ?? Jot.makeEmpty().drawing,
@@ -885,9 +901,11 @@ private final class ZoteroLibraryViewModel: ObservableObject {
                 zoteroFileName: currentAttachment.filename
             )
             let fileInfo = JotFile.Info(url: fileURL, name: title, modificationDate: nil)
+            failureStage = "localJotSave"
             try JotFileService(fileService: LocalFileService(fileManager: .default))
                 .write(jotFile: JotFile(info: fileInfo, jot: jot))
             if !loadedFromLocalCache {
+                failureStage = "localCacheSave"
                 try savePDFCache(data: sourceData, key: currentAttachment.key)
                 snapshot = try cacheStore.markDownloaded(
                     key: currentAttachment.key,
@@ -895,6 +913,14 @@ private final class ZoteroLibraryViewModel: ObservableObject {
                     md5: ZoteroSyncService.md5Hex(sourceData),
                     userID: userID
                 )
+                if let downloadContext {
+                    var details = downloadContext.eventDetails
+                    details["stage"] = "localCache"
+                    details["attempt"] = downloadContext.attempt
+                    details["cacheSaved"] = true
+                    details["byteCount"] = sourceData.count
+                    JottreDiagnostics.shared.record("zotero.download.cacheSaved", details: details)
+                }
             } else if currentAttachment.syncStatus != .dirty,
                       let cachePath = currentAttachment.localCachePath {
                 snapshot = try cacheStore.markDownloaded(
@@ -910,8 +936,18 @@ private final class ZoteroLibraryViewModel: ObservableObject {
                 await endEditingSession(sessionID: sessionID, requestSynchronization: true)
             }
         } catch {
-            await endEditingSession(sessionID: sessionID, requestSynchronization: true)
-            errorMessage = String(localized: "zotero.error.openPDF")
+            let wasCancelled = (error as? URLError)?.code == .cancelled || error is CancellationError || Task.isCancelled
+            if sourceDataReady, let downloadContext, !wasCancelled {
+                ZoteroSyncService.recordDownloadFailure(
+                    error,
+                    context: downloadContext,
+                    stageOverride: failureStage
+                )
+            }
+            await endEditingSession(sessionID: sessionID, requestSynchronization: !wasCancelled)
+            if !wasCancelled {
+                errorMessage = String(localized: "zotero.error.openPDF")
+            }
         }
     }
 

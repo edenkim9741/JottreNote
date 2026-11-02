@@ -1071,11 +1071,13 @@ final class ZoteroCacheStore: @unchecked Sendable {
         }
     }
 
-    func installRemoteVersion(key: String, data: Data, userID: String) throws {
+    @discardableResult
+    func installRemoteVersion(key: String, data: Data, userID: String) throws -> Bool {
         try withCacheAccess {
             var snapshot = loadUnlocked(userID: userID)
             guard var attachment = snapshot.attachments[key] else { throw Failure.attachmentNotFound }
-            guard !attachment.isConflict && !attachment.isLocalOnly else { return }
+            guard !attachment.isConflict && !attachment.isLocalOnly else { return false }
+            guard attachment.syncStatus != .dirty else { throw Failure.remoteDownloadWouldOverwriteDirtyAttachment }
             let url = defaultPDFCacheURL(for: key)
             guard Self.isSupportedAttachmentData(data) else {
                 throw Failure.invalidLocalAttachmentFile
@@ -1092,6 +1094,7 @@ final class ZoteroCacheStore: @unchecked Sendable {
             snapshot.attachments[key] = attachment
             snapshot.pendingRemoteDownloads.removeAll { $0 == key }
             try saveUnlocked(snapshot)
+            return true
         }
     }
 
@@ -1412,6 +1415,6 @@ final class ZoteroCacheStore: @unchecked Sendable {
     enum Failure: Error {
         case cacheAdvancedDuringSync, attachmentNotFound, dirtyAttachmentCannotBeOffloaded
         case invalidPendingDraft, pendingDraftNotFound, itemNotFound, conflictNotFound
-        case invalidLocalAttachmentFile
+        case invalidLocalAttachmentFile, remoteDownloadWouldOverwriteDirtyAttachment
     }
 }
