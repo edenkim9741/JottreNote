@@ -1269,24 +1269,31 @@ struct ZoteroLibraryView: View {
                 .accessibilityAddTraits(.isHeader)
 
             ForEach(groups) { group in
-                if group.attachments.count == 1, let attachment = group.attachments.first {
-                    attachmentRow(
-                        attachment,
-                        title: model.title(for: attachment),
-                        subtitle: model.subtitle(for: attachment),
-                        selectionKey: attachmentSelectionKey(attachment, groupKey: group.key)
-                    )
-                } else {
-                    DisclosureGroup(isExpanded: expandedBinding(for: group.key)) {
-                        ForEach(group.attachments) { attachment in
-                            attachmentRow(
-                                attachment,
-                                title: attachment.filename,
-                                subtitle: "",
-                                selectionKey: attachmentSelectionKey(attachment, groupKey: group.key)
-                            )
+                DisclosureGroup(isExpanded: expandedBinding(for: group.key)) {
+                    ForEach(group.attachments) { attachment in
+                        attachmentRow(
+                            attachment,
+                            title: attachment.filename,
+                            subtitle: "",
+                            selectionKey: attachmentSelectionKey(attachment, groupKey: group.key)
+                        )
+                    }
+                    if !model.isSelecting,
+                       model.selection != .trash,
+                       let groupItem = model.snapshot.items[group.key],
+                       groupItem.parentItemKey == nil,
+                       !["attachment", "note", "annotation"].contains(groupItem.itemType),
+                       !groupItem.isTrashed {
+                        Button {
+                            pendingAttachmentParentKey = group.key
+                            showingAttachmentImporter = true
+                        } label: {
+                            Label(String(localized: "zotero.import.addPDF"), systemImage: "plus")
+                                .font(.subheadline.weight(.medium))
                         }
-                    } label: {
+                        .buttonStyle(.borderless)
+                    }
+                } label: {
                         HStack(spacing: 10) {
                             if model.isSelecting { selectionIndicator(for: group.key) }
                             VStack(alignment: .leading, spacing: 4) {
