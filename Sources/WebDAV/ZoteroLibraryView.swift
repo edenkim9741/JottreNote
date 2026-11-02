@@ -116,6 +116,7 @@ private final class ZoteroLibraryViewModel: ObservableObject {
     var isSortReversed: Bool { sorting.isReversed }
     @Published private(set) var isSelecting = false
     @Published private(set) var selectedItemKeys = Set<String>()
+    private var synchronizationRequestedWhileSyncing = false
 
     private(set) var userID: String
     private var apiKey: String
@@ -147,9 +148,20 @@ private final class ZoteroLibraryViewModel: ObservableObject {
     deinit { networkMonitor.cancel() }
 
     func synchronize() async {
-        guard !userID.isEmpty, !apiKey.isEmpty, !isSyncing else { return }
+        guard !userID.isEmpty, !apiKey.isEmpty else { return }
+        guard !isSyncing else {
+            synchronizationRequestedWhileSyncing = true
+            print("[ZoteroSync] Coalesced a synchronization request while a sync is already running.")
+            return
+        }
         isSyncing = true
-        defer { isSyncing = false }
+        defer {
+            isSyncing = false
+            if synchronizationRequestedWhileSyncing {
+                synchronizationRequestedWhileSyncing = false
+                Task { @MainActor [weak self] in await self?.synchronize() }
+            }
+        }
         let syncGate = ZoteroEditingSessionGate.shared
         guard await syncGate.beginSynchronization() else {
             refreshCacheState()

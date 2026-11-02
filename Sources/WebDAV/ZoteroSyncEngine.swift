@@ -167,14 +167,7 @@ actor ZoteroSyncEngine {
                             version: created.libraryVersion,
                             userID: userID
                         )
-                        if let uploadAttachment,
-                           let error = await uploadWithBackoff(key: created.attachmentKey, operation: uploadAttachment) {
-                            try? cacheStore.recordPendingSyncError(
-                                key: created.attachmentKey,
-                                message: error,
-                                userID: userID
-                            )
-                        }
+                        print("[ZoteroSync] Registered new Zotero item and PDF attachment \(created.attachmentKey).")
                     } catch {
                         try? cacheStore.recordPendingSyncError(
                             key: draft.attachment.key,
@@ -192,6 +185,7 @@ actor ZoteroSyncEngine {
                         }
                         .map(\.key)
                         .sorted()
+                    print("[ZoteroSync] Initial and edited PDF upload queue contains \(dirtyKeys.count) attachment(s).")
                     for (index, key) in dirtyKeys.enumerated() {
                         let value = 0.8 + 0.18 * Double(index) / Double(max(1, dirtyKeys.count))
                         await progress?.update(value, message: String(localized: "zotero.sync.status.uploading"))

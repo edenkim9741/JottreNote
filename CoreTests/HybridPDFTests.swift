@@ -1416,9 +1416,9 @@ final class HybridPDFTests: XCTestCase {
     func testOfflineDraftPromotionRetainsItemTypeMetadataAndCreatorRoles() throws {
         let userID = "typed-draft-\(UUID().uuidString)"
         let store = ZoteroCacheStore()
-        defer { _ = try? store.permanentlyDeleteItems(keys: ["PARENT24"], userID: userID) }
-        let temporaryParentKey = "temp-parent-\(UUID().uuidString)"
-        let temporaryAttachmentKey = "temp-attachment-\(UUID().uuidString)"
+        defer { _ = try? store.permanentlyDeleteItems(keys: ["PARENT28"], userID: userID) }
+        let temporaryParentKey = "PARENT28"
+        let temporaryAttachmentKey = "ATTACH28"
         let filename = "chapter.pdf"
         let creator = ZoteroCreator(creatorType: "translator", firstName: "Ada", lastName: "Lovelace")
         let parent = ZoteroItem(
@@ -1459,8 +1459,8 @@ final class HybridPDFTests: XCTestCase {
         ))
         _ = try store.registerOfflineDraft(item: parent, attachment: attachment, hybridPDF: hybrid, userID: userID)
         let created = CreatedZoteroDocumentKeys(
-            parentItemKey: "PARENT24",
-            attachmentKey: "ATTACH24",
+            parentItemKey: temporaryParentKey,
+            attachmentKey: temporaryAttachmentKey,
             libraryVersion: 1
         )
         try store.promoteOfflineDraft(

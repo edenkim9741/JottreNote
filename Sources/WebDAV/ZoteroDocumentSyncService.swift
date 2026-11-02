@@ -54,8 +54,14 @@ struct ZoteroDocumentSyncService: Sendable {
     ) async -> String? {
         let key = canonicalKey
         let attachment = cacheStore.load(userID: userID).attachments[canonicalKey]
-        if attachment?.isLocalOnly == true || attachment?.isConflict == true { return nil }
-        if attachment?.isPendingSync == true { return nil }
+        if attachment?.isLocalOnly == true || attachment?.isConflict == true {
+            print("[ZoteroUpload] Skipped \(key): local-only or conflict attachment.")
+            return nil
+        }
+        if attachment?.isPendingSync == true {
+            print("[ZoteroUpload] Deferred \(key): attachment metadata is not registered remotely yet.")
+            return nil
+        }
         guard attachment?.syncStatus == .dirty else { return nil }
         guard let path = attachment?.localCachePath,
             FileManager.default.fileExists(atPath: path),
@@ -91,6 +97,7 @@ struct ZoteroDocumentSyncService: Sendable {
                 )
             )
             _ = try cacheStore.markSynced(key: canonicalKey, data: pdf, userID: userID)
+            print("[ZoteroUpload] Completed remote upload for \(canonicalKey).")
             NotificationCenter.default.post(name: .zoteroAttachmentCacheChanged, object: canonicalKey)
             return nil
         } catch {
