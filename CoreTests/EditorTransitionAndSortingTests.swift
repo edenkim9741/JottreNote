@@ -124,6 +124,39 @@ final class EditorTransitionAndSortingTests: XCTestCase {
         XCTAssertTrue(doubleTapRecognizers(in: pdf).allSatisfy { $0 === installed || !$0.isEnabled })
     }
 
+    func testSeparateToolUndoGroupsKeepScribbleUndoIndependentAndRedoable() {
+        let undoManager = UndoManager()
+        undoManager.groupsByEvent = false
+        var strokes: [String] = []
+
+        func registerTransition(from old: [String], to new: [String]) {
+            undoManager.beginUndoGrouping()
+            undoManager.registerUndo(withTarget: self) { _ in
+                strokes = old
+                undoManager.registerUndo(withTarget: self) { _ in strokes = new }
+            }
+            undoManager.endUndoGrouping()
+            strokes = new
+        }
+
+        registerTransition(from: [], to: ["A"])
+        registerTransition(from: ["A"], to: ["A", "S"])
+        registerTransition(from: ["A", "S"], to: [])
+
+        undoManager.undo()
+        XCTAssertEqual(strokes, ["A", "S"], "Undoing erasure restores prior ink and Scribble")
+        undoManager.undo()
+        XCTAssertEqual(strokes, ["A"], "Undoing the Scribble gesture must preserve prior ink")
+        undoManager.undo()
+        XCTAssertTrue(strokes.isEmpty, "The next Undo may then remove the prior ink")
+        undoManager.redo()
+        XCTAssertEqual(strokes, ["A"], "Redo restores prior ink first")
+        undoManager.redo()
+        XCTAssertEqual(strokes, ["A", "S"], "The next Redo restores the Scribble stroke")
+        undoManager.redo()
+        XCTAssertTrue(strokes.isEmpty, "Redo reapplies Scribble erasure last")
+    }
+
     func testDoubleTapFitTargetIsSelectedFromCurrentScale() {
         let portrait = JotCanvasZoomCoordinator.PageFitScales(shortSide: 1.4, longSide: 0.8)
 

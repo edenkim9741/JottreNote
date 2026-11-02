@@ -104,6 +104,7 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
     private var applicationBackgroundTaskGeneration: UUID?
     private var isEditingEnabled = false
     private var toolUndoManager: UndoManager?
+    private var toolUndoGroupManager: UndoManager?
 
     #if !targetEnvironment(macCatalyst)
     private var didSelectInitialPenTool = false
@@ -1440,6 +1441,14 @@ extension EditJotViewController: PKCanvasViewDelegate {
             }
             #endif
             toolUndoManager = canvasView.undoManager
+            // PencilKit registers drawing changes on this manager. Keep one
+            // tool gesture in its own group so a fast following stroke cannot
+            // be coalesced with the preceding stroke by the event-based group.
+            endToolUndoGroup()
+            if let undoManager = canvasView.undoManager {
+                undoManager.beginUndoGrouping()
+                toolUndoGroupManager = undoManager
+            }
             return
         }
     }
@@ -1448,9 +1457,16 @@ extension EditJotViewController: PKCanvasViewDelegate {
         if let canvas = canvasView as? JotCanvasView,
             pageIndexByCanvas[ObjectIdentifier(canvas)] != nil
         {
+            endToolUndoGroup()
             toolUndoManager = nil
             return
         }
+    }
+
+    private func endToolUndoGroup() {
+        guard let undoManager = toolUndoGroupManager else { return }
+        toolUndoGroupManager = nil
+        undoManager.endUndoGrouping()
     }
 
     private func flushPendingDrawingChange() {
