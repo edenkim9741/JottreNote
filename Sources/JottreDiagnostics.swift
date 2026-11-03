@@ -23,6 +23,7 @@ final class JottreDiagnostics: NSObject, MXMetricManagerSubscriber, @unchecked S
     private var lastInkChangeAt: Date?
     private var sampleTimer: DispatchSourceTimer?
     private var didStart = false
+    private var latestCanvasMemoryContext: [String: Any] = [:]
 
     private var directoryURL: URL? {
         fileManager.urls(for: .documentDirectory, in: .userDomainMask).first?
@@ -176,19 +177,35 @@ final class JottreDiagnostics: NSObject, MXMetricManagerSubscriber, @unchecked S
         record("pdf.save.\(stage)", details: details)
     }
 
-    func sampleMemoryNow(for event: String) {
+    func updateCanvasMemoryContext(_ details: [String: Any]) {
+        let safeDetails = Details(value: details)
+        queue.async { [weak self] in
+            guard let self, didStart else { return }
+            latestCanvasMemoryContext.merge(safeDetails.value) { _, new in new }
+        }
+    }
+
+    func sampleMemoryNow(for event: String, details: [String: Any] = [:]) {
+        let safeDetails = Details(value: details)
         queue.async { [weak self] in
             guard let self, didStart else { return }
             guard let footprint = Self.currentFootprintBytes() else {
-                appendEvent(event, details: ["footprintBytes": NSNull()])
+                var failedDetails = latestCanvasMemoryContext
+                failedDetails.merge(safeDetails.value) { _, new in new }
+                failedDetails["footprintBytes"] = NSNull()
+                appendEvent(event, details: failedDetails)
                 return
             }
             session["lastFootprintBytes"] = footprint
             session["highestFootprintBytes"] = max(session["highestFootprintBytes"] as? UInt64 ?? 0, footprint)
-            var sample: [String: Any] = ["timestamp": Self.timestamp(), "event": event, "footprintBytes": footprint]
+            var sample = latestCanvasMemoryContext
+            sample.merge(safeDetails.value) { _, new in new }
+            sample["timestamp"] = Self.timestamp()
+            sample["event"] = event
+            sample["footprintBytes"] = footprint
             if let documentID = session["documentID"] { sample["documentID"] = documentID }
             appendJSONLine(sample, to: "memory-\(sessionID).jsonl")
-            appendEvent(event, details: ["footprintBytes": footprint])
+            appendEvent(event, details: sample)
         }
     }
 
@@ -209,7 +226,11 @@ final class JottreDiagnostics: NSObject, MXMetricManagerSubscriber, @unchecked S
             guard let self, didStart else { return }
             let count = (session["memoryWarningCount"] as? Int ?? 0) + 1
             session["memoryWarningCount"] = count
-            appendEvent("memory.warning", details: ["count": count, "footprintBytes": Self.currentFootprintBytes() as Any? ?? NSNull()])
+            var details = latestCanvasMemoryContext
+            details["count"] = count
+            details["footprintBytes"] = Self.currentFootprintBytes() as Any? ?? NSNull()
+            appendEvent("memory.warning", details: details)
+            appendEvent("canvas.memoryWarning", details: details)
         }
     }
 
@@ -409,6 +430,12 @@ final class JottreDiagnostics: NSObject, MXMetricManagerSubscriber, @unchecked S
         guard result == KERN_SUCCESS else { return nil }
         return info.phys_footprint
     }
+
+#if DEBUG
+    static func currentFootprintBytesForTesting() -> UInt64? {
+        currentFootprintBytes()
+    }
+#endif
 
     private static func anonymizedIdentifier(_ value: String) -> String {
         String(SHA256Digest.hex(of: Data(value.utf8)).prefix(16))

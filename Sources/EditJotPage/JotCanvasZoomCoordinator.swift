@@ -22,6 +22,8 @@ final class JotCanvasZoomCoordinator: NSObject, UIGestureRecognizerDelegate {
     private let nativeDoubleTapStates = NSMapTable<UITapGestureRecognizer, NSNumber>.weakToStrongObjects()
     private weak var doubleTapHost: PDFView?
     private(set) var doubleTapRecognizer: UITapGestureRecognizer?
+    private var lastZoomScaleBucket: Int?
+    private var isPinchZoomInProgress = false
 
     private static let minimumPinchMaximumScale: CGFloat = 16
     private static let pinchMaximumScalePerFit: CGFloat = 4
@@ -95,7 +97,10 @@ final class JotCanvasZoomCoordinator: NSObject, UIGestureRecognizerDelegate {
 
     func scaleChanged() {
         guard !pinches.allObjects.contains(where: { $0.state == .began || $0.state == .changed }) else { return }
-        if let doubleTapHost { updateScaleRange(in: doubleTapHost) }
+        if let doubleTapHost {
+            updateScaleRange(in: doubleTapHost)
+            recordZoomChangeIfNeeded(in: doubleTapHost)
+        }
         schedule(delay: .milliseconds(80))
     }
 
@@ -190,12 +195,25 @@ final class JotCanvasZoomCoordinator: NSObject, UIGestureRecognizerDelegate {
     }
 
     @objc private func pinchChanged(_ pinch: UIPinchGestureRecognizer) {
+        guard let pdfView = doubleTapHost else { return }
         switch pinch.state {
         case .began, .changed:
             settleTask?.cancel()
+            if pinch.state == .began {
+                isPinchZoomInProgress = true
+                lastZoomScaleBucket = Self.zoomScaleBucket(
+                    scaleFactor: pdfView.scaleFactor,
+                    fitScaleFactor: pdfView.scaleFactorForSizeToFit
+                )
+                recordZoom("started", in: pdfView)
+            } else {
+                recordZoomChangeIfNeeded(in: pdfView)
+            }
         case .ended:
+            finishPinchZoom(in: pdfView)
             schedule(delay: .zero)
         case .cancelled, .failed:
+            finishPinchZoom(in: pdfView)
             schedule(delay: .zero)
         default: break
         }
@@ -241,6 +259,11 @@ final class JotCanvasZoomCoordinator: NSObject, UIGestureRecognizerDelegate {
         pdfView.minScaleFactor = scaleRange.minimum
         pdfView.maxScaleFactor = scaleRange.maximum
         settleTask?.cancel()
+        lastZoomScaleBucket = Self.zoomScaleBucket(
+            scaleFactor: pdfView.scaleFactor,
+            fitScaleFactor: pdfView.scaleFactorForSizeToFit
+        )
+        recordZoom("started", in: pdfView)
         UIView.animate(withDuration: 0.25, delay: 0, options: [.beginFromCurrentState, .curveEaseInOut]) {
             pdfView.autoScales = false
             pdfView.scaleFactor = target
@@ -264,8 +287,55 @@ final class JotCanvasZoomCoordinator: NSObject, UIGestureRecognizerDelegate {
                     scrollView: scrollView
                 )
             }
+            self?.recordZoom("completed", in: pdfView, sampleMemory: true)
+            self?.lastZoomScaleBucket = nil
             self?.schedule(delay: .milliseconds(40))
         }
+    }
+
+    private func recordZoomChangeIfNeeded(in pdfView: PDFView) {
+        let bucket = Self.zoomScaleBucket(
+            scaleFactor: pdfView.scaleFactor,
+            fitScaleFactor: pdfView.scaleFactorForSizeToFit
+        )
+        guard bucket != lastZoomScaleBucket else { return }
+        lastZoomScaleBucket = bucket
+        recordZoom("changed", in: pdfView, sampleMemory: true)
+    }
+
+    private func finishPinchZoom(in pdfView: PDFView) {
+        guard isPinchZoomInProgress else { return }
+        recordZoom("completed", in: pdfView, sampleMemory: true)
+        isPinchZoomInProgress = false
+        lastZoomScaleBucket = nil
+    }
+
+    private func recordZoom(_ event: String, in pdfView: PDFView, sampleMemory: Bool = false) {
+        guard let page = pdfView.currentPage,
+              let document = pdfView.document else { return }
+        let cropBox = page.bounds(for: .cropBox)
+        let displayedPageSize = PDFAnnotationConverter.displaySize(for: cropBox, rotation: page.rotation)
+        let viewport = displayViewport(in: pdfView)?.size ?? pdfView.bounds.size
+        let details: [String: Any] = [
+            "pageIndex": document.index(for: page),
+            "pdfScaleFactor": pdfView.scaleFactor,
+            "fitScaleFactor": pdfView.scaleFactorForSizeToFit,
+            "relativeZoom": pdfView.scaleFactor / max(pdfView.scaleFactorForSizeToFit, 0.01),
+            "pageDimensions": [displayedPageSize.width, displayedPageSize.height],
+            "cropBox": [cropBox.minX, cropBox.minY, cropBox.width, cropBox.height],
+            "pageRotation": page.rotation,
+            "viewport": [viewport.width, viewport.height]
+        ]
+        JottreDiagnostics.shared.updateCanvasMemoryContext(details)
+        JottreDiagnostics.shared.record("zoom.\(event)", details: details)
+        if sampleMemory {
+            JottreDiagnostics.shared.sampleMemoryNow(for: "canvas.memorySample", details: details)
+        }
+    }
+
+    private static func zoomScaleBucket(scaleFactor: CGFloat, fitScaleFactor: CGFloat) -> Int {
+        let relativeZoom = scaleFactor / max(fitScaleFactor, 0.01)
+        return Int(floor(log2(max(relativeZoom, 0.01))))
     }
 
     private func alignPageAfterZoom(

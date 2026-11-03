@@ -371,6 +371,79 @@ final class EditorInteractionUITests: XCTestCase {
         XCTAssertGreaterThan(try XCTUnwrap(after["scaleFactor"] as? Double), before * 1.1)
     }
 
+    func testMemoryFootprintAcrossHighZoomWithThreePageFourHundredSixteenStrokeFixture() async throws {
+        let app = launch(tool: "zoom-memory")
+        let page = app.staticTexts["editor.page.0"]
+        XCTAssertTrue(page.waitForExistence(timeout: 15))
+        let zoomButton = app.buttons["editor.test.zoomFactor"]
+        XCTAssertTrue(zoomButton.waitForExistence(timeout: 5))
+
+        var state = try info(page)
+        XCTAssertEqual(state["pdfPageCount"] as? Int, 3)
+        XCTAssertEqual((state["committedStrokeSeeds"] as? [UInt32])?.count, 416)
+        let baselineBytes = try XCTUnwrap(state["physicalFootprintBytes"] as? UInt64)
+        print("[ZoomMemory] baseline footprint=\(baselineBytes) bytes (\(Double(baselineBytes) / 1_048_576) MiB) canvases=\(state["activeCanvasCount"] ?? "?") overlays=\(state["activeOverlayCount"] ?? "?")")
+
+        let factors = [1.0, 2, 4, 8, 16, 32, 64]
+        for factor in factors {
+            var reachedTarget = false
+            for attempt in 0..<5 where !reachedTarget {
+                zoomButton.tap()
+                state = try info(page)
+                for _ in 0..<20 {
+                    let ratio = try XCTUnwrap(state["scaleFactor"] as? Double)
+                        / (try XCTUnwrap(state["fitScaleFactor"] as? Double))
+                    if abs(ratio - factor) < max(0.05, factor * 0.01) {
+                        reachedTarget = true
+                        break
+                    }
+                    try await Task.sleep(for: .milliseconds(100))
+                    state = try info(page)
+                }
+                if !reachedTarget, attempt < 4 { try await Task.sleep(for: .milliseconds(200)) }
+            }
+            state = try info(page)
+            let ratio = try XCTUnwrap(state["scaleFactor"] as? Double)
+                / (try XCTUnwrap(state["fitScaleFactor"] as? Double))
+            XCTAssertEqual(ratio, factor, accuracy: max(0.05, factor * 0.01))
+            try await Task.sleep(for: .seconds(1))
+            state = try info(page)
+            let footprint = try XCTUnwrap(state["physicalFootprintBytes"] as? UInt64)
+            let contentSize = try XCTUnwrap(state["contentSize"] as? [Double])
+            let canvasBounds = try XCTUnwrap(state["canvasBounds"] as? [Double])
+            print("[ZoomMemory] zoom=\(factor)x footprint=\(footprint) bytes (\(Double(footprint) / 1_048_576) MiB) canvasZoom=\(state["canvasZoom"] ?? "?") contentSize=\(contentSize) canvasBounds=\(canvasBounds) canvases=\(state["activeCanvasCount"] ?? "?") overlays=\(state["activeOverlayCount"] ?? "?")")
+
+            if factor == 64 {
+                let rectValues = try XCTUnwrap(state["rect"] as? [Double])
+                let rect = CGRect(x: rectValues[0], y: rectValues[1], width: rectValues[2], height: rectValues[3])
+                let visibleRect = rect.intersection(app.frame)
+                let start = app.coordinate(withNormalizedOffset: .zero)
+                    .withOffset(CGVector(dx: visibleRect.midX - 40, dy: visibleRect.midY))
+                let end = app.coordinate(withNormalizedOffset: .zero)
+                    .withOffset(CGVector(dx: visibleRect.midX + 40, dy: visibleRect.midY))
+                let localStrokeCount = try XCTUnwrap(state["strokes"] as? Int)
+                start.press(forDuration: 0.01, thenDragTo: end)
+                state = try await waitForDrawing(page, count: localStrokeCount + 1)
+                try await Task.sleep(for: .seconds(5))
+                state = try info(page)
+                let postInkBytes = try XCTUnwrap(state["physicalFootprintBytes"] as? UInt64)
+                print("[ZoomMemory] after 64x ink + 5s footprint=\(postInkBytes) bytes (\(Double(postInkBytes) / 1_048_576) MiB) strokes=\(state["strokes"] ?? "?")")
+                for sample in 1...11 {
+                    try await Task.sleep(for: .seconds(5))
+                    state = try info(page)
+                    let sampleBytes = try XCTUnwrap(state["physicalFootprintBytes"] as? UInt64)
+                    print("[ZoomMemory] 64x ink hold=\((sample + 1) * 5)s footprint=\(sampleBytes) bytes (\(Double(sampleBytes) / 1_048_576) MiB)")
+                }
+            }
+        }
+
+        zoomButton.tap() // 64x -> 1x
+        try await Task.sleep(for: .seconds(2))
+        state = try info(page)
+        let reducedBytes = try XCTUnwrap(state["physicalFootprintBytes"] as? UInt64)
+        print("[ZoomMemory] after zoom-out footprint=\(reducedBytes) bytes (\(Double(reducedBytes) / 1_048_576) MiB)")
+    }
+
     func testSimulatorTouchInkStaysRegisteredFromOneToSixtyFourTimesZoom() async throws {
         let app = launch(tool: "scribble-undo")
         let page = app.staticTexts["editor.page.0"]

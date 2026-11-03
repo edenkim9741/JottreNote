@@ -244,6 +244,9 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
                     model: self?.viewModel.currentDrawing ?? PKDrawing()
                 )
             },
+            activeCanvasCountsProvider: { [weak self] in
+                (canvases: self?.pageCanvases.count ?? 0, overlays: self?.pageOverlays.count ?? 0)
+            },
             onProgrammaticMiddleRemoval: { [weak self, weak canvas] in
                 guard let self, let canvas else { return }
                 removeMiddleStrokeForFixture(canvas, whileDetached: false, suppressDelegate: false)

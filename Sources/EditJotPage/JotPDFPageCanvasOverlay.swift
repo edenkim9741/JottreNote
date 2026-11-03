@@ -1,4 +1,5 @@
 @preconcurrency import PencilKit
+import PDFKit
 import UIKit
 
 enum JotPDFPageRestorationPolicy {
@@ -29,7 +30,11 @@ final class JotPDFPageCanvasOverlay: UIView {
     private let viewportHost = UIView()
     private(set) var drawingSize: CGSize
     private(set) var displayScale: CGFloat = 1
+    private(set) var diagnosticsPageIndex: Int?
+    private(set) var diagnosticsPageRotation = 0
+    private(set) var diagnosticsCropBox = CGRect.zero
     private var appliedGeometry: JotCanvasRenderGeometry?
+    private var lastMemorySampleZoomBucket: Int?
 #if DEBUG
     static var geometryExperimentMode: JotCanvasGeometryExperimentMode = .normal
     private var appliedExperimentMode: JotCanvasGeometryExperimentMode = .normal
@@ -81,6 +86,16 @@ final class JotPDFPageCanvasOverlay: UIView {
         guard size.width > 0, size.height > 0, drawingWidth > 0 else { return }
         drawingSize = CGSize(width: drawingWidth, height: drawingWidth * size.height / size.width)
         updateCanvasGeometry()
+    }
+
+    func setDiagnosticsPage(_ page: PDFPage, index: Int) {
+        let pageChanged = diagnosticsPageIndex != index
+            || diagnosticsPageRotation != page.rotation
+            || diagnosticsCropBox != page.bounds(for: .cropBox)
+        diagnosticsPageIndex = index
+        diagnosticsPageRotation = page.rotation
+        diagnosticsCropBox = page.bounds(for: .cropBox)
+        if pageChanged { lastMemorySampleZoomBucket = nil }
     }
 
     func configure(displayScale: CGFloat) {
@@ -202,6 +217,12 @@ final class JotPDFPageCanvasOverlay: UIView {
             canvas.setZoomScale(nativeZoom, animated: false)
         }
         if resetsContentOffset, canvas.contentOffset != .zero { canvas.contentOffset = .zero }
+        recordGeometryMilestoneIfNeeded(
+            requestedZoom: requestedZoom,
+            nativeZoom: nativeZoom,
+            renderScale: renderScale,
+            viewportTransform: pageToViewport
+        )
         #if DEBUG
         if isNewGeometry {
             let details: [String: Any] = [
@@ -226,6 +247,41 @@ final class JotPDFPageCanvasOverlay: UIView {
         // pinch recognizer. Disable it after all native zoom configuration so
         // PDFView remains the only owner of the user's document pinch gesture.
         disableCanvasPinchGestures(in: canvas)
+    }
+
+    private func recordGeometryMilestoneIfNeeded(
+        requestedZoom: CGFloat,
+        nativeZoom: CGFloat,
+        renderScale: CGFloat,
+        viewportTransform: CGAffineTransform
+    ) {
+        let bucket = Int(floor(log2(max(displayScale, 0.01))))
+        guard bucket != lastMemorySampleZoomBucket else { return }
+        lastMemorySampleZoomBucket = bucket
+        let details: [String: Any] = [
+            "pageIndex": diagnosticsPageIndex as Any? ?? NSNull(),
+            "pageRotation": diagnosticsPageRotation,
+            "cropBox": [diagnosticsCropBox.minX, diagnosticsCropBox.minY,
+                        diagnosticsCropBox.width, diagnosticsCropBox.height],
+            "pageDimensions": [bounds.width, bounds.height],
+            "pdfScaleFactor": pdfViewScaleFactor,
+            "measuredDisplayScale": displayScale,
+            "screenScale": window?.screen.nativeScale ?? traitCollection.displayScale,
+            "requestedCanvasZoom": requestedZoom,
+            "canvasZoomScale": canvas.zoomScale,
+            "nativeZoomMaximum": canvas.maximumZoomScale,
+            "renderScale": renderScale,
+            "canvasContentScaleFactor": canvas.contentScaleFactor,
+            "contentSize": [canvas.contentSize.width, canvas.contentSize.height],
+            "canvasBounds": [canvas.bounds.width, canvas.bounds.height],
+            "contentOffset": [canvas.contentOffset.x, canvas.contentOffset.y],
+            "viewportTransform": [viewportTransform.a, viewportTransform.d],
+            "strokeCount": canvas.drawing.strokes.count,
+            "zoomBucket": bucket
+        ]
+        JottreDiagnostics.shared.updateCanvasMemoryContext(details)
+        JottreDiagnostics.shared.record("canvas.geometryUpdated", details: details)
+        JottreDiagnostics.shared.sampleMemoryNow(for: "canvas.memorySample", details: details)
     }
 
     private func disableCanvasPinchGestures(in view: UIView) {
