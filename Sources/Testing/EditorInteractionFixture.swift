@@ -19,6 +19,7 @@ enum EditorInteractionFixture {
     private(set) static var undoTrace: [String] = []
     private(set) static var fixtureUndoActionCount = 0
     private(set) static var fixtureRedoActionCount = 0
+    private(set) static var customNoDrawingUndoCount = 0
     private(set) static var lastFixtureUndoState = "none"
 
     static func didRecognizeScribble() {
@@ -39,7 +40,21 @@ enum EditorInteractionFixture {
         if undoTrace.count > 120 { undoTrace.removeFirst(undoTrace.count - 120) }
     }
 
-    static func publish(canvas: PKCanvasView, index: Int, pdfView: PDFView, host: UIView) {
+    static func recordCustomNoDrawingUndo() {
+        guard tool == "scribble-undo" else { return }
+        customNoDrawingUndoCount += 1
+    }
+
+    static func publish(
+        canvas: PKCanvasView,
+        index: Int,
+        pdfView: PDFView,
+        host: UIView,
+        drawingStateProvider: (() -> (committed: PKDrawing, model: PKDrawing))? = nil,
+        onProgrammaticMiddleRemoval: (() -> Void)? = nil,
+        onDetachedProgrammaticMiddleRemoval: (() -> Void)? = nil,
+        onCanvasOnlyMiddleRemoval: (() -> Void)? = nil
+    ) {
         guard tool != nil else { return }
         if tool == "scribble-undo" {
             installUndoButton(in: host, identifier: "editor.test.undo", title: "Undo") { [weak canvas] in
@@ -57,6 +72,36 @@ enum EditorInteractionFixture {
                 print("[InkUndo UIFixture] Redo canvas=\(ObjectIdentifier(canvas)) manager=\(ObjectIdentifier(manager)) group=\(manager.groupingLevel) groupsByEvent=\(manager.groupsByEvent) canUndo=\(manager.canUndo) canRedo=\(manager.canRedo) isUndoing=\(manager.isUndoing) isRedoing=\(manager.isRedoing) seeds=\(canvas.drawing.strokes.map(\.randomSeed))")
                 manager.redo()
                 print("[InkUndo UIFixture] Redo completed seeds=\(canvas.drawing.strokes.map(\.randomSeed)) canUndo=\(manager.canUndo) canRedo=\(manager.canRedo)")
+            }
+            if let onProgrammaticMiddleRemoval {
+                installUndoButton(in: host, identifier: "editor.test.removeMiddle", title: "Remove B") {
+                    onProgrammaticMiddleRemoval()
+                }
+            }
+            if let onDetachedProgrammaticMiddleRemoval {
+                installUndoButton(in: host, identifier: "editor.test.removeMiddleDetached", title: "Remove B detached") {
+                    onDetachedProgrammaticMiddleRemoval()
+                }
+            }
+            if let onCanvasOnlyMiddleRemoval {
+                installUndoButton(in: host, identifier: "editor.test.removeMiddleCanvasOnly", title: "Remove B Canvas Only") {
+                    onCanvasOnlyMiddleRemoval()
+                }
+            }
+            installUndoButton(in: host, identifier: "editor.test.registerNoopUndo", title: "Register No-op Undo") { [weak canvas] in
+                guard let canvas, let manager = canvas.undoManager else { return }
+                for index in 0..<3 {
+                    manager.beginUndoGrouping()
+                    manager.registerUndo(withTarget: canvas) { _ in
+                        EditorInteractionFixture.recordCustomNoDrawingUndo()
+                        manager.registerUndo(withTarget: canvas) { _ in
+                            EditorInteractionFixture.recordCustomNoDrawingUndo()
+                        }
+                    }
+                    manager.setActionName("No-op test \(index)")
+                    manager.endUndoGrouping()
+                }
+                recordUndoTrace("three custom no-drawing groups registered manager=\(ObjectIdentifier(manager)) canUndo=\(manager.canUndo) groupingLevel=\(manager.groupingLevel) groupsByEvent=\(manager.groupsByEvent)")
             }
         }
         if !host.subviews.contains(where: { $0.accessibilityIdentifier == "editor.test.nextPage" }) {
@@ -87,7 +132,7 @@ enum EditorInteractionFixture {
             label.accessibilityIdentifier = identifier
             host.addSubview(label)
         }
-        label.makeValue = { [weak canvas, weak pdfView, weak host] in
+        label.makeValue = { [weak canvas, weak pdfView, weak host, drawingStateProvider] in
             guard let canvas, let pdfView, let host, let page = pdfView.document?.page(at: index),
                 let window = host.window else { return nil }
             let rect = pdfView.convert(pdfView.convert(page.bounds(for: .cropBox), from: page), to: window)
@@ -99,6 +144,7 @@ enum EditorInteractionFixture {
             label.frame = host.convert(rect, from: window)
             let canvasMenuInteractions = editMenuInteractionDescriptions(in: canvas)
             let pdfMenuInteractions = editMenuInteractionDescriptions(in: pdfView)
+            let synchronizedDrawings = drawingStateProvider?()
             let midX = canvas.drawing.strokes.isEmpty ? 0 : canvas.drawing.bounds.midX
             let toolName: String
             if canvas.tool is PKLassoTool {
@@ -117,6 +163,8 @@ enum EditorInteractionFixture {
                 "midX": midX,
                 "strokes": canvas.drawing.strokes.count,
                 "strokeSeeds": canvas.drawing.strokes.map(\.randomSeed),
+                "committedStrokeSeeds": synchronizedDrawings?.committed.strokes.map(\.randomSeed) ?? [],
+                "viewModelStrokeSeeds": synchronizedDrawings?.model.strokes.map(\.randomSeed) ?? [],
                 "canvasIdentity": String(describing: ObjectIdentifier(canvas)),
                 "undoManagerIdentity": canvas.undoManager.map { String(describing: ObjectIdentifier($0)) } ?? "nil",
                 "groupingLevel": canvas.undoManager?.groupingLevel ?? -1,
@@ -132,6 +180,7 @@ enum EditorInteractionFixture {
                 "undoTrace": undoTrace,
                 "fixtureUndoActionCount": fixtureUndoActionCount,
                 "fixtureRedoActionCount": fixtureRedoActionCount,
+                "customNoDrawingUndoCount": customNoDrawingUndoCount,
                 "lastFixtureUndoState": lastFixtureUndoState,
                 "rect": [rect.minX, rect.minY, rect.width, rect.height],
                 "viewportRect": [viewportRect.minX, viewportRect.minY, viewportRect.width, viewportRect.height],
@@ -230,7 +279,13 @@ enum EditorInteractionFixture {
     ) {
         guard !host.subviews.contains(where: { $0.accessibilityIdentifier == identifier }) else { return }
         let button = UIButton(type: .system)
-        button.frame = CGRect(x: 12, y: identifier.hasSuffix("undo") ? 150 : 194, width: 76, height: 36)
+        let top: CGFloat = identifier.hasSuffix("undo") ? 150
+            : (identifier.hasSuffix("redo") ? 194
+                : (identifier.contains("registerNoop") ? 326
+                    : (identifier.contains("CanvasOnly") ? 370
+                        : (identifier.hasSuffix("Detached") ? 282 : 238))))
+        let left = identifier.contains("registerNoop") ? max(12, host.bounds.width - 88) : 12
+        button.frame = CGRect(x: left, y: top, width: 76, height: 36)
         button.setTitle(title, for: .normal)
         button.backgroundColor = UIColor.systemBackground.withAlphaComponent(0.9)
         button.accessibilityIdentifier = identifier

@@ -155,13 +155,169 @@ final class EditorInteractionUITests: XCTestCase {
             "Linear XCUITest drags are touch input but do not synthesize the multi-reversal Scribble path")
     }
 
+    func testDetachedProgrammaticDrawingReplacementConsumesNativeUndoWithoutChangingDrawing() async throws {
+        let app = launch(tool: "scribble-undo")
+        let page = app.staticTexts["editor.page.0"]
+        XCTAssertTrue(page.waitForExistence(timeout: 15))
+
+        var identities: [[UInt32]] = []
+        for (name, startX, startY, endX, endY) in [
+            ("A", 0.18, 0.28, 0.42, 0.28),
+            ("B", 0.22, 0.50, 0.78, 0.50),
+            ("C", 0.56, 0.72, 0.82, 0.72),
+        ] {
+            let state = try info(page)
+            try point(app, info: state, x: startX, y: startY)
+                .press(forDuration: 0.01, thenDragTo: point(app, info: state, x: endX, y: endY))
+            let drawnState = try await waitForDrawing(page, count: identities.count + 1)
+            identities.append(try XCTUnwrap(drawnState["strokeSeeds"] as? [UInt32]))
+            XCTAssertEqual(identities.last?.count, identities.count, "Actual PencilKit input must create stroke \(name)")
+        }
+        let a = try XCTUnwrap(identities[0].first)
+        let b = try XCTUnwrap(identities[1].last)
+        let c = try XCTUnwrap(identities[2].last)
+
+        let removeMiddle = app.buttons["editor.test.removeMiddleDetached"]
+        XCTAssertTrue(removeMiddle.waitForExistence(timeout: 5))
+        removeMiddle.tap()
+        var state = try await waitForSeeds(page, [a, c])
+        assertDrawingsSynchronized(state)
+        XCTAssertTrue(try info(page)["canUndo"] as? Bool == true)
+
+        let undo = app.buttons["editor.test.undo"]
+        let managerBefore = try XCTUnwrap(state["undoManagerIdentity"] as? String)
+        undo.tap()
+        state = try await waitForSeeds(page, [a, c])
+        assertDrawingsSynchronized(state)
+        XCTAssertEqual(state["canRedo"] as? Bool, false,
+            "The PKDrawing setter consumed the native Undo but did not produce a Drawing change")
+        XCTAssertEqual(state["undoManagerIdentity"] as? String, managerBefore)
+        XCTAssertEqual(state["canUndo"] as? Bool, true)
+        print("[DrawingSyncExperiment] Detached replacement after Undo: seeds=\(state["strokeSeeds"] ?? []), coordinator=\(state["committedStrokeSeeds"] ?? []), model=\(state["viewModelStrokeSeeds"] ?? []), canUndo=\(state["canUndo"] ?? "nil"), canRedo=\(state["canRedo"] ?? "nil"), manager=\(state["undoManagerIdentity"] ?? "nil")")
+        XCTContext.runActivity(named: "Detached PKDrawing replacement outcome") { activity in
+            activity.add(XCTAttachment(string: String(describing: state)))
+        }
+    }
+
+    func testCanvasOnlyProgrammaticDrawingReplacementIsolatesUndoMutation() async throws {
+        let app = launch(tool: "scribble-undo")
+        let page = app.staticTexts["editor.page.0"]
+        XCTAssertTrue(page.waitForExistence(timeout: 15))
+        var identities: [[UInt32]] = []
+        for (startX, startY, endX, endY) in [
+            (0.18, 0.28, 0.42, 0.28),
+            (0.22, 0.50, 0.78, 0.50),
+            (0.56, 0.72, 0.82, 0.72),
+        ] {
+            let state = try info(page)
+            try point(app, info: state, x: startX, y: startY)
+                .press(forDuration: 0.01, thenDragTo: point(app, info: state, x: endX, y: endY))
+            let drawnState = try await waitForDrawing(page, count: identities.count + 1)
+            identities.append(try XCTUnwrap(drawnState["strokeSeeds"] as? [UInt32]))
+        }
+        let a = try XCTUnwrap(identities[0].first)
+        let b = try XCTUnwrap(identities[1].last)
+        let c = try XCTUnwrap(identities[2].last)
+        let remove = app.buttons["editor.test.removeMiddleCanvasOnly"]
+        XCTAssertTrue(remove.waitForExistence(timeout: 5))
+        remove.tap()
+        var state = try info(page)
+        XCTAssertEqual(state["strokeSeeds"] as? [UInt32], [a, c])
+        XCTAssertEqual(state["committedStrokeSeeds"] as? [UInt32], [a, b, c],
+            "With the delegate deliberately suppressed, only PKCanvasView should change")
+        XCTAssertEqual(state["viewModelStrokeSeeds"] as? [UInt32], [a, b, c])
+        let managerBefore = try XCTUnwrap(state["undoManagerIdentity"] as? String)
+
+        app.buttons["editor.test.undo"].tap()
+        try await Task.sleep(for: .milliseconds(250))
+        state = try info(page)
+        let managerAfter = try XCTUnwrap(state["undoManagerIdentity"] as? String)
+        XCTAssertEqual(managerAfter, managerBefore)
+        XCTContext.runActivity(named: "Drawing-only replacement: native Undo outcome") { activity in
+            activity.add(XCTAttachment(string: String(describing: state)))
+        }
+        let canvasSeedsAfterUndo = state["strokeSeeds"] as? [UInt32] ?? []
+        let coordinatorSeedsAfterUndo = state["committedStrokeSeeds"] as? [UInt32] ?? []
+        let modelSeedsAfterUndo = state["viewModelStrokeSeeds"] as? [UInt32] ?? []
+        let canUndoAfterUndo = state["canUndo"] as? Bool ?? false
+        let canRedoAfterUndo = state["canRedo"] as? Bool ?? false
+        print("[DrawingSyncExperiment] Canvas-only D2 after Undo: \(canvasSeedsAfterUndo); coordinator=\(coordinatorSeedsAfterUndo); model=\(modelSeedsAfterUndo); canUndo=\(canUndoAfterUndo); canRedo=\(canRedoAfterUndo)")
+    }
+
+    func testCustomUndoRegistrationWithoutDrawingReplacementPreservesNativeStrokeUndo() async throws {
+        let app = launch(tool: "scribble-undo")
+        let page = app.staticTexts["editor.page.0"]
+        XCTAssertTrue(page.waitForExistence(timeout: 15))
+        var identities: [[UInt32]] = []
+        for (startX, startY, endX, endY) in [
+            (0.18, 0.28, 0.42, 0.28),
+            (0.22, 0.50, 0.78, 0.50),
+            (0.56, 0.72, 0.82, 0.72),
+        ] {
+            let state = try info(page)
+            try point(app, info: state, x: startX, y: startY)
+                .press(forDuration: 0.01, thenDragTo: point(app, info: state, x: endX, y: endY))
+            let drawnState = try await waitForDrawing(page, count: identities.count + 1)
+            identities.append(try XCTUnwrap(drawnState["strokeSeeds"] as? [UInt32]))
+        }
+        let a = try XCTUnwrap(identities[0].first)
+        let b = try XCTUnwrap(identities[1].last)
+        let c = try XCTUnwrap(identities[2].last)
+        let beforeRegistration = try info(page)
+        let seedsBeforeRegistration = try XCTUnwrap(beforeRegistration["strokeSeeds"] as? [UInt32])
+        let registerNoop = app.buttons["editor.test.registerNoopUndo"]
+        XCTAssertTrue(registerNoop.waitForExistence(timeout: 5))
+        registerNoop.tap()
+
+        let undo = app.buttons["editor.test.undo"]
+        undo.tap()
+        var state = try await waitForSeeds(page, [a, b, c])
+        XCTAssertEqual(state["customNoDrawingUndoCount"] as? Int, 3,
+            "Three explicit groups registered in one event are coalesced by UndoManager's event grouping")
+        XCTAssertEqual(state["strokeSeeds"] as? [UInt32], seedsBeforeRegistration)
+        assertDrawingsSynchronized(state)
+
+        undo.tap()
+        state = try await waitForSeeds(page, [a, b])
+        assertDrawingsSynchronized(state)
+        undo.tap()
+        state = try await waitForSeeds(page, [a])
+        assertDrawingsSynchronized(state)
+        undo.tap()
+        state = try await waitForSeeds(page, [])
+        assertDrawingsSynchronized(state)
+
+        let redo = app.buttons["editor.test.redo"]
+        for expected in [[a], [a, b], [a, b, c]] as [[UInt32]] {
+            redo.tap()
+            state = try await waitForSeeds(page, expected)
+            assertDrawingsSynchronized(state)
+        }
+        redo.tap()
+        state = try await waitForSeeds(page, [a, b, c])
+        XCTAssertEqual(state["customNoDrawingUndoCount"] as? Int, 6,
+            "The custom event-group transaction should Redo once after native stroke Redos")
+        assertDrawingsSynchronized(state)
+    }
+
+    private func assertDrawingsSynchronized(
+        _ state: [String: Any],
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let canvas = state["strokeSeeds"] as? [UInt32]
+        XCTAssertEqual(state["committedStrokeSeeds"] as? [UInt32], canvas, "Canvas/Coordinator mismatch", file: file, line: line)
+        XCTAssertEqual(state["viewModelStrokeSeeds"] as? [UInt32], canvas, "Canvas/ViewModel mismatch", file: file, line: line)
+    }
+
     private func waitForDrawing(_ page: XCUIElement, count: Int) async throws -> [String: Any] {
         var state = try info(page)
         for _ in 0..<40 where (state["strokes"] as? Int ?? -1) != count {
             try await Task.sleep(for: .milliseconds(100))
             state = try info(page)
         }
-        XCTAssertEqual(state["strokes"] as? Int, count)
+        let trace = state["undoTrace"] as? [String] ?? []
+        XCTAssertEqual(state["strokes"] as? Int, count, "Drawing wait failed for \(count); state=\(state); undoTrace=\(trace)")
         return state
     }
 

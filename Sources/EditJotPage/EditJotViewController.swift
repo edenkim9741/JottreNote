@@ -231,6 +231,65 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
         }
     }
 
+    #if DEBUG
+    private func publishInteractionFixture(canvas: JotCanvasView, pageIndex: Int) {
+        EditorInteractionFixture.publish(
+            canvas: canvas,
+            index: pageIndex,
+            pdfView: pdfView,
+            host: view,
+            drawingStateProvider: { [weak self] in
+                (
+                    committed: self?.inkCanvasCoordinator.committedDrawing ?? PKDrawing(),
+                    model: self?.viewModel.currentDrawing ?? PKDrawing()
+                )
+            },
+            onProgrammaticMiddleRemoval: { [weak self, weak canvas] in
+                guard let self, let canvas else { return }
+                removeMiddleStrokeForFixture(canvas, whileDetached: false, suppressDelegate: false)
+            },
+            onDetachedProgrammaticMiddleRemoval: { [weak self, weak canvas] in
+                guard let self, let canvas else { return }
+                removeMiddleStrokeForFixture(canvas, whileDetached: true, suppressDelegate: false)
+            },
+            onCanvasOnlyMiddleRemoval: { [weak self, weak canvas] in
+                guard let self, let canvas else { return }
+                removeMiddleStrokeForFixture(canvas, whileDetached: false, suppressDelegate: true)
+            }
+        )
+    }
+
+    private func removeMiddleStrokeForFixture(
+        _ canvas: JotCanvasView,
+        whileDetached: Bool,
+        suppressDelegate: Bool
+    ) {
+        let strokes = canvas.drawing.strokes
+        guard strokes.count >= 3, let parent = canvas.superview,
+              let originalIndex = parent.subviews.firstIndex(of: canvas) else { return }
+        let originalFrame = canvas.frame
+        let originalManager = canvas.undoManager.map { String(describing: ObjectIdentifier($0)) } ?? "nil"
+        let originalDelegate = canvas.delegate
+        if suppressDelegate { canvas.delegate = nil }
+        if whileDetached { canvas.removeFromSuperview() }
+        let managerDuringReplacement = canvas.undoManager.map { String(describing: ObjectIdentifier($0)) } ?? "nil"
+        let withoutMiddleStroke = strokes.enumerated().compactMap { index, stroke in
+            index == 1 ? nil : stroke
+        }
+        canvas.drawing = PKDrawing(strokes: withoutMiddleStroke)
+        if whileDetached {
+            parent.insertSubview(canvas, at: originalIndex)
+            canvas.frame = originalFrame
+        }
+        if suppressDelegate { canvas.delegate = originalDelegate }
+        #if DEBUG
+        EditorInteractionFixture.recordUndoTrace(
+            "programmatic middle removal detached=\(whileDetached) suppressDelegate=\(suppressDelegate) managerBefore=\(originalManager) managerDuring=\(managerDuringReplacement) managerAfter=\(canvas.undoManager.map { String(describing: ObjectIdentifier($0)) } ?? "nil")"
+        )
+        #endif
+    }
+    #endif
+
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         assertionFailure("\(#function) has not been implemented")
@@ -512,7 +571,7 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
         )
         isApplyingOverlayDrawing = false
         #if DEBUG
-        EditorInteractionFixture.publish(canvas: canvas, index: pageIndex, pdfView: pdfView, host: view)
+        publishInteractionFixture(canvas: canvas, pageIndex: pageIndex)
         #endif
         updatePageCanvasRenderer(for: canvas)
         synchronizePageInputState()
@@ -528,7 +587,7 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
             canvas.layoutIfNeeded()
             updatePageCanvasRenderer(for: canvas)
             #if DEBUG
-            EditorInteractionFixture.publish(canvas: canvas, index: pageIndex, pdfView: pdfView, host: view)
+            publishInteractionFixture(canvas: canvas, pageIndex: pageIndex)
             #endif
 
         }
@@ -594,7 +653,7 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
         EditorInteractionFixture.pickerRulerActive = cachedRulerActive
         if EditorInteractionFixture.tool != nil {
             for (index, canvas) in pageCanvases {
-                EditorInteractionFixture.publish(canvas: canvas, index: index, pdfView: pdfView, host: view)
+                publishInteractionFixture(canvas: canvas, pageIndex: index)
             }
         }
         #endif
@@ -753,12 +812,14 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
         )
         isApplyingOverlayDrawing = true
         for (pageIndex, canvas) in pageCanvases {
-            canvas.drawing = localDrawing(
+            let pageDrawing = localDrawing(
                 from: drawing.value,
                 pageIndices: drawing.strokePageIndices,
                 pageIndex: pageIndex,
                 overlaySize: pageOverlays[pageIndex]?.drawingSize ?? currentPageSize
             )
+            guard !JotEditorDrawingState.drawingsMatch(canvas.drawing, pageDrawing) else { continue }
+            canvas.drawing = pageDrawing
         }
         isApplyingOverlayDrawing = false
     }
@@ -1159,7 +1220,7 @@ extension EditJotViewController {
         }
         #if DEBUG
         if let index = pageIndexByCanvas[ObjectIdentifier(canvas)] {
-            EditorInteractionFixture.publish(canvas: canvas, index: index, pdfView: pdfView, host: view)
+            publishInteractionFixture(canvas: canvas, pageIndex: index)
         }
         #endif
     }
@@ -1480,7 +1541,9 @@ extension EditJotViewController: PKCanvasViewDelegate {
             guard !isApplyingOverlayDrawing else { return }
             shapeCoordinator.drawingDidChange(canvasView)
             #if DEBUG
-            EditorInteractionFixture.publish(canvas: canvasView, index: pageIndex, pdfView: pdfView, host: view)
+            if let canvas = canvasView as? JotCanvasView {
+                publishInteractionFixture(canvas: canvas, pageIndex: pageIndex)
+            }
             #endif
             let converted = canonicalDrawing(
                 from: canvasView.drawing,
@@ -1515,7 +1578,7 @@ extension EditJotViewController: PKCanvasViewDelegate {
             if canvas.tool is PKLassoTool { activateLassoCanvas(canvas) }
             #if DEBUG
             if let index = pageIndexByCanvas[ObjectIdentifier(canvas)] {
-                EditorInteractionFixture.publish(canvas: canvas, index: index, pdfView: pdfView, host: view)
+                publishInteractionFixture(canvas: canvas, pageIndex: index)
             }
             #endif
             toolUndoManager = canvasView.undoManager
