@@ -196,6 +196,76 @@ final class EditorTransitionAndSortingTests: XCTestCase {
         XCTAssertFalse(newlyVisiblePageUndoManager.canUndo)
     }
 
+    func testUndoTransitionsRegisteredInSeparateRunLoopEventsRemainSeparate() {
+        let undoManager = UndoManager()
+        var state = "D1"
+        let eraseRegistration = expectation(description: "Erase action is registered on next event")
+
+        func register(_ previousState: String, on manager: UndoManager) {
+            manager.beginUndoGrouping()
+            manager.registerUndo(withTarget: self) { _ in state = previousState }
+            manager.endUndoGrouping()
+        }
+
+        register("D0", on: undoManager) // Scribble creation undo.
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(20))
+            state = "D2"
+            register("D1", on: undoManager) // Erase undo, in a distinct event.
+
+            undoManager.undo()
+            XCTAssertEqual(state, "D1", "The first Undo should reverse only the erase")
+            undoManager.undo()
+            XCTAssertEqual(state, "D0", "The next Undo should reverse Scribble creation")
+            eraseRegistration.fulfill()
+        }
+
+        wait(for: [eraseRegistration], timeout: 1)
+    }
+
+    func testReplacingNativeScribbleActionKeepsEraseAndCreationAsTwoUndoSteps() {
+        let undoManager = UndoManager()
+        undoManager.groupsByEvent = false
+        var state = "D1"
+
+        // Simulate PencilKit's Scribble drawing action, then consume it before
+        // the programmatic drawing replacement invalidates its native entry.
+        undoManager.beginUndoGrouping()
+        undoManager.registerUndo(withTarget: self) { _ in state = "D0" }
+        undoManager.endUndoGrouping()
+        undoManager.undo()
+        XCTAssertEqual(state, "D0")
+
+        // Install the explicit D1 -> D0 replacement and then the D2 -> D1
+        // Erase action, matching the controller's two-event registration.
+        state = "D1"
+        undoManager.beginUndoGrouping()
+        undoManager.registerUndo(withTarget: self) { _ in
+            state = "D0"
+            undoManager.registerUndo(withTarget: self) { _ in state = "D1" }
+        }
+        undoManager.endUndoGrouping()
+        state = "D2"
+
+        undoManager.beginUndoGrouping()
+        undoManager.registerUndo(withTarget: self) { _ in
+            state = "D1"
+            undoManager.registerUndo(withTarget: self) { _ in state = "D2" }
+        }
+        undoManager.endUndoGrouping()
+
+        undoManager.undo()
+        XCTAssertEqual(state, "D1", "Undo 1 reverses Erase")
+        XCTAssertTrue(undoManager.canUndo)
+        undoManager.undo()
+        XCTAssertEqual(state, "D0", "Undo 2 removes only the Scribble")
+
+        undoManager.redo()
+        XCTAssertEqual(state, "D1", "Redo 1 restores the Scribble")
+        undoManager.redo()
+        XCTAssertEqual(state, "D2", "Redo 2 reapplies Erase")
+    }
+
     func testDoubleTapFitTargetIsSelectedFromCurrentScale() {
         let portrait = JotCanvasZoomCoordinator.PageFitScales(shortSide: 1.4, longSide: 0.8)
 

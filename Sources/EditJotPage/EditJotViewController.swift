@@ -169,8 +169,6 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
         scribbleEraseTask = Task { @MainActor [weak self] in
             for await event in viewModel.scribbleEraseEvent {
                 guard let self else { return }
-                let beforeDrawing = event.beforeDrawing
-                let afterDrawing = event.result.value
                 drawingWidth = event.result.width
                 if pendingScrollPage == nil { pendingScrollPage = defaultsService.getValue(lastPageKey) }
                 let undoManager = scribbleUndoManagersByPage.removeValue(forKey: event.pageIndex)
@@ -178,7 +176,23 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
                     ?? toolUndoManager
                 activeScribbleUndoManager = undoManager
                 debugScribbleUndoState("erase event received page=\(event.pageIndex)", manager: undoManager)
-                registerDrawingUndo(before: beforeDrawing, after: afterDrawing, manager: undoManager)
+                consumePencilKitScribbleUndoIfPresent(event, manager: undoManager)
+                applyViewModelDrawing(event.scribbleDrawing)
+                registerDrawingUndo(
+                    snapshot: event.previousDrawing,
+                    inverse: event.scribbleDrawing,
+                    manager: undoManager
+                )
+
+                // UndoManager groups registrations made during one run-loop
+                // event together. Keep Scribble creation and Erase as two
+                // actual undo steps by committing Erase in the next event.
+                try? await Task.sleep(for: .milliseconds(20))
+                registerDrawingUndo(
+                    snapshot: event.scribbleDrawing,
+                    inverse: event.result,
+                    manager: undoManager
+                )
                 applyViewModelDrawing(event.result)
                 debugScribbleUndoState("erase applied page=\(event.pageIndex)", manager: undoManager)
             }
@@ -733,56 +747,10 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
         isApplyingOverlayDrawing = false
     }
 
-    private func reconciledPageIndices(for drawing: PKDrawing) -> [Int] {
-        var oldIndicesBySeed: [UInt32: [Int]] = [:]
-        for (index, stroke) in inkCanvasCoordinator.committedDrawing.strokes.enumerated() {
-            let pageIndex =
-                inkCanvasCoordinator.committedStrokePageIndices.indices.contains(index)
-                ? inkCanvasCoordinator.committedStrokePageIndices[index]
-                : pageIndex(for: stroke)
-            oldIndicesBySeed[stroke.randomSeed, default: []].append(pageIndex)
-        }
-
-        return drawing.strokes.map { stroke in
-            if var matching = oldIndicesBySeed[stroke.randomSeed], !matching.isEmpty {
-                let pageIndex = matching.removeFirst()
-                oldIndicesBySeed[stroke.randomSeed] = matching
-                return pageIndex
-            }
-            return pageIndex(for: stroke)
-        }
-    }
-
     private func pageIndex(for stroke: PKStroke) -> Int {
         let stride = currentPageSize.height + JotPageLayout.pageSpacing
         guard stride.isFinite, stride > 0 else { return 0 }
         return max(0, Int(floor(max(0, stroke.renderBounds.midY) / stride)))
-    }
-
-    private func registerDrawingUndo(
-        before: PKDrawing,
-        after: PKDrawing,
-        manager: UndoManager?
-    ) {
-        let beforeIndices =
-            before.strokes.count == inkCanvasCoordinator.committedStrokePageIndices.count
-            ? inkCanvasCoordinator.committedStrokePageIndices
-            : reconciledPageIndices(for: before)
-        let afterIndices =
-            viewModel.currentStrokePageIndices.count == after.strokes.count
-            ? viewModel.currentStrokePageIndices
-            : reconciledPageIndices(for: after)
-        let beforeSnapshot = EditJotViewModel.Drawing(
-            value: before,
-            width: drawingWidth,
-            strokePageIndices: beforeIndices
-        )
-        let afterSnapshot = EditJotViewModel.Drawing(
-            value: after,
-            width: drawingWidth,
-            strokePageIndices: afterIndices
-        )
-        registerDrawingUndo(snapshot: beforeSnapshot, inverse: afterSnapshot, manager: manager)
     }
 
     private func registerDrawingUndo(
@@ -820,6 +788,38 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
             "canUndo=\(manager?.canUndo ?? false) canRedo=\(manager?.canRedo ?? false) " +
             "groupingLevel=\(manager?.groupingLevel ?? -1) " +
             "isUndoing=\(manager?.isUndoing ?? false) isRedoing=\(manager?.isRedoing ?? false)"
+        )
+    }
+
+    private func consumePencilKitScribbleUndoIfPresent(
+        _ event: EditJotViewModel.ScribbleEraseEvent,
+        manager: UndoManager?
+    ) {
+        guard let manager, manager.canUndo,
+            let canvas = pageCanvases[event.pageIndex]
+        else {
+            debugScribbleUndoState("native scribble undo unavailable", manager: manager)
+            return
+        }
+
+        let overlaySize = pageOverlays[event.pageIndex]?.drawingSize ?? currentPageSize
+        let expectedBefore = localDrawing(
+            from: event.previousDrawing.value,
+            pageIndices: event.previousDrawing.strokePageIndices,
+            pageIndex: event.pageIndex,
+            overlaySize: overlaySize
+        )
+        let wasApplyingOverlayDrawing = isApplyingOverlayDrawing
+        isApplyingOverlayDrawing = true
+        manager.undo()
+        let consumedScribbleUndo = JotEditorDrawingState.drawingsMatch(canvas.drawing, expectedBefore)
+        if !consumedScribbleUndo, manager.canRedo {
+            manager.redo()
+        }
+        isApplyingOverlayDrawing = wasApplyingOverlayDrawing
+        debugScribbleUndoState(
+            consumedScribbleUndo ? "native scribble undo replaced" : "native scribble undo not on top",
+            manager: manager
         )
     }
     #else

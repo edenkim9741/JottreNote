@@ -38,7 +38,8 @@ final class EditJotViewModel {
     }
 
     struct ScribbleEraseEvent: Sendable {
-        let beforeDrawing: PKDrawing
+        let previousDrawing: Drawing
+        let scribbleDrawing: Drawing
         let result: Drawing
         let pageIndex: Int
     }
@@ -280,11 +281,17 @@ final class EditJotViewModel {
                 after: result,
                 previousDrawing: prev
             )
+            let scribblePageIndices: [Int]
+            if let strokePageIndices, strokePageIndices.count == drawing.strokes.count {
+                scribblePageIndices = normalizedStrokePageIndices(strokePageIndices, for: drawing)
+            } else {
+                var indices = normalizedStrokePageIndices(priorIndices, for: prev)
+                indices.append(contentsOf: drawing.strokes.dropFirst(prev.strokes.count).map(pageIndex(for:)))
+                scribblePageIndices = indices
+            }
             let scribblePageIndex: Int
-            if let strokePageIndices,
-                strokePageIndices.count == drawing.strokes.count,
-                drawing.strokes.count > prev.strokes.count {
-                scribblePageIndex = strokePageIndices[prev.strokes.count]
+            if scribblePageIndices.count > prev.strokes.count {
+                scribblePageIndex = scribblePageIndices[prev.strokes.count]
             } else {
                 scribblePageIndex = changedPageIndices.sorted().first
                     ?? (currentStrokePageIndices.last ?? 0)
@@ -297,7 +304,16 @@ final class EditJotViewModel {
             ))
             scribbleEraseContinuation.yield(
                 ScribbleEraseEvent(
-                    beforeDrawing: drawing,
+                    previousDrawing: Drawing(
+                        value: prev,
+                        width: currentWidth,
+                        strokePageIndices: normalizedStrokePageIndices(priorIndices, for: prev)
+                    ),
+                    scribbleDrawing: Drawing(
+                        value: drawing,
+                        width: currentWidth,
+                        strokePageIndices: scribblePageIndices
+                    ),
                     result: Drawing(
                         value: processed,
                         width: currentWidth,
