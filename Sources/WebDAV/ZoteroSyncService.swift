@@ -19,8 +19,8 @@ struct ZoteroDownloadContext: Sendable {
     var attempt: Int { attemptState.value }
     func setAttempt(_ attempt: Int) { attemptState.value = attempt }
 
-    init(source: ZoteroDownloadSource, relatedAttachmentID: String? = nil) {
-        requestID = UUID().uuidString
+    init(source: ZoteroDownloadSource, relatedAttachmentID: String? = nil, requestID: String? = nil) {
+        self.requestID = requestID ?? UUID().uuidString
         attachmentID = UUID().uuidString
         self.source = source
         self.relatedAttachmentID = relatedAttachmentID

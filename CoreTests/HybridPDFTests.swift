@@ -1579,6 +1579,108 @@ final class HybridPDFTests: XCTestCase {
         XCTAssertEqual(afterDirtyBlock.attachments[protectedKey]?.syncError, "Upload pending")
     }
 
+    func testExplicitRemoteRestoreBacksUpDirtyFilesBeforeReplacingThem() throws {
+        let userID = "explicit-restore-\(UUID().uuidString)"
+        let key = "RESTORE01"
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let oldPDFURL = folder.appendingPathComponent("old.pdf")
+        let jotURL = folder.appendingPathComponent("local.jot")
+        let installedJotURL = folder.appendingPathComponent("editor.jot")
+        let oldPDF = try makePDF(pageSize: CGSize(width: 240, height: 320), rotation: 0)
+        let remotePDF = try makePDF(pageSize: CGSize(width: 320, height: 240), rotation: 0)
+        try oldPDF.write(to: oldPDFURL)
+        let localJot = Jot(
+            drawing: PKDrawing().dataRepresentation(),
+            width: 1_200,
+            pdfData: oldPDF,
+            extraPages: 2
+        )
+        let encoder = PropertyListEncoder()
+        encoder.outputFormat = .binary
+        let oldJotData = try encoder.encode(localJot)
+        try oldJotData.write(to: jotURL)
+
+        let attachment = ZoteroAttachment(
+            key: key,
+            parentItemKey: nil,
+            contentType: "application/pdf",
+            filename: "restore.pdf",
+            localCachePath: oldPDFURL.path,
+            syncStatus: .dirty,
+            version: 1,
+            md5: ZoteroSyncService.md5Hex(oldPDF),
+            modificationTimeMilliseconds: nil,
+            isPendingSync: true,
+            syncError: "Could not download or open the PDF."
+        )
+        let store = ZoteroCacheStore()
+        try store.save(ZoteroCacheSnapshot(
+            userID: userID,
+            lastLibraryVersion: 1,
+            collections: [:],
+            items: [:],
+            attachments: [key: attachment],
+            lastSyncedAt: Date(),
+            pendingRemoteDownloads: [key]
+        ))
+
+        let backup = try store.createRemoteRestoreBackup(
+            key: key,
+            userID: userID,
+            additionalLocalURLs: [jotURL]
+        )
+        let backedUpPDF = try XCTUnwrap(backup.backupURLs.first { $0.pathExtension == "pdf" })
+        let backedUpJot = try XCTUnwrap(backup.backupURLs.first { $0.pathExtension == "jot" })
+        XCTAssertTrue(FileManager.default.contentsEqual(atPath: oldPDFURL.path, andPath: backedUpPDF.path))
+        XCTAssertTrue(FileManager.default.contentsEqual(atPath: jotURL.path, andPath: backedUpJot.path))
+        XCTAssertTrue(backup.includedJotFile)
+
+        XCTAssertThrowsError(try store.installRemoteVersionAfterExplicitRestore(
+            key: key,
+            data: remotePDF,
+            jotData: Data("invalid jot".utf8),
+            jotURL: jotURL,
+            userID: userID,
+            cacheMD5: ZoteroSyncService.md5Hex(remotePDF),
+            remotePDFMD5: ZoteroSyncService.md5Hex(remotePDF),
+            remoteVersion: 2,
+            backup: backup
+        ))
+        XCTAssertEqual(try Data(contentsOf: oldPDFURL), oldPDF)
+        XCTAssertEqual(try Data(contentsOf: jotURL), oldJotData)
+        XCTAssertEqual(store.load(userID: userID).attachments[key]?.syncStatus, .dirty)
+
+        let remoteJot = Jot(
+            drawing: PKDrawing().dataRepresentation(),
+            width: 1_200,
+            pdfData: remotePDF
+        )
+        let remoteJotData = try encoder.encode(remoteJot)
+        let remoteHash = ZoteroSyncService.md5Hex(remotePDF)
+        let installed = try store.installRemoteVersionAfterExplicitRestore(
+            key: key,
+            data: remotePDF,
+            jotData: remoteJotData,
+            jotURL: installedJotURL,
+            userID: userID,
+            cacheMD5: ZoteroSyncService.md5Hex(remotePDF),
+            remotePDFMD5: remoteHash,
+            remoteVersion: 2,
+            backup: backup
+        )
+        let restoredAttachment = try XCTUnwrap(installed.attachments[key])
+        XCTAssertEqual(restoredAttachment.syncStatus, .downloaded)
+        XCTAssertFalse(restoredAttachment.isPendingSync)
+        XCTAssertNil(restoredAttachment.syncError)
+        XCTAssertTrue(installed.pendingRemoteDownloads.isEmpty)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: try XCTUnwrap(restoredAttachment.localCachePath))), remotePDF)
+        XCTAssertEqual(try PropertyListDecoder().decode(Jot.self, from: Data(contentsOf: installedJotURL)).pdfData, remotePDF)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: backedUpPDF.path), "The recovery backup remains available after install")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: backedUpJot.path))
+    }
+
     @MainActor
     func testLocalJotBaselineUsesContentRatherThanReembeddedPlistMD5() throws {
         let pdfData = try makePDF(pageSize: CGSize(width: 240, height: 320), rotation: 0)

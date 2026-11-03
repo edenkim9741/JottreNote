@@ -317,6 +317,28 @@ struct ZoteroCacheSnapshot: Codable, Sendable {
     }
 }
 
+struct ZoteroRemoteRestoreBackupReceipt: Sendable {
+    let attachmentKey: String
+    let userID: String
+    let directoryURL: URL
+    let backupURLs: [URL]
+    let includedJotFile: Bool
+
+    fileprivate init(
+        attachmentKey: String,
+        userID: String,
+        directoryURL: URL,
+        backupURLs: [URL],
+        includedJotFile: Bool
+    ) {
+        self.attachmentKey = attachmentKey
+        self.userID = userID
+        self.directoryURL = directoryURL
+        self.backupURLs = backupURLs
+        self.includedJotFile = includedJotFile
+    }
+}
+
 struct ZoteroLibraryDelta: Sendable {
     let sinceVersion: Int
     let libraryVersion: Int
@@ -879,6 +901,166 @@ final class ZoteroCacheStore: @unchecked Sendable {
             snapshot.attachments[key] = attachment
             snapshot.pendingRemoteDownloads.removeAll { $0 == key }
             try saveUnlocked(snapshot)
+            return snapshot
+        }
+    }
+
+    /// Creates an app-persistent copy of every local file that a deliberate
+    /// remote restore could replace. The receipt is required by the installer.
+    func createRemoteRestoreBackup(
+        key: String,
+        userID: String,
+        additionalLocalURLs: [URL] = []
+    ) throws -> ZoteroRemoteRestoreBackupReceipt {
+        try withCacheAccess {
+            let snapshot = loadUnlocked(userID: userID)
+            guard let attachment = snapshot.attachments[key],
+                  !attachment.isLocalOnly, !attachment.isConflict else {
+                throw Failure.attachmentNotFound
+            }
+            let anonymousKey = String(ZoteroSyncService.md5Hex(Data(key.utf8)).prefix(12))
+            let backupRoot = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("ZoteroRecovery", isDirectory: true)
+                .appendingPathComponent(anonymousKey, isDirectory: true)
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(at: backupRoot, withIntermediateDirectories: true)
+
+            do {
+                var sources: [(label: String, url: URL)] = []
+                if let localCachePath = attachment.localCachePath {
+                    sources.append(("local-cache", URL(fileURLWithPath: localCachePath)))
+                }
+                sources.append(contentsOf: additionalLocalURLs.enumerated().map {
+                    ("local-data-\($0.offset)", $0.element)
+                })
+                var copiedURLs: [URL] = []
+                var manifestFiles: [[String: Any]] = []
+                var includedJotFile = false
+                let uniqueSources = sources.reduce(into: [(String, URL)]()) { collected, source in
+                    let standardized = source.url.standardizedFileURL
+                    guard !collected.contains(where: { $0.1.standardizedFileURL == standardized }) else { return }
+                    collected.append((source.label, standardized))
+                }
+                for (index, source) in uniqueSources.enumerated() {
+                    guard FileManager.default.fileExists(atPath: source.1.path) else { continue }
+                    let values = try source.1.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+                    guard values.isRegularFile == true, let size = values.fileSize else {
+                        throw Failure.remoteRestoreBackupFailed
+                    }
+                    let fileName = "\(source.0)-\(index).\(source.1.pathExtension.isEmpty ? "bin" : source.1.pathExtension)"
+                    let destination = backupRoot.appendingPathComponent(fileName)
+                    try FileManager.default.copyItem(at: source.1, to: destination)
+                    let copiedSize = try destination.resourceValues(forKeys: [.fileSizeKey]).fileSize
+                    guard copiedSize == size,
+                          FileManager.default.contentsEqual(atPath: source.1.path, andPath: destination.path) else {
+                        throw Failure.remoteRestoreBackupFailed
+                    }
+                    if source.0.hasPrefix("local-data-") && source.1.pathExtension == "jot" {
+                        includedJotFile = true
+                    }
+                    copiedURLs.append(destination)
+                    manifestFiles.append(["name": fileName, "bytes": size])
+                }
+                let manifest: [String: Any] = [
+                    "attachmentID": anonymousKey,
+                    "createdAt": ISO8601DateFormatter().string(from: Date()),
+                    "previousSyncStatus": attachment.syncStatus.rawValue,
+                    "dirty": attachment.syncStatus == .dirty || attachment.isPendingSync,
+                    "conflictCopyExists": snapshot.attachments.values.contains {
+                        $0.isConflict && $0.conflictOriginalKey == key
+                    },
+                    "files": manifestFiles
+                ]
+                let manifestURL = backupRoot.appendingPathComponent("manifest.json")
+                let manifestData = try JSONSerialization.data(withJSONObject: manifest, options: [.prettyPrinted, .sortedKeys])
+                try manifestData.write(to: manifestURL, options: .atomic)
+                copiedURLs.append(manifestURL)
+                return ZoteroRemoteRestoreBackupReceipt(
+                    attachmentKey: key,
+                    userID: userID,
+                    directoryURL: backupRoot,
+                    backupURLs: copiedURLs,
+                    includedJotFile: includedJotFile
+                )
+            } catch {
+                try? FileManager.default.removeItem(at: backupRoot)
+                throw error
+            }
+        }
+    }
+
+    /// Installs a verified remote PDF only when a matching durable backup
+    /// receipt exists. Both cache metadata and the editor Jot file roll back
+    /// if either write fails.
+    func installRemoteVersionAfterExplicitRestore(
+        key: String,
+        data: Data,
+        jotData: Data,
+        jotURL: URL,
+        userID: String,
+        cacheMD5: String,
+        remotePDFMD5: String,
+        remoteVersion: Int,
+        backup: ZoteroRemoteRestoreBackupReceipt
+    ) throws -> ZoteroCacheSnapshot {
+        try withCacheAccess {
+            guard backup.attachmentKey == key,
+                  backup.userID == userID,
+                  FileManager.default.fileExists(atPath: backup.directoryURL.appendingPathComponent("manifest.json").path),
+                  Self.isValidPDFAttachment(data),
+                  let restoredJot = try? PropertyListDecoder().decode(Jot.self, from: jotData),
+                  restoredJot.pdfData != nil else {
+                throw Failure.remoteRestoreBackupFailed
+            }
+            var snapshot = loadUnlocked(userID: userID)
+            guard var attachment = snapshot.attachments[key],
+                  !attachment.isLocalOnly, !attachment.isConflict else {
+                throw Failure.attachmentNotFound
+            }
+            let oldCachePath = attachment.localCachePath
+            let newURL = defaultPDFCacheURL(for: key).deletingLastPathComponent()
+                .appendingPathComponent("\(key).restore-\(UUID().uuidString).pdf")
+            let existingJotBackup = backup.backupURLs.first(where: { $0.lastPathComponent.hasPrefix("local-data-") && $0.pathExtension == "jot" })
+            guard !backup.includedJotFile
+                || existingJotBackup.map({ FileManager.default.fileExists(atPath: $0.path) }) == true else {
+                throw Failure.remoteRestoreBackupFailed
+            }
+            try FileManager.default.createDirectory(at: newURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try data.write(to: newURL, options: .atomic)
+            do {
+                guard isUsableLocalCacheFile(at: newURL) else { throw Failure.invalidLocalAttachmentFile }
+                try FileManager.default.createDirectory(at: jotURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try jotData.write(to: jotURL, options: .atomic)
+
+                attachment.localCachePath = newURL.path
+                attachment.syncStatus = .downloaded
+                attachment.version = remoteVersion
+                attachment.md5 = cacheMD5
+                attachment.modificationTimeMilliseconds = nil
+                attachment.isPendingSync = false
+                attachment.syncError = nil
+                attachment.remoteMD5 = remotePDFMD5
+                attachment.remoteMD5IsPDF = true
+                attachment.verificationRemoteMD5 = nil
+                attachment.verificationRemoteMD5WasChecked = false
+                snapshot.attachments[key] = attachment
+                snapshot.pendingRemoteDownloads.removeAll { $0 == key }
+                clearParentSyncError(for: attachment, snapshot: &snapshot)
+                try saveUnlocked(snapshot)
+            } catch {
+                try? FileManager.default.removeItem(at: newURL)
+                if backup.includedJotFile, let existingJotBackup {
+                    if let backupData = try? Data(contentsOf: existingJotBackup) {
+                        try? backupData.write(to: jotURL, options: .atomic)
+                    }
+                } else {
+                    try? FileManager.default.removeItem(at: jotURL)
+                }
+                throw error
+            }
+            if let oldCachePath, oldCachePath != newURL.path {
+                try? FileManager.default.removeItem(atPath: oldCachePath)
+            }
             return snapshot
         }
     }
@@ -1905,5 +2087,24 @@ final class ZoteroCacheStore: @unchecked Sendable {
         case invalidLocalAttachmentFile, remoteDownloadWouldOverwriteDirtyAttachment
         case conflictLocalFileUnavailable, conflictResolutionReservationMismatch
         case conflictResolutionInProgress, remoteDownloadMetadataMismatch
+        case remoteRestoreBackupFailed, remoteRestoreAlreadyRunning
+        case remoteRestoreBlockedByActiveEditor, remoteRestoreMissingCredentials
+    }
+}
+
+extension ZoteroCacheStore.Failure: LocalizedError {
+    var errorDescription: String? {
+        switch self {
+        case .remoteRestoreBackupFailed:
+            String(localized: "zotero.forceRestore.backupFailed", defaultValue: "로컬 복구 데이터를 안전하게 백업하지 못해 복구를 중단했습니다.")
+        case .remoteRestoreAlreadyRunning:
+            String(localized: "zotero.forceRestore.alreadyRunning", defaultValue: "이 첨부 파일은 이미 복구 중입니다.")
+        case .remoteRestoreBlockedByActiveEditor:
+            String(localized: "zotero.forceRestore.editorActive", defaultValue: "편집 중인 문서를 닫은 뒤 다시 시도하세요.")
+        case .remoteRestoreMissingCredentials:
+            String(localized: "zotero.forceRestore.credentialsMissing", defaultValue: "Zotero 계정 설정을 확인하세요.")
+        default:
+            nil
+        }
     }
 }

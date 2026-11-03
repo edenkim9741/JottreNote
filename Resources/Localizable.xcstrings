@@ -10701,6 +10701,86 @@
           }
         }
       }
+    },
+    "zotero.forceRestore.menu" : {
+      "comment" : "Context menu action to restore an attachment from its server version",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Restore from Remote Version" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "원격 버전으로 복구" } }
+      }
+    },
+    "zotero.forceRestore.confirm.title" : {
+      "comment" : "Confirmation title for replacing local PDF data with its remote version",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Restore from Remote Version?" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "원격 버전으로 복구하시겠습니까?" } }
+      }
+    },
+    "zotero.forceRestore.confirm.action" : {
+      "comment" : "Explicit confirmation button for restoring a remote PDF",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Restore from Remote Version" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "원격 버전으로 복구" } }
+      }
+    },
+    "zotero.forceRestore.confirm.message" : {
+      "comment" : "Warning shown before replacing local PDF data with the remote version",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "The PDF stored on the server will be downloaded again and replace the current local version. Unsynced handwriting or changes may not appear in the restored document. Recoverable local data will be preserved in a separate backup." } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "서버에 저장된 PDF를 다시 다운로드하여 현재 로컬 버전을 대체합니다. 서버에 동기화되지 않은 필기나 수정 내용은 현재 문서에 표시되지 않을 수 있습니다. 복구 가능한 로컬 데이터는 별도 백업으로 보존합니다." } }
+      }
+    },
+    "zotero.forceRestore.success" : {
+      "comment" : "Message shown after the local remote-version restore completes",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "The remote PDF was restored. You can share or save the local backup." } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "원격 PDF를 복구했습니다. 백업은 공유하거나 보관할 수 있습니다." } }
+      }
+    },
+    "zotero.forceRestore.shareBackup" : {
+      "comment" : "Share local data backup created before remote PDF restore",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Share Local Backup" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "로컬 백업 공유" } }
+      }
+    },
+    "zotero.forceRestore.backupFailed" : {
+      "comment" : "Error shown when local recovery data cannot be safely backed up",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Restore was stopped because local recovery data could not be backed up safely." } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "로컬 복구 데이터를 안전하게 백업하지 못해 복구를 중단했습니다." } }
+      }
+    },
+    "zotero.forceRestore.alreadyRunning" : {
+      "comment" : "Error shown when a restore is already running for an attachment",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "This attachment is already being restored." } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "이 첨부 파일은 이미 복구 중입니다." } }
+      }
+    },
+    "zotero.forceRestore.editorActive" : {
+      "comment" : "Error shown when remote restore is blocked while its editor is open",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Close the open document editor, then try again." } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "편집 중인 문서를 닫은 뒤 다시 시도하세요." } }
+      }
+    },
+    "zotero.forceRestore.credentialsMissing" : {
+      "comment" : "Error shown when Zotero account credentials are unavailable for restore",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Check the Zotero account settings and try again." } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "Zotero 계정 설정을 확인하세요." } }
+      }
     }
   },
   "version" : "1.0"

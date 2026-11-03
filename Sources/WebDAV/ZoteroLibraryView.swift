@@ -145,12 +145,15 @@ private final class ZoteroLibraryViewModel: ObservableObject {
     @Published private(set) var isSyncing = false
     @Published private(set) var errorMessage: String?
     @Published private(set) var openingAttachmentKey: String?
+    @Published private(set) var restoringAttachmentKey: String?
+    @Published private(set) var remoteRestoreBackupURLs: [URL]?
     @Published private(set) var sorting: ZoteroLibrarySorting
     var sortOrder: ZoteroAttachmentSortOrder { sorting.order }
     var isSortReversed: Bool { sorting.isReversed }
     @Published private(set) var isSelecting = false
     @Published private(set) var selectedItemKeys = Set<String>()
     private var synchronizationRequestedWhileSyncing = false
+    private var remoteRestoreRequestIDs: [String: String] = [:]
 
     private(set) var userID: String
     private var apiKey: String
@@ -1063,6 +1066,172 @@ private final class ZoteroLibraryViewModel: ObservableObject {
         )
     }
 
+    func shouldOfferRemoteRestore(for attachment: ZoteroAttachment) -> Bool {
+        guard attachment.contentType.lowercased() == "application/pdf",
+              ZoteroSyncService.isValidKey(attachment.key),
+              !attachment.isLocalOnly, !attachment.isConflict,
+              !isSelecting, restoringAttachmentKey == nil else { return false }
+        let hasValidPDF = cacheStore.hasUsableLocalFile(for: attachment)
+        let expectsLocalPDF = attachment.syncStatus == .downloaded
+            || attachment.syncStatus == .dirty
+            || attachment.localCachePath != nil
+        let localVersionIsMissingOrBroken = expectsLocalPDF && !hasValidPDF
+        return attachment.syncError != nil
+            || localVersionIsMissingOrBroken
+            || snapshot.pendingRemoteDownloads.contains(attachment.key)
+            || cacheStore.hasUsableConflictCopy(forOriginalKey: attachment.key, userID: userID)
+    }
+
+    func recordRemoteRestoreRequest(for attachment: ZoteroAttachment) {
+        let requestID = UUID().uuidString
+        remoteRestoreRequestIDs[attachment.key] = requestID
+        let details: [String: Any] = [
+            "requestID": requestID,
+            "attachmentID": String(ZoteroSyncService.md5Hex(Data(attachment.key.utf8)).prefix(12)),
+            "previousSyncStatus": attachment.syncStatus.rawValue,
+            "dirty": attachment.syncStatus == .dirty || attachment.isPendingSync,
+            "jotFileExists": FileManager.default.fileExists(atPath: jotSessionID(for: attachment.key)),
+            "conflictCopyExists": cacheStore.hasUsableConflictCopy(forOriginalKey: attachment.key, userID: userID)
+        ]
+        JottreDiagnostics.shared.record("zotero.forceRestore.requested", details: details)
+    }
+
+    /// Explicit user-approved restore. This is intentionally separate from
+    /// ordinary open/sync and never uploads the resulting remote version.
+    func restoreRemoteVersion(_ selectedAttachment: ZoteroAttachment) async throws -> [URL] {
+        guard restoringAttachmentKey == nil else { throw ZoteroCacheStore.Failure.remoteRestoreAlreadyRunning }
+        guard !userID.isEmpty, !apiKey.isEmpty else { throw ZoteroCacheStore.Failure.remoteRestoreMissingCredentials }
+        guard ZoteroSyncService.isValidKey(selectedAttachment.key) else {
+            throw ZoteroSyncService.Failure.invalidKey
+        }
+        let key = selectedAttachment.key
+        guard let attachment = cacheStore.load(userID: userID).attachments[key],
+              attachment.contentType.lowercased() == "application/pdf",
+              !attachment.isLocalOnly, !attachment.isConflict else {
+            throw ZoteroCacheStore.Failure.attachmentNotFound
+        }
+        let gate = ZoteroEditingSessionGate.shared
+        guard await gate.beginSynchronization() else {
+            throw ZoteroCacheStore.Failure.remoteRestoreBlockedByActiveEditor
+        }
+        restoringAttachmentKey = key
+        defer {
+            Task { @MainActor [weak self] in
+                await gate.endSynchronization()
+                self?.restoringAttachmentKey = nil
+            }
+        }
+
+        let context = ZoteroDownloadContext(
+            source: .conflictResolution,
+            requestID: remoteRestoreRequestIDs.removeValue(forKey: key)
+        )
+        let anonymousKey = String(ZoteroSyncService.md5Hex(Data(key.utf8)).prefix(12))
+        var stage = "backup"
+        var backup: ZoteroRemoteRestoreBackupReceipt?
+        var downloadedBytes = 0
+        var httpStatus: Int?
+        var details: [String: Any] = context.eventDetails
+        details["attachmentID"] = anonymousKey
+        details["previousSyncStatus"] = attachment.syncStatus.rawValue
+        details["dirty"] = attachment.syncStatus == .dirty || attachment.isPendingSync
+        details["jotFileExists"] = FileManager.default.fileExists(atPath: jotSessionID(for: key))
+        details["conflictCopyExists"] = cacheStore.hasUsableConflictCopy(forOriginalKey: key, userID: userID)
+        JottreDiagnostics.shared.record("zotero.forceRestore.confirmed", details: details)
+        JottreDiagnostics.shared.record("zotero.forceRestore.backupStarted", details: details)
+        do {
+            let jotURL = URL(fileURLWithPath: jotSessionID(for: key))
+            backup = try cacheStore.createRemoteRestoreBackup(
+                key: key,
+                userID: userID,
+                additionalLocalURLs: [jotURL, pdfCacheURL(for: key)]
+            )
+            remoteRestoreBackupURLs = backup?.backupURLs
+            details["backupSucceeded"] = true
+            details["backupFileCount"] = backup?.backupURLs.count ?? 0
+            details["backupID"] = backup?.directoryURL.lastPathComponent
+            JottreDiagnostics.shared.record("zotero.forceRestore.backupCompleted", details: details)
+
+            stage = "remoteMetadata"
+            let remoteState = try await ZoteroAPIClient(apiKey: apiKey, userID: userID)
+                .fetchAttachmentRemoteState(key: key)
+            details["remoteVersion"] = remoteState.version
+            details["remoteMD5Available"] = remoteState.md5 != nil
+
+            stage = "webDAVDownload"
+            JottreDiagnostics.shared.record("zotero.forceRestore.downloadStarted", details: details)
+            let remoteData = try await makeSyncService().download(
+                documentID: key,
+                context: context,
+                expectedRemoteMD5: remoteState.md5
+            )
+            downloadedBytes = remoteData.count
+            let hasEmbeddedJot = HybridPDFManager.embeddedJotData(in: remoteData) != nil
+            let unpacked = try? HybridPDFManager.load(data: remoteData)
+            guard !hasEmbeddedJot || unpacked != nil else {
+                throw ZoteroSyncService.Failure.invalidHybridPDF
+            }
+            let sourcePDF = unpacked?.pdfData ?? HybridPDFManager.pdfData(in: remoteData)
+            guard isValidEditorPDFData(sourcePDF) else { throw ZoteroSyncService.Failure.invalidPDF }
+            details["byteCount"] = remoteData.count
+            details["pdfValid"] = true
+            JottreDiagnostics.shared.record("zotero.forceRestore.validationCompleted", details: details)
+
+            stage = "localInstall"
+            let restoredJot = Jot(
+                drawing: unpacked?.jot.drawing ?? Jot.makeEmpty().drawing,
+                width: unpacked?.jot.width ?? Jot.defaultWidth,
+                pdfData: sourcePDF,
+                extraPages: unpacked?.jot.extraPages ?? 0,
+                pdfInsertedPageSlots: unpacked?.jot.pdfInsertedPageSlots ?? [],
+                strokePageIndices: unpacked?.jot.strokePageIndices ?? [],
+                trashedPages: unpacked?.jot.trashedPages ?? [],
+                zoteroItemKey: key,
+                zoteroFileName: attachment.filename
+            )
+            let encoder = PropertyListEncoder()
+            encoder.outputFormat = .binary
+            let jotData = try encoder.encode(restoredJot)
+            let installedSnapshot = try cacheStore.installRemoteVersionAfterExplicitRestore(
+                key: key,
+                data: remoteData,
+                jotData: jotData,
+                jotURL: jotURL,
+                userID: userID,
+                cacheMD5: ZoteroSyncService.md5Hex(remoteData),
+                remotePDFMD5: remoteState.md5 ?? ZoteroSyncService.md5Hex(sourcePDF),
+                remoteVersion: remoteState.version,
+                backup: try requireBackup(backup)
+            )
+            snapshot = installedSnapshot
+            details["cacheInstalled"] = true
+            details["finalStatus"] = installedSnapshot.attachments[key]?.syncStatus.rawValue
+            JottreDiagnostics.shared.record("zotero.forceRestore.cacheInstalled", details: details)
+            JottreDiagnostics.shared.record("zotero.forceRestore.completed", details: details)
+            NotificationCenter.default.post(name: .zoteroAttachmentCacheChanged, object: key)
+            return try requireBackup(backup).backupURLs
+        } catch {
+            if case WebDAVService.Failure.unexpectedResponse(let status) = error { httpStatus = status }
+            details["stage"] = stage
+            if let httpStatus { details["httpStatus"] = httpStatus }
+            details["downloadedBytes"] = downloadedBytes
+            details["errorType"] = String(reflecting: type(of: error))
+            details["errorDomain"] = (error as NSError).domain
+            details["errorCode"] = (error as NSError).code
+            details["backupSucceeded"] = backup != nil
+            if stage == "webDAVDownload" {
+                JottreDiagnostics.shared.record("zotero.forceRestore.downloadFailed", details: details)
+            }
+            JottreDiagnostics.shared.record("zotero.forceRestore.failed", details: details)
+            throw error
+        }
+    }
+
+    private func requireBackup(_ backup: ZoteroRemoteRestoreBackupReceipt?) throws -> ZoteroRemoteRestoreBackupReceipt {
+        guard let backup else { throw ZoteroCacheStore.Failure.remoteRestoreBackupFailed }
+        return backup
+    }
+
     private func isOrderedBefore(_ lhs: ZoteroAttachment, _ rhs: ZoteroAttachment) -> Bool {
         switch sortOrder {
         case .title:
@@ -1404,6 +1573,23 @@ private final class ZoteroLibraryViewModel: ObservableObject {
                     stageOverride: failureStage
                 )
             }
+            if !wasCancelled, downloadContext == nil, failureStage == "hybridPDFValidation" {
+                try? cacheStore.recordPendingSyncError(
+                    key: currentAttachment.key,
+                    message: "Could not download or open the PDF.",
+                    userID: userID
+                )
+                snapshot = cacheStore.load(userID: userID)
+                JottreDiagnostics.shared.record("zotero.recovery.localValidationFailed", details: [
+                    "attachmentID": String(ZoteroSyncService.md5Hex(Data(currentAttachment.key.utf8)).prefix(12)),
+                    "previousSyncStatus": currentAttachment.syncStatus.rawValue,
+                    "syncErrorPresent": currentAttachment.syncError != nil,
+                    "localFileValid": cacheStore.hasUsableLocalFile(for: currentAttachment),
+                    "dirty": currentAttachment.syncStatus == .dirty || currentAttachment.isPendingSync,
+                    "conflictCopyExists": cacheStore.hasUsableConflictCopy(forOriginalKey: currentAttachment.key, userID: userID),
+                    "reason": "PDFKitOrHybridJotValidationFailed"
+                ])
+            }
             await endEditingSession(sessionID: sessionID, requestSynchronization: !wasCancelled)
             if !wasCancelled {
                 errorMessage = String(localized: "zotero.error.openPDF")
@@ -1538,6 +1724,9 @@ struct ZoteroLibraryView: View {
     @State private var pendingTrashKeys = Set<String>()
     @State private var showingTrashConfirmation = false
     @State private var resolvingConflict: ZoteroAttachment?
+    @State private var pendingRemoteRestore: ZoteroAttachment?
+    @State private var remoteRestoreBackupURLs: [URL]?
+    @State private var showingRemoteRestoreBackupShare = false
 
     init(
         cacheStore: ZoteroCacheStore,
@@ -1763,13 +1952,51 @@ struct ZoteroLibraryView: View {
                 ? "zotero.document.deletePermanently.confirmMessage"
                 : "zotero.document.trash.confirmMessage"))
         }
+        .confirmationDialog(
+            String(localized: "zotero.forceRestore.confirm.title", defaultValue: "원격 버전으로 복구하시겠습니까?"),
+            isPresented: Binding(
+                get: { pendingRemoteRestore != nil },
+                set: { if !$0 { pendingRemoteRestore = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            if let attachment = pendingRemoteRestore {
+                Button(String(localized: "zotero.forceRestore.confirm.action", defaultValue: "원격 버전으로 복구"), role: .destructive) {
+                    pendingRemoteRestore = nil
+                    Task {
+                        do {
+                            remoteRestoreBackupURLs = try await model.restoreRemoteVersion(attachment)
+                            creationNotice = String(localized: "zotero.forceRestore.success", defaultValue: "원격 PDF를 복구했습니다. 백업은 공유하거나 보관할 수 있습니다.")
+                        } catch {
+                            remoteRestoreBackupURLs = model.remoteRestoreBackupURLs
+                            creationNotice = error.localizedDescription
+                        }
+                    }
+                }
+                .disabled(model.restoringAttachmentKey != nil || model.isSyncing)
+            }
+            Button(String(localized: "action.cancel"), role: .cancel) { pendingRemoteRestore = nil }
+        } message: {
+            Text(String(localized: "zotero.forceRestore.confirm.message", defaultValue: "서버에 저장된 PDF를 다시 다운로드하여 현재 로컬 버전을 대체합니다. 서버에 동기화되지 않은 필기나 수정 내용은 현재 문서에 표시되지 않을 수 있습니다. 복구 가능한 로컬 데이터는 별도 백업으로 보존합니다."))
+        }
         .alert("Zotero", isPresented: Binding(
             get: { creationNotice != nil },
             set: { if !$0 { creationNotice = nil } }
         )) {
+            if remoteRestoreBackupURLs != nil {
+                Button(String(localized: "zotero.forceRestore.shareBackup", defaultValue: "로컬 백업 공유")) {
+                    creationNotice = nil
+                    showingRemoteRestoreBackupShare = true
+                }
+            }
             Button(String(localized: "action.ok"), role: .cancel) { creationNotice = nil }
         } message: {
             Text(creationNotice ?? "")
+        }
+        .sheet(isPresented: $showingRemoteRestoreBackupShare) {
+            if let remoteRestoreBackupURLs {
+                ZoteroRestoreBackupShareSheet(items: remoteRestoreBackupURLs)
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: .zoteroAttachmentCacheChanged)) { _ in
             model.refreshCacheState()
@@ -2036,12 +2263,28 @@ struct ZoteroLibraryView: View {
                         .foregroundStyle(.orange)
                         .lineLimit(1)
                 }
-                if model.openingAttachmentKey == attachment.key { ProgressView() }
+                if model.openingAttachmentKey == attachment.key || model.restoringAttachmentKey == attachment.key {
+                    ProgressView()
+                }
             }
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .contextMenu { documentContextMenu(itemKey: selectionKey) }
+        .contextMenu {
+            documentContextMenu(itemKey: selectionKey)
+            if model.shouldOfferRemoteRestore(for: attachment) {
+                Button {
+                    model.recordRemoteRestoreRequest(for: attachment)
+                    pendingRemoteRestore = attachment
+                } label: {
+                    Label(
+                        String(localized: "zotero.forceRestore.menu", defaultValue: "원격 버전으로 복구"),
+                        systemImage: "arrow.clockwise.icloud"
+                    )
+                }
+                .disabled(model.restoringAttachmentKey != nil || model.isSyncing)
+            }
+        }
     }
 
     private func attachmentSelectionKey(_ attachment: ZoteroAttachment, groupKey: String) -> String {
@@ -2616,4 +2859,14 @@ private struct ZoteroCollectionPickerSheet: View {
 
 private extension ZoteroLibraryViewModel {
     func clearError() { errorMessage = nil }
+}
+
+private struct ZoteroRestoreBackupShareSheet: UIViewControllerRepresentable {
+    let items: [URL]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }
