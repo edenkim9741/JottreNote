@@ -40,6 +40,7 @@ final class EditJotViewModel {
     struct ScribbleEraseEvent: Sendable {
         let beforeDrawing: PKDrawing
         let result: Drawing
+        let pageIndex: Int
     }
 
     private struct StrokePageSignature: Equatable {
@@ -279,6 +280,15 @@ final class EditJotViewModel {
                 after: result,
                 previousDrawing: prev
             )
+            let scribblePageIndex: Int
+            if let strokePageIndices,
+                strokePageIndices.count == drawing.strokes.count,
+                drawing.strokes.count > prev.strokes.count {
+                scribblePageIndex = strokePageIndices[prev.strokes.count]
+            } else {
+                scribblePageIndex = changedPageIndices.sorted().first
+                    ?? (currentStrokePageIndices.last ?? 0)
+            }
             dirtyPageIndices.formUnion(changedPages(
                 from: prev,
                 oldPageIndices: priorIndices,
@@ -292,7 +302,8 @@ final class EditJotViewModel {
                         value: processed,
                         width: currentWidth,
                         strokePageIndices: currentStrokePageIndices
-                    )
+                    ),
+                    pageIndex: scribblePageIndex
                 )
             )
             schedulePersistence()

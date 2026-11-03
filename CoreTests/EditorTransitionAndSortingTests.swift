@@ -157,6 +157,45 @@ final class EditorTransitionAndSortingTests: XCTestCase {
         XCTAssertTrue(strokes.isEmpty, "Redo reapplies Scribble erasure last")
     }
 
+    func testScribbleUndoAndRedoRemainOnOriginatingPageManagerAfterPageChanges() {
+        let scribblePageUndoManager = UndoManager()
+        let newlyVisiblePageUndoManager = UndoManager()
+        scribblePageUndoManager.groupsByEvent = false
+        newlyVisiblePageUndoManager.groupsByEvent = false
+        var strokes = ["A"]
+
+        func register(from previous: [String], to next: [String], on manager: UndoManager) {
+            manager.beginUndoGrouping()
+            manager.registerUndo(withTarget: self) { _ in
+                strokes = previous
+                manager.registerUndo(withTarget: self) { _ in strokes = next }
+            }
+            manager.endUndoGrouping()
+            strokes = next
+        }
+
+        register(from: ["A"], to: ["A", "S"], on: scribblePageUndoManager)
+        register(from: ["A", "S"], to: [], on: scribblePageUndoManager)
+
+        XCTAssertFalse(newlyVisiblePageUndoManager.canUndo)
+        XCTAssertTrue(scribblePageUndoManager.canUndo)
+
+        // The view has moved to a different page, but the Scribble history
+        // must continue to use the manager that owned the originating canvas.
+        scribblePageUndoManager.undo()
+        XCTAssertEqual(strokes, ["A", "S"])
+        XCTAssertTrue(scribblePageUndoManager.canUndo)
+
+        scribblePageUndoManager.undo()
+        XCTAssertEqual(strokes, ["A"])
+
+        scribblePageUndoManager.redo()
+        XCTAssertEqual(strokes, ["A", "S"])
+        scribblePageUndoManager.redo()
+        XCTAssertTrue(strokes.isEmpty)
+        XCTAssertFalse(newlyVisiblePageUndoManager.canUndo)
+    }
+
     func testDoubleTapFitTargetIsSelectedFromCurrentScale() {
         let portrait = JotCanvasZoomCoordinator.PageFitScales(shortSide: 1.4, longSide: 0.8)
 
