@@ -773,7 +773,10 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
     ) {
         guard let manager else { return }
         debugScribbleUndoState("register \(action) undo", pageIndex: pageIndex, manager: manager)
-        let shouldCreateGroup = !manager.isUndoing && !manager.isRedoing
+        let shouldCreateGroup = !manager.isUndoing && !manager.isRedoing && manager.groupingLevel == 0
+        if !manager.isUndoing && !manager.isRedoing && manager.groupingLevel > 0 {
+            debugScribbleUndoState("register \(action) inside enclosing group", pageIndex: pageIndex, manager: manager)
+        }
         if shouldCreateGroup {
             manager.beginUndoGrouping()
         }
@@ -862,16 +865,12 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
 
     private func restoreUndoManagerGroupingSettings() {
         for setting in undoManagerGroupingSettings.values {
-            guard setting.manager.groupingLevel == 0 else {
-                debugScribbleUndoState("grouping restore deferred; owned/external group still open", manager: setting.manager)
-                continue
-            }
+            // Restore only the property we changed; never close a group that
+            // might belong to PencilKit or another responder.
             setting.manager.groupsByEvent = setting.groupsByEvent
             debugScribbleUndoState("grouping policy restored", manager: setting.manager)
         }
-        undoManagerGroupingSettings = undoManagerGroupingSettings.filter {
-            $0.value.manager.groupingLevel != 0
-        }
+        undoManagerGroupingSettings.removeAll()
     }
 
     private func handleLoadingProgress(_ progress: Double?) {

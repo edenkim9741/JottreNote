@@ -7,8 +7,34 @@ import XCTest
 
 @MainActor
 final class EditorTransitionAndSortingTests: XCTestCase {
+    private final class UndoManagerHost: UIViewController {
+        let suppliedUndoManager = UndoManager()
+
+        override var undoManager: UndoManager? { suppliedUndoManager }
+    }
+
     private func overlay() -> JotPDFPageCanvasOverlay {
         JotPDFPageCanvasOverlay(canvas: JotCanvasView(), pageSize: CGSize(width: 600, height: 800))
+    }
+
+    private func makeUndoStroke(seed: UInt32) -> PKStroke {
+        let points = (0..<4).map { index in
+            PKStrokePoint(
+                location: CGPoint(x: CGFloat(index * 10), y: CGFloat(index * 7)),
+                timeOffset: Double(index) / 60,
+                size: CGSize(width: 4, height: 4),
+                opacity: 1,
+                force: 0.7,
+                azimuth: 0.2,
+                altitude: 1.1
+            )
+        }
+        var stroke = PKStroke(
+            ink: PKInk(.pen, color: .black),
+            path: PKStrokePath(controlPoints: points, creationDate: .distantPast)
+        )
+        stroke.randomSeed = seed
+        return stroke
     }
 
     func testPageOverlayIsConfiguredBeforeBeingReturnedToPDFKit() throws {
@@ -166,6 +192,70 @@ final class EditorTransitionAndSortingTests: XCTestCase {
         XCTAssertEqual(strokes, ["A", "B", "C", "S"], "Redo 4 restores Scribble")
         undoManager.redo()
         XCTAssertEqual(strokes, ["A", "C"], "Redo 5 reapplies Scribble erasure")
+    }
+
+    func testPencilKitCanvasDrawingIdentitySurvivesScribbleUndoTransitions() throws {
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 500, height: 700))
+        let host = UndoManagerHost()
+        let canvas = JotCanvasView(frame: window.bounds)
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        host.view.addSubview(canvas)
+        let undoManager = try XCTUnwrap(canvas.undoManager)
+        XCTAssertTrue(undoManager === host.suppliedUndoManager)
+
+        let previousGroupsByEvent = undoManager.groupsByEvent
+        undoManager.groupsByEvent = false
+        defer { undoManager.groupsByEvent = previousGroupsByEvent }
+
+        let a = makeUndoStroke(seed: 101)
+        let b = makeUndoStroke(seed: 102)
+        let c = makeUndoStroke(seed: 103)
+        let scribble = makeUndoStroke(seed: 104)
+
+        func register(from previous: [PKStroke], to next: [PKStroke]) {
+            let previousDrawing = PKDrawing(strokes: previous)
+            let nextDrawing = PKDrawing(strokes: next)
+            undoManager.beginUndoGrouping()
+            undoManager.registerUndo(withTarget: canvas) { target in
+                target.drawing = previousDrawing
+                undoManager.registerUndo(withTarget: target) { redoTarget in
+                    redoTarget.drawing = nextDrawing
+                }
+            }
+            undoManager.endUndoGrouping()
+            canvas.drawing = nextDrawing
+        }
+
+        func seeds() -> [UInt32] { canvas.drawing.strokes.map(\.randomSeed) }
+
+        register(from: [], to: [a])
+        register(from: [a], to: [a, b])
+        register(from: [a, b], to: [a, b, c])
+        register(from: [a, b, c], to: [a, b, c, scribble])
+        register(from: [a, b, c, scribble], to: [a, c])
+
+        undoManager.undo()
+        XCTAssertEqual(seeds(), [101, 102, 103, 104])
+        undoManager.undo()
+        XCTAssertEqual(seeds(), [101, 102, 103])
+        undoManager.undo()
+        XCTAssertEqual(seeds(), [101, 102])
+        undoManager.undo()
+        XCTAssertEqual(seeds(), [101])
+        undoManager.undo()
+        XCTAssertTrue(seeds().isEmpty)
+
+        undoManager.redo()
+        XCTAssertEqual(seeds(), [101])
+        undoManager.redo()
+        XCTAssertEqual(seeds(), [101, 102])
+        undoManager.redo()
+        XCTAssertEqual(seeds(), [101, 102, 103])
+        undoManager.redo()
+        XCTAssertEqual(seeds(), [101, 102, 103, 104])
+        undoManager.redo()
+        XCTAssertEqual(seeds(), [101, 103])
     }
 
     func testRapidSeparateInkGesturesUndoOneStrokeAtATime() {
