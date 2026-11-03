@@ -253,7 +253,7 @@ actor ZoteroEditingSessionGate {
     }
 
     /// Waits for an existing synchronization to release the gate, then acquires
-    /// it atomically on the main actor. Active editors still block the caller.
+    /// it atomically within the gate actor. Active editors still block the caller.
     func beginSynchronizationWhenAvailable() async -> Bool {
         while synchronizationInProgress {
             await withCheckedContinuation { synchronizationWaiters.append($0) }
