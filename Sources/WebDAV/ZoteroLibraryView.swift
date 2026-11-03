@@ -53,6 +53,23 @@ enum ZoteroAttachmentDisplayStatus: Equatable {
     }
 }
 
+enum ZoteroSyncTrigger: String {
+    case appLaunch, editorFinished, periodic, networkReconnect, manual, accountChanged
+}
+
+enum ZoteroSyncSchedule {
+    static let minimumAutomaticInterval: TimeInterval = 600
+
+    static func shouldRun(_ trigger: ZoteroSyncTrigger, lastAttempt: Date?, now: Date = Date()) -> Bool {
+        switch trigger {
+        case .appLaunch, .editorFinished, .manual, .accountChanged: return true
+        case .periodic, .networkReconnect:
+            guard let lastAttempt else { return true }
+            return now.timeIntervalSince(lastAttempt) >= minimumAutomaticInterval
+        }
+    }
+}
+
 enum ZoteroDownloadInstallTransaction {
     /// A committed cache is the durable recovery point. If the atomic Jot
     /// write fails, the next open rebuilds it from the validated cache.
@@ -67,7 +84,7 @@ enum ZoteroDownloadInstallTransaction {
 }
 
 @MainActor
-enum ZoteroLocalJotBaseline {
+enum ZoteroLocalJotBaselineValidator {
     static func matches(localJot: Jot, baselineData: Data) -> Bool {
         guard localJot.pdfData != nil,
               let localDrawing = try? PKDrawing(data: localJot.drawing) else { return false }
@@ -79,10 +96,6 @@ enum ZoteroLocalJotBaseline {
               localJot.pdfInsertedPageSlots == baselineJot.pdfInsertedPageSlots,
               localJot.strokePageIndices == baselineJot.strokePageIndices,
               localJot.trashedPages == baselineJot.trashedPages else { return false }
-
-        // PDFKit may rewrite equivalent PDF bytes. The Jot drawing and page
-        // metadata are the local edit state; the remote PDF hash is validated
-        // separately by ZoteroSyncService.
         return true
     }
 }
@@ -153,6 +166,9 @@ private final class ZoteroLibraryViewModel: ObservableObject {
     @Published private(set) var isSelecting = false
     @Published private(set) var selectedItemKeys = Set<String>()
     private var synchronizationRequestedWhileSyncing = false
+    private var lastSynchronizationAttempt: Date?
+    private var wasNetworkSatisfied = false
+    private var periodicSyncTask: Task<Void, Never>?
     private var remoteRestoreRequestIDs: [String: String] = [:]
 
     private(set) var userID: String
@@ -174,33 +190,61 @@ private final class ZoteroLibraryViewModel: ObservableObject {
         userID = defaults.getValue(.zoteroUserID) ?? ""
         apiKey = keychain.value(for: "zotero_api_key") ?? ""
         snapshot = cacheStore.load(userID: userID)
+        lastSynchronizationAttempt = UserDefaults.standard.object(forKey: "zotero.lastSyncAttempt.\(userID)") as? Date
         networkMonitor.pathUpdateHandler = { [weak self] path in
-            guard path.status == .satisfied else { return }
-            Task { @MainActor [weak self] in await self?.synchronize() }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let isSatisfied = path.status == .satisfied
+                let reconnected = isSatisfied && !self.wasNetworkSatisfied
+                self.wasNetworkSatisfied = isSatisfied
+                if reconnected { await self.synchronize(trigger: .networkReconnect) }
+            }
         }
         networkMonitor.start(queue: networkQueue)
-        if !userID.isEmpty, !apiKey.isEmpty { Task { await synchronize() } }
+        if !userID.isEmpty, !apiKey.isEmpty { Task { await synchronize(trigger: .appLaunch) } }
+        periodicSyncTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(60))
+                guard let self, UIApplication.shared.applicationState == .active else { continue }
+                await self.synchronize(trigger: .periodic)
+            }
+        }
     }
 
-    deinit { networkMonitor.cancel() }
+    deinit { networkMonitor.cancel(); periodicSyncTask?.cancel() }
 
-    func synchronize() async {
+    func synchronize(trigger: ZoteroSyncTrigger = .manual) async {
         guard !userID.isEmpty, !apiKey.isEmpty else { return }
+        let now = Date()
+        var requestDetails: [String: Any] = ["trigger": trigger.rawValue]
+        if let lastSynchronizationAttempt {
+            requestDetails["lastAttemptAgeSeconds"] = now.timeIntervalSince(lastSynchronizationAttempt)
+        }
+        JottreDiagnostics.shared.record("zotero.sync.requested", details: requestDetails)
+        guard ZoteroSyncSchedule.shouldRun(trigger, lastAttempt: lastSynchronizationAttempt, now: now) else {
+            JottreDiagnostics.shared.record("zotero.sync.skipped", details: ["trigger": trigger.rawValue, "reason": "minimumInterval"])
+            return
+        }
         guard !isSyncing else {
-            synchronizationRequestedWhileSyncing = true
-            print("[ZoteroSync] Coalesced a synchronization request while a sync is already running.")
+            if trigger == .editorFinished || trigger == .accountChanged { synchronizationRequestedWhileSyncing = true }
+            JottreDiagnostics.shared.record("zotero.sync.joined", details: ["trigger": trigger.rawValue, "followUpRequired": synchronizationRequestedWhileSyncing])
             return
         }
         isSyncing = true
+        let startedAt = Date()
+        lastSynchronizationAttempt = now
+        UserDefaults.standard.set(now, forKey: "zotero.lastSyncAttempt.\(userID)")
+        JottreDiagnostics.shared.record("zotero.sync.started", details: ["trigger": trigger.rawValue])
         defer {
             isSyncing = false
             if synchronizationRequestedWhileSyncing {
                 synchronizationRequestedWhileSyncing = false
-                Task { @MainActor [weak self] in await self?.synchronize() }
+                Task { @MainActor [weak self] in await self?.synchronize(trigger: .editorFinished) }
             }
         }
         let syncGate = ZoteroEditingSessionGate.shared
         guard await syncGate.beginSynchronization() else {
+            JottreDiagnostics.shared.record("zotero.sync.skipped", details: ["trigger": trigger.rawValue, "reason": "editingSessionOrGateBusy"])
             refreshCacheState()
             return
         }
@@ -232,13 +276,20 @@ private final class ZoteroLibraryViewModel: ObservableObject {
                     )
                 }
             )
+            guard syncUserID == userID else {
+                JottreDiagnostics.shared.record("zotero.sync.skipped", details: ["trigger": trigger.rawValue, "reason": "accountChangedDuringSync"])
+                await syncGate.endSynchronization()
+                return
+            }
             snapshot = synchronizedSnapshot
             if case .collection(let key) = selection, snapshot.collections[key] == nil {
                 selection = .myLibrary
             }
             errorMessage = nil
+            JottreDiagnostics.shared.record("zotero.sync.completed", details: ["trigger": trigger.rawValue, "durationMilliseconds": Date().timeIntervalSince(startedAt) * 1_000])
         } catch {
             errorMessage = String(localized: "zotero.error.librarySync")
+            JottreDiagnostics.shared.record("zotero.sync.failed", details: ["trigger": trigger.rawValue, "durationMilliseconds": Date().timeIntervalSince(startedAt) * 1_000, "errorDomain": (error as NSError).domain, "errorCode": (error as NSError).code])
         }
         await syncGate.endSynchronization()
     }
@@ -247,7 +298,8 @@ private final class ZoteroLibraryViewModel: ObservableObject {
         userID = defaults.getValue(.zoteroUserID) ?? ""
         apiKey = keychain.value(for: "zotero_api_key") ?? ""
         snapshot = cacheStore.load(userID: userID)
-        await synchronize()
+        lastSynchronizationAttempt = nil
+        await synchronize(trigger: .accountChanged)
     }
 
     func refreshCacheState() {
@@ -1111,10 +1163,21 @@ private final class ZoteroLibraryViewModel: ObservableObject {
             throw ZoteroCacheStore.Failure.attachmentNotFound
         }
         let gate = ZoteroEditingSessionGate.shared
-        guard await gate.beginSynchronization() else {
+        restoringAttachmentKey = key
+        let waitStartedAt = Date()
+        JottreDiagnostics.shared.record("zotero.syncGate.waitStarted", details: [
+            "operation": "remoteRestore",
+            "attachmentID": String(ZoteroSyncService.md5Hex(Data(key.utf8)).prefix(12))
+        ])
+        guard await gate.beginSynchronizationWhenAvailable() else {
+            restoringAttachmentKey = nil
             throw ZoteroCacheStore.Failure.remoteRestoreBlockedByActiveEditor
         }
-        restoringAttachmentKey = key
+        JottreDiagnostics.shared.record("zotero.syncGate.waitCompleted", details: [
+            "operation": "remoteRestore",
+            "attachmentID": String(ZoteroSyncService.md5Hex(Data(key.utf8)).prefix(12)),
+            "waitMilliseconds": Date().timeIntervalSince(waitStartedAt) * 1_000
+        ])
         defer {
             Task { @MainActor [weak self] in
                 await gate.endSynchronization()
@@ -1165,6 +1228,15 @@ private final class ZoteroLibraryViewModel: ObservableObject {
                 context: context,
                 expectedRemoteMD5: remoteState.md5
             )
+            stage = "remoteMetadataRevalidation"
+            let latestRemoteState = try await ZoteroAPIClient(apiKey: apiKey, userID: userID)
+                .fetchAttachmentRemoteState(key: key)
+            guard latestRemoteState.version == remoteState.version,
+                  latestRemoteState.md5?.lowercased() == remoteState.md5?.lowercased() else {
+                throw ZoteroDocumentSyncService.Failure.remoteVersionChanged
+            }
+            details["downloadVersion"] = remoteState.version
+            details["revalidatedVersion"] = latestRemoteState.version
             downloadedBytes = remoteData.count
             let hasEmbeddedJot = HybridPDFManager.embeddedJotData(in: remoteData) != nil
             let unpacked = try? HybridPDFManager.load(data: remoteData)
@@ -1501,6 +1573,27 @@ private final class ZoteroLibraryViewModel: ObservableObject {
                     snapshot = installedSnapshot
                     jotSaved = true
                 } catch {
+                    let nsError = error as NSError
+                    var details: [String: Any] = [
+                        "stage": "localJotRecoveryCacheCommit",
+                        "attachmentID": String(ZoteroSyncService.md5Hex(Data(currentAttachment.key.utf8)).prefix(12)),
+                        "jotPath": fileURL.path,
+                        "jotParentExists": FileManager.default.fileExists(atPath: fileURL.deletingLastPathComponent().path),
+                        "jotParentWritable": FileManager.default.isWritableFile(atPath: fileURL.deletingLastPathComponent().path),
+                        "errorDomain": nsError.domain,
+                        "errorCode": nsError.code
+                    ]
+                    if let cachePath = currentAttachment.localCachePath {
+                        let cacheURL = URL(fileURLWithPath: cachePath)
+                        details["cachePath"] = cacheURL.path
+                        details["cacheExists"] = FileManager.default.fileExists(atPath: cacheURL.path)
+                        details["cacheParentExists"] = FileManager.default.fileExists(atPath: cacheURL.deletingLastPathComponent().path)
+                    }
+                    if let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError {
+                        details["underlyingErrorDomain"] = underlying.domain
+                        details["underlyingErrorCode"] = underlying.code
+                    }
+                    JottreDiagnostics.shared.record("zotero.open.localRecoveryCommitFailed", details: details)
                     if !remoteCacheInstalled {
                         try? FileManager.default.removeItem(at: installedCacheURL)
                     }
@@ -1627,7 +1720,7 @@ private final class ZoteroLibraryViewModel: ObservableObject {
                 .readJotFile(jotFileInfo: info),
               file.jot.pdfData != nil else { return false }
 
-        return ZoteroLocalJotBaseline.matches(localJot: file.jot, baselineData: baselineData)
+        return ZoteroLocalJotBaselineValidator.matches(localJot: file.jot, baselineData: baselineData)
     }
 
     private func expectedRemoteMD5(for attachment: ZoteroAttachment) -> String? {
@@ -2003,9 +2096,10 @@ struct ZoteroLibraryView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
             model.refreshCacheState()
+            Task { await model.synchronize(trigger: .periodic) }
         }
         .onReceive(NotificationCenter.default.publisher(for: .zoteroEditorDidEnd)) { _ in
-            Task { await model.synchronize() }
+            Task { await model.synchronize(trigger: .editorFinished) }
         }
     }
 

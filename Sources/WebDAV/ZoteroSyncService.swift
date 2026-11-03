@@ -91,6 +91,7 @@ struct ZoteroSyncService: Sendable {
                     ]
                 )
                 archiveByteCount = archiveData.count
+                let archiveBytes = archiveData.count
                 currentStage = "zipExtraction"
                 let extractionStartedAt = Date()
                 Self.recordDownloadEvent("zotero.download.extractionStarted", context: context, stage: "zipExtraction", attempt: context.attempt)
@@ -153,16 +154,38 @@ struct ZoteroSyncService: Sendable {
                             )
                             throw Failure.invalidPDF
                         }
-                        let actualRemoteMD5 = Self.md5Hex(HybridPDFManager.pdfData(in: hybridData))
+                        // Zotero attachment `md5` describes the original PDF bytes in
+                        // the WebDAV ZIP. PDFKit/Hybrid restoration may serialize those
+                        // bytes differently, so validate the extracted source bytes.
+                        let actualRemoteMD5 = Self.md5Hex(standardPDF)
+                        Self.recordDownloadEvent(
+                            "zotero.download.metadataValidationStarted",
+                            context: context,
+                            stage: "remoteMetadataValidation",
+                            attempt: context.attempt,
+                            extra: [
+                                "verificationRepresentation": "extractedOriginalPDFBytes",
+                                "expectedMetadataMD5": (expectedRemoteMD5 as Any?) ?? NSNull(),
+                                "extractedPDFMD5": actualRemoteMD5,
+                                "restoredHybridPDFPayloadMD5": Self.md5Hex(HybridPDFManager.pdfData(in: hybridData)),
+                                "zipBytes": archiveBytes,
+                                "pdfBytes": standardPDF.count
+                            ]
+                        )
                         if let expectedRemoteMD5 = expectedRemoteMD5?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
                            !expectedRemoteMD5.isEmpty,
                            expectedRemoteMD5 != actualRemoteMD5 {
                             Self.recordDownloadEvent(
-                                "zotero.download.validationFailed",
+                                "zotero.download.metadataValidationFailed",
                                 context: context,
                                 stage: "remoteMetadataValidation",
                                 attempt: context.attempt,
-                                extra: ["failureReason": "downloadedPDFChecksumDoesNotMatchAttachmentMetadata"]
+                                extra: [
+                                    "failureReason": "downloadedPDFChecksumDoesNotMatchAttachmentMetadata",
+                                    "verificationRepresentation": "extractedOriginalPDFBytes",
+                                    "expectedMetadataMD5": expectedRemoteMD5,
+                                    "extractedPDFMD5": actualRemoteMD5
+                                ]
                             )
                             throw Failure.remoteDownloadMetadataMismatch
                         }

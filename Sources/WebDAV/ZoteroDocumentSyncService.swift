@@ -252,6 +252,17 @@ actor ZoteroEditingSessionGate {
         return true
     }
 
+    /// Waits for an existing synchronization to release the gate, then acquires
+    /// it atomically on the main actor. Active editors still block the caller.
+    func beginSynchronizationWhenAvailable() async -> Bool {
+        while synchronizationInProgress {
+            await withCheckedContinuation { synchronizationWaiters.append($0) }
+        }
+        guard editingSessions.isEmpty else { return false }
+        synchronizationInProgress = true
+        return true
+    }
+
     func endSynchronization() {
         synchronizationInProgress = false
         let waiters = synchronizationWaiters
