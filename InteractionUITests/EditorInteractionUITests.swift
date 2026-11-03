@@ -6,10 +6,11 @@ import UIKit
 final class EditorInteractionUITests: XCTestCase {
     override func setUpWithError() throws { continueAfterFailure = false }
 
-    private func launch(tool: String? = nil) -> XCUIApplication {
+    private func launch(tool: String? = nil, rotatedCrop: Bool = false) -> XCUIApplication {
         let app = XCUIApplication()
         app.launchArguments = ["-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
         app.launchEnvironment["JOTTRE_INTERACTION_TEST_TOOL"] = tool
+        app.launchEnvironment["JOTTRE_INTERACTION_TEST_ROTATED_CROP"] = rotatedCrop ? "1" : "0"
         app.launch()
         return app
     }
@@ -17,6 +18,18 @@ final class EditorInteractionUITests: XCTestCase {
     private func info(_ probe: XCUIElement) throws -> [String: Any] {
         let text = try XCTUnwrap(probe.value as? String)
         return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+    }
+
+    private func endpointDrift(
+        in state: [String: Any],
+        touchKey: String,
+        strokeKey: String
+    ) throws -> Double {
+        let touch = try XCTUnwrap(state[touchKey] as? [Double])
+        let stroke = try XCTUnwrap(state[strokeKey] as? [Double])
+        XCTAssertEqual(touch.count, 2)
+        XCTAssertEqual(stroke.count, 2)
+        return hypot(touch[0] - stroke[0], touch[1] - stroke[1])
     }
 
     private func point(_ app: XCUIApplication, info: [String: Any], x: Double, y: Double) throws -> XCUICoordinate {
@@ -356,6 +369,188 @@ final class EditorInteractionUITests: XCTestCase {
             after = try info(page)
         }
         XCTAssertGreaterThan(try XCTUnwrap(after["scaleFactor"] as? Double), before * 1.1)
+    }
+
+    func testSimulatorTouchInkStaysRegisteredFromOneToSixtyFourTimesZoom() async throws {
+        let app = launch(tool: "scribble-undo")
+        let page = app.staticTexts["editor.page.0"]
+        XCTAssertTrue(page.waitForExistence(timeout: 15))
+        let zoomButton = app.buttons["editor.test.zoomFactor"]
+        XCTAssertTrue(zoomButton.waitForExistence(timeout: 5))
+
+        let factors = [1.0, 2, 4, 8, 16, 32, 64]
+        var expectedStrokeCount = 0
+        for (factorIndex, factor) in factors.enumerated() {
+            zoomButton.tap()
+            var state = try info(page)
+            for _ in 0..<40 {
+                let ratio = try XCTUnwrap(state["scaleFactor"] as? Double)
+                    / (try XCTUnwrap(state["fitScaleFactor"] as? Double))
+                let drawingSize = try XCTUnwrap(state["drawingSize"] as? [Double])
+                let canvasZoom = try XCTUnwrap(state["canvasZoom"] as? Double)
+                let canvasScale = try XCTUnwrap(state["canvasRect"] as? [Double])[2] / drawingSize[0]
+                if abs(ratio - factor) < max(0.05, factor * 0.01), abs(canvasZoom - canvasScale) < 0.01 { break }
+                try await Task.sleep(for: .milliseconds(100))
+                state = try info(page)
+            }
+            state = try info(page)
+            let settledRatio = try XCTUnwrap(state["scaleFactor"] as? Double)
+                / (try XCTUnwrap(state["fitScaleFactor"] as? Double))
+            XCTAssertEqual(settledRatio, factor, accuracy: max(0.05, factor * 0.01),
+                "Fixture did not reach the requested zoom factor \(factor)x")
+
+            let pageValues = try XCTUnwrap(state["rect"] as? [Double])
+            let drawingSize = try XCTUnwrap(state["drawingSize"] as? [Double])
+            let settledCanvasRect = try XCTUnwrap(state["canvasRect"] as? [Double])
+            XCTContext.runActivity(named: "Pre-input geometry at \(factor)x") { activity in
+                activity.add(XCTAttachment(string: String(describing: state)))
+            }
+            let viewportTransform = try XCTUnwrap(state["viewportHostTransform"] as? [Double])
+            let effectiveScale = try XCTUnwrap(state["canvasZoom"] as? Double)
+                * viewportTransform[0]
+                * (try XCTUnwrap(state["measuredDisplayScale"] as? Double))
+            XCTAssertEqual(effectiveScale, settledCanvasRect[2] / drawingSize[0], accuracy: 0.01,
+                "Canvas and residual viewport scaling must compose to the PDF page scale at \(factor)x")
+            let pageRect = CGRect(x: pageValues[0], y: pageValues[1], width: pageValues[2], height: pageValues[3])
+            let visibleRect = pageRect.intersection(app.frame)
+            XCTAssertFalse(visibleRect.isNull || visibleRect.isEmpty, "No visible page at \(factor)x: \(pageRect)")
+            let startScreen: CGPoint
+            let endScreen: CGPoint
+            switch factorIndex % 3 {
+            case 0:
+                startScreen = CGPoint(x: visibleRect.minX + 100, y: visibleRect.minY + 300)
+                endScreen = CGPoint(x: visibleRect.minX + 220, y: visibleRect.minY + 300)
+            case 1:
+                startScreen = CGPoint(x: visibleRect.midX - 80, y: visibleRect.midY)
+                endScreen = CGPoint(x: visibleRect.midX + 80, y: visibleRect.midY)
+            default:
+                let lowerPageY = visibleRect.minY + visibleRect.height * 0.72
+                startScreen = CGPoint(x: visibleRect.maxX - 300, y: lowerPageY)
+                endScreen = CGPoint(x: visibleRect.maxX - 180, y: lowerPageY)
+            }
+            let start = app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: startScreen.x, dy: startScreen.y))
+            let end = app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: endScreen.x, dy: endScreen.y))
+            start.press(forDuration: 0.01, thenDragTo: end)
+            expectedStrokeCount += 1
+            state = try await waitForDrawing(page, count: expectedStrokeCount)
+
+            let startError = try endpointDrift(
+                in: state, touchKey: "touchStartWindow", strokeKey: "lastStrokeStartWindow"
+            )
+            let endError = try endpointDrift(
+                in: state, touchKey: "touchEndWindow", strokeKey: "lastStrokeEndWindow"
+            )
+            let reportedStartErrorPixels = try XCTUnwrap(state["lastStrokeStartErrorPixels"] as? Double)
+            let screenScale = try XCTUnwrap(state["screenScale"] as? Double)
+            XCTAssertEqual(reportedStartErrorPixels, startError * screenScale, accuracy: 0.1,
+                "Fixture and controller must compare the same touch-to-stroke endpoints")
+            print("[ZoomCoordinate] requested=\(factor)x touchToStrokeStart=\(startError)pt touchToStrokeEnd=\(endError)pt")
+            XCTContext.runActivity(named: "Actual finger ink at \(factor)x") { activity in
+                activity.add(XCTAttachment(string: "state=\(state)\nstartErrorPixels=\(startError)\nendErrorPixels=\(endError)"))
+            }
+            XCTAssertLessThan(startError, 12, "Touch-to-stroke start drifted by \(startError) screen points at \(factor)x")
+            XCTAssertLessThan(endError, 12, "Touch-to-stroke end drifted by \(endError) screen points at \(factor)x")
+            let canvasRect = try XCTUnwrap(state["canvasRect"] as? [Double])
+            for index in 0..<4 {
+                XCTAssertEqual(canvasRect[index], pageValues[index], accuracy: 2)
+            }
+        }
+
+        // At the 32x stress point, compare the three independent UIScrollView
+        // state variants: automatic contentSize, natural contentOffset, and both.
+        for _ in 0..<5 { zoomButton.tap() } // 64x -> 1x -> 2x -> 4x -> 8x -> 16x
+        zoomButton.tap() // 32x
+        var state = try info(page)
+        for _ in 0..<40 {
+            let ratio = try XCTUnwrap(state["scaleFactor"] as? Double)
+                / (try XCTUnwrap(state["fitScaleFactor"] as? Double))
+            if abs(ratio - 32) < 0.32 { break }
+            try await Task.sleep(for: .milliseconds(100))
+            state = try info(page)
+        }
+        let settledRatio = try XCTUnwrap(state["scaleFactor"] as? Double)
+            / (try XCTUnwrap(state["fitScaleFactor"] as? Double))
+        XCTAssertEqual(settledRatio, 32, accuracy: 0.32)
+        let geometryButton = app.buttons["editor.test.geometryExperiment"]
+        XCTAssertTrue(geometryButton.waitForExistence(timeout: 5))
+        for expectedMode in 1...3 {
+            geometryButton.tap()
+            state = try info(page)
+            XCTAssertEqual(state["geometryExperimentMode"] as? Int, expectedMode)
+            let pageValues = try XCTUnwrap(state["rect"] as? [Double])
+            let pageRect = CGRect(x: pageValues[0], y: pageValues[1], width: pageValues[2], height: pageValues[3])
+            let visibleRect = pageRect.intersection(app.frame)
+            let startScreen = CGPoint(x: visibleRect.midX - 24, y: visibleRect.midY)
+            let endScreen = CGPoint(x: visibleRect.midX + 24, y: visibleRect.midY)
+            let start = app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: startScreen.x, dy: startScreen.y))
+            let end = app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: endScreen.x, dy: endScreen.y))
+            start.press(forDuration: 0.01, thenDragTo: end)
+            expectedStrokeCount += 1
+            state = try await waitForDrawing(page, count: expectedStrokeCount)
+            let startError = try endpointDrift(
+                in: state, touchKey: "touchStartWindow", strokeKey: "lastStrokeStartWindow"
+            )
+            let endError = try endpointDrift(
+                in: state, touchKey: "touchEndWindow", strokeKey: "lastStrokeEndWindow"
+            )
+            print("[ZoomCoordinate] geometryMode=\(expectedMode) requested=32x touchToStrokeStart=\(startError)pt touchToStrokeEnd=\(endError)pt")
+            XCTContext.runActivity(named: "32x geometry experiment \(expectedMode)") { activity in
+                activity.add(XCTAttachment(string: "state=\(state)\nstartErrorPixels=\(startError)\nendErrorPixels=\(endError)"))
+            }
+            XCTAssertLessThan(startError, 12, "Geometry experiment \(expectedMode) start drifted by \(startError) points")
+            XCTAssertLessThan(endError, 12, "Geometry experiment \(expectedMode) end drifted by \(endError) points")
+        }
+    }
+
+    func testRotatedPageWithNonzeroCropOriginKeepsHighZoomTouchCoordinatesRegistered() async throws {
+        let app = launch(tool: "scribble-undo", rotatedCrop: true)
+        let page = app.staticTexts["editor.page.0"]
+        XCTAssertTrue(page.waitForExistence(timeout: 15))
+        let zoomButton = app.buttons["editor.test.zoomFactor"]
+        XCTAssertTrue(zoomButton.waitForExistence(timeout: 5))
+        for _ in 0..<6 { zoomButton.tap() } // 1x -> 32x
+
+        var state = try info(page)
+        for _ in 0..<40 {
+            let ratio = try XCTUnwrap(state["scaleFactor"] as? Double)
+                / (try XCTUnwrap(state["fitScaleFactor"] as? Double))
+            if abs(ratio - 32) < 0.32 { break }
+            try await Task.sleep(for: .milliseconds(100))
+            state = try info(page)
+        }
+        state = try info(page)
+        let settledRatio = try XCTUnwrap(state["scaleFactor"] as? Double)
+            / (try XCTUnwrap(state["fitScaleFactor"] as? Double))
+        XCTAssertEqual(settledRatio, 32, accuracy: 0.32,
+            "Rotated crop fixture did not reach 32x")
+        XCTAssertEqual(state["pageRotation"] as? Int, 90)
+        let crop = try XCTUnwrap(state["cropBox"] as? [Double])
+        XCTAssertEqual(crop[0], 40, accuracy: 0.01)
+        XCTAssertEqual(crop[1], 60, accuracy: 0.01)
+
+        let pageValues = try XCTUnwrap(state["rect"] as? [Double])
+        let pageRect = CGRect(x: pageValues[0], y: pageValues[1], width: pageValues[2], height: pageValues[3])
+        let visibleRect = pageRect.intersection(app.frame)
+        XCTAssertFalse(visibleRect.isNull || visibleRect.isEmpty)
+        let startScreen = CGPoint(x: visibleRect.midX - 24, y: visibleRect.midY)
+        let endScreen = CGPoint(x: visibleRect.midX + 24, y: visibleRect.midY)
+        app.coordinate(withNormalizedOffset: .zero)
+            .withOffset(CGVector(dx: startScreen.x, dy: startScreen.y))
+            .press(forDuration: 0.01, thenDragTo: app.coordinate(withNormalizedOffset: .zero)
+                .withOffset(CGVector(dx: endScreen.x, dy: endScreen.y)))
+        state = try await waitForDrawing(page, count: 1)
+        let startError = try endpointDrift(
+            in: state, touchKey: "touchStartWindow", strokeKey: "lastStrokeStartWindow"
+        )
+        let endError = try endpointDrift(
+            in: state, touchKey: "touchEndWindow", strokeKey: "lastStrokeEndWindow"
+        )
+        print("[ZoomCoordinate] rotatedCrop=90deg requested=32x touchToStrokeStart=\(startError)pt touchToStrokeEnd=\(endError)pt")
+        XCTContext.runActivity(named: "Rotated crop geometry at 32x") { activity in
+            activity.add(XCTAttachment(string: "state=\(state)\nstartError=\(startError)\nendError=\(endError)"))
+        }
+        XCTAssertLessThan(startError, 12, "Rotated crop start drifted by \(startError); state=\(state)")
+        XCTAssertLessThan(endError, 12, "Rotated crop end drifted by \(endError); state=\(state)")
     }
 
     func testBlankNoteKeepsPencilKitDrawingAndSuppressesRepeatedFingerEditMenus() async throws {

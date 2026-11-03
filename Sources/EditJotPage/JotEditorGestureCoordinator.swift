@@ -281,6 +281,40 @@ final class JotPDFView: PDFView {
 }
 
 final class JotCanvasView: PKCanvasView {
+#if DEBUG
+    private(set) var diagnosticTouchStartInWindow: CGPoint?
+    private(set) var diagnosticTouchEndInWindow: CGPoint?
+    private(set) var diagnosticStrokeCountAtTouchStart = 0
+
+    func resetDiagnosticTouches() {
+        diagnosticTouchStartInWindow = nil
+        diagnosticTouchEndInWindow = nil
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if let touch = touches.first, let window {
+            diagnosticTouchStartInWindow = touch.location(in: window)
+            diagnosticTouchEndInWindow = diagnosticTouchStartInWindow
+            diagnosticStrokeCountAtTouchStart = drawing.strokes.count
+        }
+        super.touchesBegan(touches, with: event)
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if let touch = touches.first, let window {
+            diagnosticTouchEndInWindow = touch.location(in: window)
+        }
+        super.touchesMoved(touches, with: event)
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if let touch = touches.first, let window {
+            diagnosticTouchEndInWindow = touch.location(in: window)
+        }
+        super.touchesEnded(touches, with: event)
+    }
+#endif
+
     var firstResponderInHierarchy: UIResponder? {
         func firstResponder(in view: UIView) -> UIResponder? {
             if view.isFirstResponder { return view }

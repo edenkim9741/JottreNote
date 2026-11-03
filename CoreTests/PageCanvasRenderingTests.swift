@@ -71,6 +71,31 @@ final class PageCanvasRenderingTests: XCTestCase {
         }
     }
 
+    func testCanvasZoomLimitKeepsHighMagnificationRegisteredThroughViewportTransform() {
+        let pageSize = CGSize(width: 600, height: 800)
+        let canvas = PKCanvasView()
+        let overlay = JotPDFPageCanvasOverlay(canvas: canvas, pageSize: pageSize)
+        let pageHost = UIView(frame: CGRect(origin: .zero, size: pageSize))
+        pageHost.addSubview(overlay)
+        overlay.transform = CGAffineTransform(scaleX: 64, y: 64)
+        overlay.configure(displayScale: 64)
+        overlay.layoutIfNeeded()
+
+        XCTAssertLessThanOrEqual(canvas.zoomScale, canvas.maximumZoomScale)
+        XCTAssertEqual(
+            canvas.zoomScale * overlay.viewportHostTransform.a * overlay.displayScale,
+            pageSize.width * 64 / overlay.drawingSize.width,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            canvas.convert(canvas.bounds, to: pageHost).width,
+            pageSize.width * 64,
+            accuracy: 0.01
+        )
+        XCTAssertEqual(canvas.contentOffset, .zero)
+        XCTAssertEqual(canvas.transform, .identity)
+    }
+
     func testZoomedPageDrawingStillRoundTripsThroughDocumentCoordinates() {
         let canvas = PKCanvasView()
         let overlay = JotPDFPageCanvasOverlay(canvas: canvas, pageSize: pageSize)

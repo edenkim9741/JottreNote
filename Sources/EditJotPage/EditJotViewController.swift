@@ -1579,6 +1579,7 @@ extension EditJotViewController: PKCanvasViewDelegate {
             #if DEBUG
             if let index = pageIndexByCanvas[ObjectIdentifier(canvas)] {
                 publishInteractionFixture(canvas: canvas, pageIndex: index)
+                recordCanvasTouchStart(canvas, pageIndex: index)
             }
             #endif
             toolUndoManager = canvasView.undoManager
@@ -1607,6 +1608,9 @@ extension EditJotViewController: PKCanvasViewDelegate {
             pageIndexByCanvas[ObjectIdentifier(canvas)] != nil
         {
             let pageIndex = pageIndexByCanvas[ObjectIdentifier(canvasView)]
+#if DEBUG
+            if let pageIndex { recordCommittedCanvasStroke(canvas, pageIndex: pageIndex) }
+#endif
             debugScribbleUndoState(
                 "tool stroke ended",
                 pageIndex: pageIndex,
@@ -1617,6 +1621,90 @@ extension EditJotViewController: PKCanvasViewDelegate {
             return
         }
     }
+
+#if DEBUG
+    private func recordCanvasTouchStart(_ canvas: JotCanvasView, pageIndex: Int) {
+        guard let window = view.window,
+              let point = canvas.diagnosticTouchStartInWindow,
+              let overlay = pageOverlays[pageIndex] else { return }
+        let touchInPDFView = pdfView.convert(point, from: window)
+        let touchInOverlay = overlay.convert(point, from: window)
+        let touchInPage = pdfView.document?.page(at: pageIndex).map {
+            pdfView.convert(touchInPDFView, to: $0)
+        }
+        let viewport = overlay.convert(overlay.bounds, to: window)
+        let canvasPoint = canvas.convert(point, from: window)
+        JottreDiagnostics.shared.record("canvas.touchBegan", details: [
+            "pageIndex": pageIndex,
+            "touchWindow": [point.x, point.y],
+            "touchPDFView": [touchInPDFView.x, touchInPDFView.y],
+            "touchPage": touchInPage.map { [$0.x, $0.y] } ?? [],
+            "touchOverlay": [touchInOverlay.x, touchInOverlay.y],
+            "touchCanvas": [canvasPoint.x, canvasPoint.y],
+            "pdfScaleFactor": pdfView.scaleFactor,
+            "measuredDisplayScale": overlay.displayScale,
+            "canvasZoomScale": canvas.zoomScale,
+            "canvasBounds": [canvas.bounds.width, canvas.bounds.height],
+            "contentSize": [canvas.contentSize.width, canvas.contentSize.height],
+            "contentOffset": [canvas.contentOffset.x, canvas.contentOffset.y],
+            "viewportTransform": [overlay.viewportHostTransform.a, overlay.viewportHostTransform.d],
+            "overlayBounds": [overlay.bounds.width, overlay.bounds.height],
+            "viewportOnScreen": [viewport.minX, viewport.minY, viewport.width, viewport.height]
+        ])
+    }
+
+    private func recordCommittedCanvasStroke(_ canvas: JotCanvasView, pageIndex: Int) {
+        guard let window = view.window,
+              let touchPoint = canvas.diagnosticTouchStartInWindow,
+              canvas.drawing.strokes.count > canvas.diagnosticStrokeCountAtTouchStart,
+              let overlay = pageOverlays[pageIndex],
+              let stroke = canvas.drawing.strokes.last,
+              overlay.bounds.width > 0, overlay.bounds.height > 0 else { return }
+        let overlayPoint = overlay.convert(touchPoint, from: window)
+        let touchInPDFView = pdfView.convert(touchPoint, from: window)
+        let page = pdfView.document?.page(at: pageIndex)
+        let touchInPage = page.map { pdfView.convert(touchInPDFView, to: $0) }
+        let expectedDrawingPoint = CGPoint(
+            x: overlayPoint.x * overlay.drawingSize.width / overlay.bounds.width,
+            y: overlayPoint.y * overlay.drawingSize.height / overlay.bounds.height
+        )
+        let strokePoint = stroke.path.first?.location.applying(stroke.transform) ?? .zero
+        let actualOverlayPoint = CGPoint(
+            x: strokePoint.x * overlay.bounds.width / overlay.drawingSize.width,
+            y: strokePoint.y * overlay.bounds.height / overlay.drawingSize.height
+        )
+        let actualWindowPoint = overlay.convert(actualOverlayPoint, to: window)
+        let screenError = hypot(actualWindowPoint.x - touchPoint.x, actualWindowPoint.y - touchPoint.y)
+            * window.screen.scale
+        let details: [String: Any] = [
+            "pageIndex": pageIndex,
+            "touchWindow": [touchPoint.x, touchPoint.y],
+            "touchEndWindow": canvas.diagnosticTouchEndInWindow.map { [$0.x, $0.y] } ?? [],
+            "touchPDFView": [touchInPDFView.x, touchInPDFView.y],
+            "touchPage": touchInPage.map { [$0.x, $0.y] } ?? [],
+            "touchOverlay": [overlayPoint.x, overlayPoint.y],
+            "expectedDrawingPoint": [expectedDrawingPoint.x, expectedDrawingPoint.y],
+            "actualStrokePoint": [strokePoint.x, strokePoint.y],
+            "screenErrorPixels": screenError,
+            "pdfScaleFactor": pdfView.scaleFactor,
+            "measuredDisplayScale": overlay.displayScale,
+            "canvasZoomScale": canvas.zoomScale,
+            "canvasBounds": [canvas.bounds.width, canvas.bounds.height],
+            "contentSize": [canvas.contentSize.width, canvas.contentSize.height],
+            "contentOffset": [canvas.contentOffset.x, canvas.contentOffset.y],
+            "viewportTransform": [overlay.viewportHostTransform.a, overlay.viewportHostTransform.d],
+            "overlayBounds": [overlay.bounds.width, overlay.bounds.height],
+            "pageRotation": page?.rotation ?? 0,
+            "cropBox": page.map { [$0.bounds(for: .cropBox).minX, $0.bounds(for: .cropBox).minY,
+                                    $0.bounds(for: .cropBox).width, $0.bounds(for: .cropBox).height] } ?? []
+        ]
+        JottreDiagnostics.shared.record("canvas.strokeCommitted", details: details)
+        if screenError > 2 {
+            JottreDiagnostics.shared.record("canvas.coordinateMismatch", details: details)
+        }
+        canvas.resetDiagnosticTouches()
+    }
+#endif
 
     private func flushPendingDrawingChange() {
         // Page callbacks commit synchronously to the model. Capture a final

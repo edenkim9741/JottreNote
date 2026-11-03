@@ -14,6 +14,10 @@ enum EditorInteractionFixture {
         return ["pen", "lasso", "blank-pen", "scribble-undo"].contains(value ?? "") ? value : nil
     }
 
+    private static var rotatesFixturePage: Bool {
+        ProcessInfo.processInfo.environment["JOTTRE_INTERACTION_TEST_ROTATED_CROP"] == "1"
+    }
+
     private(set) static var scribbleRecognitionCount = 0
     private(set) static var scribbleEraseApplicationCount = 0
     private(set) static var undoTrace: [String] = []
@@ -21,6 +25,9 @@ enum EditorInteractionFixture {
     private(set) static var fixtureRedoActionCount = 0
     private(set) static var customNoDrawingUndoCount = 0
     private(set) static var lastFixtureUndoState = "none"
+    private static var zoomBaseScales: [ObjectIdentifier: CGFloat] = [:]
+    private static var nextZoomStep = 0
+    private static let zoomFactors: [CGFloat] = [1, 2, 4, 8, 16, 32, 64]
 
     static func didRecognizeScribble() {
         guard tool == "scribble-undo" else { return }
@@ -56,6 +63,7 @@ enum EditorInteractionFixture {
         onCanvasOnlyMiddleRemoval: (() -> Void)? = nil
     ) {
         guard tool != nil else { return }
+        installZoomControls(in: host, pdfView: pdfView)
         if tool == "scribble-undo" {
             installUndoButton(in: host, identifier: "editor.test.undo", title: "Undo") { [weak canvas] in
                 guard let canvas, let manager = canvas.undoManager else { return }
@@ -141,6 +149,39 @@ enum EditorInteractionFixture {
             let currentPageIndex = pdfView.document.flatMap { document in
                 pdfView.currentPage.map { document.index(for: $0) }
             } ?? NSNotFound
+            let overlay = canvas.superview?.superview as? JotPDFPageCanvasOverlay
+            let lastStroke = canvas.drawing.strokes.last
+            let strokeStart = lastStroke?.path.first?.location.applying(lastStroke?.transform ?? .identity) ?? .zero
+            let strokeEnd = lastStroke?.path.last?.location.applying(lastStroke?.transform ?? .identity) ?? .zero
+            let diagnosticCanvas = canvas as? JotCanvasView
+            let touchStartWindow = diagnosticCanvas?.diagnosticTouchStartInWindow
+            let touchEndWindow = diagnosticCanvas?.diagnosticTouchEndInWindow
+            let strokeStartWindow: CGPoint? = overlay.flatMap { overlay in
+                guard overlay.drawingSize.width > 0, overlay.drawingSize.height > 0 else { return nil }
+                return overlay.convert(
+                    CGPoint(
+                        x: strokeStart.x * overlay.bounds.width / overlay.drawingSize.width,
+                        y: strokeStart.y * overlay.bounds.height / overlay.drawingSize.height
+                    ),
+                    to: window
+                )
+            }
+            let strokeEndWindow: CGPoint? = overlay.flatMap { overlay in
+                guard overlay.drawingSize.width > 0, overlay.drawingSize.height > 0 else { return nil }
+                return overlay.convert(
+                    CGPoint(
+                        x: strokeEnd.x * overlay.bounds.width / overlay.drawingSize.width,
+                        y: strokeEnd.y * overlay.bounds.height / overlay.drawingSize.height
+                    ),
+                    to: window
+                )
+            }
+            let startErrorPixels: CGFloat? = if let touchStartWindow, let strokeStartWindow {
+                hypot(strokeStartWindow.x - touchStartWindow.x, strokeStartWindow.y - touchStartWindow.y)
+                    * window.screen.scale
+            } else {
+                nil
+            }
             label.frame = host.convert(rect, from: window)
             let canvasMenuInteractions = editMenuInteractionDescriptions(in: canvas)
             let pdfMenuInteractions = editMenuInteractionDescriptions(in: pdfView)
@@ -159,7 +200,7 @@ enum EditorInteractionFixture {
                    canvasRect.minX, canvasRect.minY, canvasRect.width, canvasRect.height,
                    midX, pdfView.scaleFactor].allSatisfy(\.isFinite),
                 rect.width > 0, rect.height > 0 else { return nil }
-            let info: [String: Any] = [
+            var info: [String: Any] = [
                 "midX": midX,
                 "strokes": canvas.drawing.strokes.count,
                 "strokeSeeds": canvas.drawing.strokes.map(\.randomSeed),
@@ -186,6 +227,27 @@ enum EditorInteractionFixture {
                 "viewportRect": [viewportRect.minX, viewportRect.minY, viewportRect.width, viewportRect.height],
                 "canvasRect": [canvasRect.minX, canvasRect.minY, canvasRect.width, canvasRect.height],
                 "scaleFactor": pdfView.scaleFactor,
+                "fitScaleFactor": zoomBaseScales[ObjectIdentifier(pdfView)] ?? pdfView.scaleFactor,
+                "canvasZoom": canvas.zoomScale,
+                "minimumCanvasZoom": canvas.minimumZoomScale,
+                "maximumCanvasZoom": canvas.maximumZoomScale,
+                "canvasBounds": [canvas.bounds.width, canvas.bounds.height],
+                "contentSize": [canvas.contentSize.width, canvas.contentSize.height],
+                "contentOffset": [canvas.contentOffset.x, canvas.contentOffset.y],
+                "overlayBounds": [overlay?.bounds.width ?? 0, overlay?.bounds.height ?? 0],
+                "drawingSize": [overlay?.drawingSize.width ?? 0, overlay?.drawingSize.height ?? 0],
+                "measuredDisplayScale": overlay?.displayScale ?? 0,
+                "viewportHostTransform": [overlay?.viewportHostTransform.a ?? 0, overlay?.viewportHostTransform.d ?? 0],
+                "pageRotation": page.rotation,
+                "cropBox": rectArray(page.bounds(for: .cropBox)),
+                "lastStrokeStart": [strokeStart.x, strokeStart.y],
+                "lastStrokeEnd": [strokeEnd.x, strokeEnd.y],
+                "touchStartWindow": touchStartWindow.map { [$0.x, $0.y] } ?? [],
+                "touchEndWindow": touchEndWindow.map { [$0.x, $0.y] } ?? [],
+                "lastStrokeStartWindow": strokeStartWindow.map { [$0.x, $0.y] } ?? [],
+                "lastStrokeEndWindow": strokeEndWindow.map { [$0.x, $0.y] } ?? [],
+                "lastStrokeStartErrorPixels": startErrorPixels ?? -1,
+                "screenScale": window.screen.scale,
                 "currentPageIndex": currentPageIndex,
                 "tool": toolName,
                 "firstResponder": canvas.isFirstResponder,
@@ -200,12 +262,69 @@ enum EditorInteractionFixture {
                 "pdfEditMenuInteractions": pdfMenuInteractions,
                 "blankNoteFixture": tool == "blank-pen",
             ]
+#if DEBUG
+            info["geometryExperimentMode"] = JotPDFPageCanvasOverlay.geometryExperimentMode.rawValue
+#endif
             if let data = try? JSONSerialization.data(withJSONObject: info), let value = String(data: data, encoding: .utf8)
             {
                 return value
             }
             return nil
         }
+    }
+
+    private static func rectArray(_ rect: CGRect) -> [CGFloat] {
+        [rect.minX, rect.minY, rect.width, rect.height]
+    }
+
+    private static func installZoomControls(in host: UIView, pdfView: PDFView) {
+        guard !host.subviews.contains(where: { $0.accessibilityIdentifier == "editor.test.zoomFactor" }) else { return }
+        let viewID = ObjectIdentifier(pdfView)
+        zoomBaseScales[viewID] = max(pdfView.scaleFactor, 0.01)
+        nextZoomStep = 0
+        let button = UIButton(type: .system)
+        button.frame = CGRect(x: max(12, host.bounds.width - 120), y: 150, width: 108, height: 36)
+        button.setTitle("Next zoom", for: .normal)
+        button.backgroundColor = UIColor.systemBackground.withAlphaComponent(0.9)
+        button.accessibilityLabel = "Next zoom factor"
+        button.accessibilityIdentifier = "editor.test.zoomFactor"
+        button.addAction(UIAction { _ in
+            let factor = zoomFactors[nextZoomStep % zoomFactors.count]
+            nextZoomStep += 1
+            pdfView.autoScales = false
+            let fitScale = zoomBaseScales[viewID] ?? max(pdfView.scaleFactor, 0.01)
+            pdfView.minScaleFactor = min(pdfView.minScaleFactor, fitScale)
+            pdfView.maxScaleFactor = max(pdfView.maxScaleFactor, fitScale * 64)
+            pdfView.scaleFactor = fitScale * factor
+            pdfView.setNeedsLayout()
+            pdfView.layoutIfNeeded()
+        }, for: .touchUpInside)
+        host.addSubview(button)
+
+        let experimentButton = UIButton(type: .system)
+        experimentButton.frame = CGRect(x: max(12, host.bounds.width - 120), y: 194, width: 108, height: 36)
+        experimentButton.setTitle("Geometry mode", for: .normal)
+        experimentButton.backgroundColor = UIColor.systemBackground.withAlphaComponent(0.9)
+        experimentButton.accessibilityLabel = "Next canvas geometry experiment"
+        experimentButton.accessibilityIdentifier = "editor.test.geometryExperiment"
+        experimentButton.addAction(UIAction { _ in
+            Task { @MainActor in
+                let modes = JotCanvasGeometryExperimentMode.allCases
+                let next = (JotPDFPageCanvasOverlay.geometryExperimentMode.rawValue + 1) % modes.count
+                JotPDFPageCanvasOverlay.geometryExperimentMode = modes[next]
+                @MainActor func refresh(_ view: UIView) {
+                    if let overlay = view as? JotPDFPageCanvasOverlay {
+                        overlay.configure(in: pdfView, pdfScaleFactor: pdfView.scaleFactor)
+                        overlay.setNeedsLayout()
+                        overlay.layoutIfNeeded()
+                        return
+                    }
+                    for child in view.subviews { refresh(child) }
+                }
+                refresh(pdfView)
+            }
+        }, for: .touchUpInside)
+        host.addSubview(experimentButton)
     }
 
     private static func editMenuInteractionDescriptions(in root: UIView) -> [String] {
@@ -222,7 +341,7 @@ enum EditorInteractionFixture {
     static func makeDocument(using service: any JotFileServiceProtocol) throws -> JotFile.Info {
         let bounds = CGRect(x: 0, y: 0, width: 600, height: 800)
         let pageCount = tool == "scribble-undo" ? 1 : 2
-        let pdf = UIGraphicsPDFRenderer(bounds: bounds).pdfData { context in
+        let sourcePDF = UIGraphicsPDFRenderer(bounds: bounds).pdfData { context in
             for index in 0..<pageCount {
                 context.beginPage()
                 UIColor.white.setFill()
@@ -234,6 +353,16 @@ enum EditorInteractionFixture {
                     )
                 }
             }
+        }
+        let pdf: Data
+        if rotatesFixturePage,
+           let document = PDFDocument(data: sourcePDF),
+           let page = document.page(at: 0) {
+            page.setBounds(CGRect(x: 40, y: 60, width: 500, height: 700), for: .cropBox)
+            page.rotation = 90
+            pdf = document.dataRepresentation() ?? sourcePDF
+        } else {
+            pdf = sourcePDF
         }
         let initialStrokeCount = tool == "blank-pen" ? 1 : (tool == "scribble-undo" ? 0 : 2)
         let strokes = (0..<initialStrokeCount).map { index in
