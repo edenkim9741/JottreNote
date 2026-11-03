@@ -96,8 +96,7 @@ final class EditJotViewModel {
     let drawing: AsyncStream<Drawing>
     private let drawingContinuation: AsyncStream<Drawing>.Continuation
 
-    let scribbleEraseEvent: AsyncStream<ScribbleEraseEvent>
-    private let scribbleEraseContinuation: AsyncStream<ScribbleEraseEvent>.Continuation
+    var onScribbleErase: ((ScribbleEraseEvent) -> Void)?
 
     let background: AsyncStream<Background>
     private let backgroundContinuation: AsyncStream<Background>.Continuation
@@ -165,10 +164,6 @@ final class EditJotViewModel {
         )
         (drawing, drawingContinuation) = AsyncStream.makeStream(
             of: Drawing.self,
-            bufferingPolicy: .bufferingNewest(1)
-        )
-        (scribbleEraseEvent, scribbleEraseContinuation) = AsyncStream.makeStream(
-            of: ScribbleEraseEvent.self,
             bufferingPolicy: .bufferingNewest(1)
         )
         (background, backgroundContinuation) = AsyncStream.makeStream(
@@ -309,7 +304,7 @@ final class EditJotViewModel {
                 to: processed,
                 newPageIndices: currentStrokePageIndices
             ))
-            scribbleEraseContinuation.yield(
+            onScribbleErase?(
                 ScribbleEraseEvent(
                     previousDrawing: Drawing(
                         value: prev,
@@ -418,7 +413,6 @@ final class EditJotViewModel {
         loadingTask?.cancel()
         isEditingContinuation.finish()
         drawingContinuation.finish()
-        scribbleEraseContinuation.finish()
         backgroundContinuation.finish()
         showsBackButtonContinuation.finish()
         loadingProgressContinuation.finish()

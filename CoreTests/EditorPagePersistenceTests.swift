@@ -43,6 +43,29 @@ final class EditorPagePersistenceTests: XCTestCase {
         XCTAssertEqual(writes.first?.drawing.strokes.count, 1)
     }
 
+    func testScribbleEraseEventIsDeliveredSynchronouslyWithItsCommittedResult() async {
+        let repository = PagePersistenceRepository()
+        let model = await loadedModel(repository)
+        let base = scribbleTargetStroke()
+        model.didChangeDrawing(PKDrawing(strokes: [base]), strokePageIndices: [0], changedPageIndices: [0])
+
+        var deliveredEvent: EditJotViewModel.ScribbleEraseEvent?
+        model.onScribbleErase = { deliveredEvent = $0 }
+        let scribble = scribbleStroke()
+        model.didChangeDrawing(
+            PKDrawing(strokes: [base, scribble]),
+            strokePageIndices: [0, 0],
+            changedPageIndices: [0]
+        )
+
+        let event = deliveredEvent
+        XCTAssertNotNil(event, "The controller must receive Erase before a later pencil gesture can begin")
+        XCTAssertEqual(event?.previousDrawing.value.strokes.map(\.randomSeed), [base.randomSeed])
+        XCTAssertEqual(event?.scribbleDrawing.value.strokes.map(\.randomSeed), [base.randomSeed, scribble.randomSeed])
+        XCTAssertEqual(event?.result.value.strokes.map(\.randomSeed), [])
+        XCTAssertEqual(model.currentDrawing.strokes.map(\.randomSeed), [])
+    }
+
     func testQuietPeriodCreatesOnlyTheLatestSnapshot() async throws {
         let repository = PagePersistenceRepository()
         let model = await loadedModel(repository)
@@ -118,6 +141,47 @@ final class EditorPagePersistenceTests: XCTestCase {
             ink: PKInk(.pen, color: .black),
             path: PKStrokePath(controlPoints: points, creationDate: .distantPast)
         )
+    }
+
+    private func scribbleStroke() -> PKStroke {
+        let xPositions: [CGFloat] = [0, 100, 0, 100, 0]
+        let points = xPositions.enumerated().map { index, x in
+            PKStrokePoint(
+                location: CGPoint(x: x, y: 50),
+                timeOffset: Double(index) / 60,
+                size: CGSize(width: 3, height: 3),
+                opacity: 1,
+                force: 0.7,
+                azimuth: 0.3,
+                altitude: 1.2
+            )
+        }
+        var stroke = PKStroke(
+            ink: PKInk(.pen, color: .black),
+            path: PKStrokePath(controlPoints: points, creationDate: .distantPast)
+        )
+        stroke.randomSeed = 9_999
+        return stroke
+    }
+
+    private func scribbleTargetStroke() -> PKStroke {
+        let points = [20, 80].enumerated().map { index, x in
+            PKStrokePoint(
+                location: CGPoint(x: CGFloat(x), y: 50),
+                timeOffset: Double(index) / 60,
+                size: CGSize(width: 3, height: 3),
+                opacity: 1,
+                force: 0.7,
+                azimuth: 0.3,
+                altitude: 1.2
+            )
+        }
+        var stroke = PKStroke(
+            ink: PKInk(.pen, color: .black),
+            path: PKStrokePath(controlPoints: points, creationDate: .distantPast)
+        )
+        stroke.randomSeed = 9_998
+        return stroke
     }
 }
 
