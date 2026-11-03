@@ -296,6 +296,13 @@ final class EditJotViewModel {
                 scribblePageIndex = changedPageIndices.sorted().first
                     ?? (currentStrokePageIndices.last ?? 0)
             }
+            #if DEBUG
+            print(
+                "[InkUndo] Scribble recognized page=\(scribblePageIndex) " +
+                "before=\(prev.strokes.count) scribble=\(drawing.strokes.count) " +
+                "afterErase=\(processed.strokes.count)"
+            )
+            #endif
             dirtyPageIndices.formUnion(changedPages(
                 from: prev,
                 oldPageIndices: priorIndices,

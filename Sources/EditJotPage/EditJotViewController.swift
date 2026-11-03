@@ -49,6 +49,11 @@ private final class PersistentToolPickerAnchorView: UIView {
 @MainActor
 final class EditJotViewController: UIViewController, @preconcurrency PDFPageOverlayViewProvider {
 
+    private struct UndoManagerGroupingSetting {
+        let manager: UndoManager
+        let groupsByEvent: Bool
+    }
+
     #if !targetEnvironment(macCatalyst)
     private struct ToolSelection {
         let tool: any PKTool
@@ -108,6 +113,11 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
     private var toolUndoPageIndex: Int?
     private var scribbleUndoManagersByPage: [Int: UndoManager] = [:]
     private var activeScribbleUndoManager: UndoManager?
+    private var activeScribbleUndoPageIndex: Int?
+    private var undoManagerGroupingSettings: [ObjectIdentifier: UndoManagerGroupingSetting] = [:]
+    #if DEBUG
+    private var undoDebugSequence: UInt64 = 0
+    #endif
 
     #if !targetEnvironment(macCatalyst)
     private var didSelectInitialPenTool = false
@@ -174,27 +184,26 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
                 let undoManager = scribbleUndoManagersByPage.removeValue(forKey: event.pageIndex)
                     ?? pageCanvases[event.pageIndex]?.undoManager
                     ?? toolUndoManager
+                if let undoManager {
+                    useExplicitUndoGroups(for: undoManager)
+                }
                 activeScribbleUndoManager = undoManager
-                debugScribbleUndoState("erase event received page=\(event.pageIndex)", manager: undoManager)
-                consumePencilKitScribbleUndoIfPresent(event, manager: undoManager)
-                applyViewModelDrawing(event.scribbleDrawing)
-                registerDrawingUndo(
-                    snapshot: event.previousDrawing,
-                    inverse: event.scribbleDrawing,
-                    manager: undoManager
-                )
-
-                // UndoManager groups registrations made during one run-loop
-                // event together. Keep Scribble creation and Erase as two
-                // actual undo steps by committing Erase in the next event.
-                try? await Task.sleep(for: .milliseconds(20))
+                activeScribbleUndoPageIndex = event.pageIndex
+                debugScribbleUndoState("Scribble erase event delivered", pageIndex: event.pageIndex, manager: undoManager)
+                if toolUndoGroupManager === undoManager {
+                    endToolUndoGroup()
+                }
+                applyViewModelDrawing(event.result)
+                // The Scribble stroke remains the PencilKit tool-group action.
+                // Register only Erase here so the stroke is not duplicated.
                 registerDrawingUndo(
                     snapshot: event.scribbleDrawing,
                     inverse: event.result,
-                    manager: undoManager
+                    manager: undoManager,
+                    pageIndex: event.pageIndex,
+                    action: "Scribble erase"
                 )
-                applyViewModelDrawing(event.result)
-                debugScribbleUndoState("erase applied page=\(event.pageIndex)", manager: undoManager)
+                debugScribbleUndoState("Scribble erase applied", pageIndex: event.pageIndex, manager: undoManager)
             }
         }
         backButtonTask = Task { @MainActor [weak self] in
@@ -330,6 +339,8 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
             overlays: pageOverlays
         )
         flushPendingDrawingChange()
+        endToolUndoGroup()
+        restoreUndoManagerGroupingSettings()
         saveScrollPosition()
         Task { @MainActor [viewModel] in await viewModel.didDisappear() }
         #if !targetEnvironment(macCatalyst)
@@ -711,9 +722,9 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
               isEditingEnabled,
               let undoManager = inkUndoManager,
               undoManager.canUndo else { return }
-        debugScribbleUndoState("two finger undo", manager: undoManager)
+        debugScribbleUndoState("two finger undo invoked", pageIndex: currentPDFPageIndex, manager: undoManager)
         undoManager.undo()
-        debugScribbleUndoState("two finger undo completed", manager: undoManager)
+        debugScribbleUndoState("two finger undo completed", pageIndex: currentPDFPageIndex, manager: undoManager)
     }
 
     private func updatePageOverlayRendererZoom() {
@@ -756,11 +767,21 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
     private func registerDrawingUndo(
         snapshot: EditJotViewModel.Drawing,
         inverse: EditJotViewModel.Drawing,
-        manager: UndoManager?
+        manager: UndoManager?,
+        pageIndex: Int? = nil,
+        action: String = "drawing"
     ) {
-        debugScribbleUndoState("register drawing undo", manager: manager)
-        manager?.registerUndo(withTarget: self) { target in
+        guard let manager else { return }
+        debugScribbleUndoState("register \(action) undo", pageIndex: pageIndex, manager: manager)
+        let shouldCreateGroup = !manager.isUndoing && !manager.isRedoing
+        if shouldCreateGroup {
+            manager.beginUndoGrouping()
+        }
+        manager.registerUndo(withTarget: self) { target in
             target.applyDrawingUndo(snapshot, inverse: inverse, manager: manager)
+        }
+        if shouldCreateGroup {
+            manager.endUndoGrouping()
         }
     }
 
@@ -776,61 +797,81 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
             strokePageIndices: snapshot.strokePageIndices,
             detectsScribbleErase: false
         )
-        registerDrawingUndo(snapshot: inverse, inverse: snapshot, manager: manager)
-        debugScribbleUndoState("apply drawing undo end", manager: manager)
+        registerDrawingUndo(
+            snapshot: inverse,
+            inverse: snapshot,
+            manager: manager,
+            pageIndex: snapshot.strokePageIndices.last,
+            action: "undo/redo inverse"
+        )
+        debugScribbleUndoState(
+            "apply drawing undo end",
+            pageIndex: snapshot.strokePageIndices.last,
+            manager: manager
+        )
     }
 
     #if DEBUG
-    private func debugScribbleUndoState(_ operation: String, manager: UndoManager?) {
+    private func debugScribbleUndoState(
+        _ operation: String,
+        pageIndex: Int? = nil,
+        manager: UndoManager?
+    ) {
+        undoDebugSequence &+= 1
         let identity = manager.map { String(describing: ObjectIdentifier($0)) } ?? "nil"
         print(
-            "[ScribbleUndo] \(operation) manager=\(identity) " +
+            "[InkUndo #\(undoDebugSequence)] \(operation) page=\(pageIndex.map(String.init) ?? "unknown") " +
+            "manager=\(identity) strokes=\(inkCanvasCoordinator.committedDrawing.strokes.count) " +
             "canUndo=\(manager?.canUndo ?? false) canRedo=\(manager?.canRedo ?? false) " +
             "groupingLevel=\(manager?.groupingLevel ?? -1) " +
             "isUndoing=\(manager?.isUndoing ?? false) isRedoing=\(manager?.isRedoing ?? false)"
         )
     }
 #else
-    private func debugScribbleUndoState(_ operation: String, manager: UndoManager?) {}
+    private func debugScribbleUndoState(
+        _ operation: String,
+        pageIndex: Int? = nil,
+        manager: UndoManager?
+    ) {}
 #endif
 
-    private func consumePencilKitScribbleUndoIfPresent(
-        _ event: EditJotViewModel.ScribbleEraseEvent,
-        manager: UndoManager?
-    ) {
-        guard let manager, manager.canUndo,
-            let canvas = pageCanvases[event.pageIndex]
-        else {
-            debugScribbleUndoState("native scribble undo unavailable", manager: manager)
-            return
+    private var inkUndoManager: UndoManager? {
+        if let toolUndoManager { return toolUndoManager }
+        guard let currentPDFPageIndex else { return nil }
+        if activeScribbleUndoPageIndex == currentPDFPageIndex,
+            let activeScribbleUndoManager {
+            return activeScribbleUndoManager
         }
+        return pageCanvases[currentPDFPageIndex]?.undoManager
 
-        let overlaySize = pageOverlays[event.pageIndex]?.drawingSize ?? currentPageSize
-        let expectedBefore = localDrawing(
-            from: event.previousDrawing.value,
-            pageIndices: event.previousDrawing.strokePageIndices,
-            pageIndex: event.pageIndex,
-            overlaySize: overlaySize
-        )
-        let wasApplyingOverlayDrawing = isApplyingOverlayDrawing
-        isApplyingOverlayDrawing = true
-        manager.undo()
-        let consumedScribbleUndo = JotEditorDrawingState.drawingsMatch(canvas.drawing, expectedBefore)
-        if !consumedScribbleUndo, manager.canRedo {
-            manager.redo()
-        }
-        isApplyingOverlayDrawing = wasApplyingOverlayDrawing
-        debugScribbleUndoState(
-            consumedScribbleUndo ? "native scribble undo replaced" : "native scribble undo not on top",
-            manager: manager
-        )
     }
 
-    private var inkUndoManager: UndoManager? {
-        toolUndoManager
-            ?? activeScribbleUndoManager
-            ?? currentPDFPageIndex.flatMap { pageCanvases[$0]?.undoManager }
+    private func useExplicitUndoGroups(for manager: UndoManager) {
+        let identity = ObjectIdentifier(manager)
+        guard undoManagerGroupingSettings[identity] == nil else { return }
+        undoManagerGroupingSettings[identity] = UndoManagerGroupingSetting(
+            manager: manager,
+            groupsByEvent: manager.groupsByEvent
+        )
+        // Event grouping can merge adjacent explicit groups from separate
+        // tool gestures. The editor owns each gesture boundary, so preserve
+        // those boundaries directly while this editor is active.
+        manager.groupsByEvent = false
+        debugScribbleUndoState("explicit grouping enabled", manager: manager)
+    }
 
+    private func restoreUndoManagerGroupingSettings() {
+        for setting in undoManagerGroupingSettings.values {
+            guard setting.manager.groupingLevel == 0 else {
+                debugScribbleUndoState("grouping restore deferred; owned/external group still open", manager: setting.manager)
+                continue
+            }
+            setting.manager.groupsByEvent = setting.groupsByEvent
+            debugScribbleUndoState("grouping policy restored", manager: setting.manager)
+        }
+        undoManagerGroupingSettings = undoManagerGroupingSettings.filter {
+            $0.value.manager.groupingLevel != 0
+        }
     }
 
     private func handleLoadingProgress(_ progress: Double?) {
@@ -1455,9 +1496,19 @@ extension EditJotViewController: PKCanvasViewDelegate {
                 overlaySize: pageOverlays[pageIndex]?.drawingSize ?? currentPageSize
             )
             guard inkCanvasCoordinator.replacePage(converted, at: pageIndex) else { return }
+            let undoManager = canvasView.undoManager
+            let isUndoRedoReplay = undoManager?.isUndoing == true || undoManager?.isRedoing == true
+            if isUndoRedoReplay {
+                debugScribbleUndoState(
+                    "drawing changed during Undo/Redo replay",
+                    pageIndex: pageIndex,
+                    manager: undoManager
+                )
+            }
             viewModel.didChangeDrawing(
                 inkCanvasCoordinator.committedDrawing,
                 strokePageIndices: inkCanvasCoordinator.committedStrokePageIndices,
+                detectsScribbleErase: !isUndoRedoReplay,
                 changedPageIndices: [pageIndex]
             )
             JottreDiagnostics.shared.updateInkState(strokeCount: inkCanvasCoordinator.committedDrawing.strokes.count)
@@ -1477,16 +1528,21 @@ extension EditJotViewController: PKCanvasViewDelegate {
             #endif
             toolUndoManager = canvasView.undoManager
             toolUndoPageIndex = pageIndexByCanvas[ObjectIdentifier(canvasView)]
+            if let undoManager = canvasView.undoManager {
+                useExplicitUndoGroups(for: undoManager)
+            }
             if let activeScribbleUndoManager,
                 let canvasUndoManager = canvasView.undoManager,
                 activeScribbleUndoManager !== canvasUndoManager {
                 self.activeScribbleUndoManager = nil
+                activeScribbleUndoPageIndex = nil
             }
             if let pageIndex = toolUndoPageIndex {
                 scribbleUndoManagersByPage[pageIndex] = canvasView.undoManager
             }
             debugScribbleUndoState(
-                "tool begin page=\(pageIndexByCanvas[ObjectIdentifier(canvasView)] ?? -1)",
+                "tool stroke began",
+                pageIndex: pageIndexByCanvas[ObjectIdentifier(canvasView)],
                 manager: canvasView.undoManager
             )
             // PencilKit registers drawing changes on this manager. Keep one
@@ -1496,6 +1552,11 @@ extension EditJotViewController: PKCanvasViewDelegate {
             if let undoManager = canvasView.undoManager {
                 undoManager.beginUndoGrouping()
                 toolUndoGroupManager = undoManager
+                debugScribbleUndoState(
+                    "tool undo group began",
+                    pageIndex: pageIndexByCanvas[ObjectIdentifier(canvasView)],
+                    manager: undoManager
+                )
             }
             return
         }
@@ -1506,7 +1567,8 @@ extension EditJotViewController: PKCanvasViewDelegate {
             pageIndexByCanvas[ObjectIdentifier(canvas)] != nil
         {
             debugScribbleUndoState(
-                "tool end page=\(pageIndexByCanvas[ObjectIdentifier(canvasView)] ?? -1)",
+                "tool stroke ended",
+                pageIndex: pageIndexByCanvas[ObjectIdentifier(canvasView)],
                 manager: canvasView.undoManager
             )
             endToolUndoGroup()
@@ -1519,7 +1581,9 @@ extension EditJotViewController: PKCanvasViewDelegate {
     private func endToolUndoGroup() {
         guard let undoManager = toolUndoGroupManager else { return }
         toolUndoGroupManager = nil
+        debugScribbleUndoState("tool undo group ending", pageIndex: toolUndoPageIndex, manager: undoManager)
         undoManager.endUndoGrouping()
+        debugScribbleUndoState("tool undo group ended", pageIndex: toolUndoPageIndex, manager: undoManager)
     }
 
     private func flushPendingDrawingChange() {

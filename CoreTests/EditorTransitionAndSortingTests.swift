@@ -124,7 +124,7 @@ final class EditorTransitionAndSortingTests: XCTestCase {
         XCTAssertTrue(doubleTapRecognizers(in: pdf).allSatisfy { $0 === installed || !$0.isEnabled })
     }
 
-    func testSeparateToolUndoGroupsKeepScribbleUndoIndependentAndRedoable() {
+    func testScribbleKeepsEveryPriorStrokeAsAnIndependentUndoAndRedoStep() {
         let undoManager = UndoManager()
         undoManager.groupsByEvent = false
         var strokes: [String] = []
@@ -140,21 +140,97 @@ final class EditorTransitionAndSortingTests: XCTestCase {
         }
 
         registerTransition(from: [], to: ["A"])
-        registerTransition(from: ["A"], to: ["A", "S"])
-        registerTransition(from: ["A", "S"], to: [])
+        registerTransition(from: ["A"], to: ["A", "B"])
+        registerTransition(from: ["A", "B"], to: ["A", "B", "C"])
+        registerTransition(from: ["A", "B", "C"], to: ["A", "B", "C", "S"])
+        registerTransition(from: ["A", "B", "C", "S"], to: ["A", "C"])
 
         undoManager.undo()
-        XCTAssertEqual(strokes, ["A", "S"], "Undoing erasure restores prior ink and Scribble")
+        XCTAssertEqual(strokes, ["A", "B", "C", "S"], "Undo 1 reverses only Scribble erasure")
         undoManager.undo()
-        XCTAssertEqual(strokes, ["A"], "Undoing the Scribble gesture must preserve prior ink")
+        XCTAssertEqual(strokes, ["A", "B", "C"], "Undo 2 removes only the Scribble stroke")
         undoManager.undo()
-        XCTAssertTrue(strokes.isEmpty, "The next Undo may then remove the prior ink")
+        XCTAssertEqual(strokes, ["A", "B"], "Undo 3 removes only stroke C")
+        undoManager.undo()
+        XCTAssertEqual(strokes, ["A"], "Undo 4 removes only stroke B")
+        undoManager.undo()
+        XCTAssertTrue(strokes.isEmpty, "Undo 5 removes only stroke A")
+
         undoManager.redo()
-        XCTAssertEqual(strokes, ["A"], "Redo restores prior ink first")
+        XCTAssertEqual(strokes, ["A"], "Redo 1 restores A")
         undoManager.redo()
-        XCTAssertEqual(strokes, ["A", "S"], "The next Redo restores the Scribble stroke")
+        XCTAssertEqual(strokes, ["A", "B"], "Redo 2 restores B")
         undoManager.redo()
-        XCTAssertTrue(strokes.isEmpty, "Redo reapplies Scribble erasure last")
+        XCTAssertEqual(strokes, ["A", "B", "C"], "Redo 3 restores C")
+        undoManager.redo()
+        XCTAssertEqual(strokes, ["A", "B", "C", "S"], "Redo 4 restores Scribble")
+        undoManager.redo()
+        XCTAssertEqual(strokes, ["A", "C"], "Redo 5 reapplies Scribble erasure")
+    }
+
+    func testRapidSeparateInkGesturesUndoOneStrokeAtATime() {
+        let undoManager = UndoManager()
+        undoManager.groupsByEvent = false
+        var strokes: [String] = []
+
+        for stroke in ["A", "B", "C"] {
+            let previous = strokes
+            let next = strokes + [stroke]
+            undoManager.beginUndoGrouping()
+            undoManager.registerUndo(withTarget: self) { _ in
+                strokes = previous
+                undoManager.registerUndo(withTarget: self) { _ in strokes = next }
+            }
+            undoManager.endUndoGrouping()
+            strokes = next
+        }
+
+        undoManager.undo()
+        XCTAssertEqual(strokes, ["A", "B"])
+        undoManager.undo()
+        XCTAssertEqual(strokes, ["A"])
+        undoManager.undo()
+        XCTAssertTrue(strokes.isEmpty)
+    }
+
+    func testMultipleScribbleTransactionsStaySeparateFromInkHistory() {
+        let undoManager = UndoManager()
+        undoManager.groupsByEvent = false
+        var strokes: [String] = []
+
+        func register(from previous: [String], to next: [String]) {
+            undoManager.beginUndoGrouping()
+            undoManager.registerUndo(withTarget: self) { _ in
+                strokes = previous
+                undoManager.registerUndo(withTarget: self) { _ in strokes = next }
+            }
+            undoManager.endUndoGrouping()
+            strokes = next
+        }
+
+        register(from: [], to: ["A"])
+        register(from: ["A"], to: ["A", "B"])
+        register(from: ["A", "B"], to: ["A", "B", "S1"])
+        register(from: ["A", "B", "S1"], to: ["A"])
+        register(from: ["A"], to: ["A", "C"])
+        register(from: ["A", "C"], to: ["A", "C", "S2"])
+        register(from: ["A", "C", "S2"], to: ["A"])
+
+        for expected in [
+            ["A", "C", "S2"], ["A", "C"], ["A"], ["A", "B", "S1"],
+            ["A", "B"], ["A"], [String]()
+        ] {
+            undoManager.undo()
+            XCTAssertEqual(strokes, expected)
+        }
+
+        for expected in [
+            ["A"], ["A", "B"], ["A", "B", "S1"], ["A"],
+            ["A", "C"], ["A", "C", "S2"], ["A"]
+        ] {
+            undoManager.redo()
+            XCTAssertEqual(strokes, expected)
+        }
     }
 
     func testScribbleUndoAndRedoRemainOnOriginatingPageManagerAfterPageChanges() {
@@ -194,76 +270,6 @@ final class EditorTransitionAndSortingTests: XCTestCase {
         scribblePageUndoManager.redo()
         XCTAssertTrue(strokes.isEmpty)
         XCTAssertFalse(newlyVisiblePageUndoManager.canUndo)
-    }
-
-    func testUndoTransitionsRegisteredInSeparateRunLoopEventsRemainSeparate() {
-        let undoManager = UndoManager()
-        var state = "D1"
-        let eraseRegistration = expectation(description: "Erase action is registered on next event")
-
-        func register(_ previousState: String, on manager: UndoManager) {
-            manager.beginUndoGrouping()
-            manager.registerUndo(withTarget: self) { _ in state = previousState }
-            manager.endUndoGrouping()
-        }
-
-        register("D0", on: undoManager) // Scribble creation undo.
-        Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(20))
-            state = "D2"
-            register("D1", on: undoManager) // Erase undo, in a distinct event.
-
-            undoManager.undo()
-            XCTAssertEqual(state, "D1", "The first Undo should reverse only the erase")
-            undoManager.undo()
-            XCTAssertEqual(state, "D0", "The next Undo should reverse Scribble creation")
-            eraseRegistration.fulfill()
-        }
-
-        wait(for: [eraseRegistration], timeout: 1)
-    }
-
-    func testReplacingNativeScribbleActionKeepsEraseAndCreationAsTwoUndoSteps() {
-        let undoManager = UndoManager()
-        undoManager.groupsByEvent = false
-        var state = "D1"
-
-        // Simulate PencilKit's Scribble drawing action, then consume it before
-        // the programmatic drawing replacement invalidates its native entry.
-        undoManager.beginUndoGrouping()
-        undoManager.registerUndo(withTarget: self) { _ in state = "D0" }
-        undoManager.endUndoGrouping()
-        undoManager.undo()
-        XCTAssertEqual(state, "D0")
-
-        // Install the explicit D1 -> D0 replacement and then the D2 -> D1
-        // Erase action, matching the controller's two-event registration.
-        state = "D1"
-        undoManager.beginUndoGrouping()
-        undoManager.registerUndo(withTarget: self) { _ in
-            state = "D0"
-            undoManager.registerUndo(withTarget: self) { _ in state = "D1" }
-        }
-        undoManager.endUndoGrouping()
-        state = "D2"
-
-        undoManager.beginUndoGrouping()
-        undoManager.registerUndo(withTarget: self) { _ in
-            state = "D1"
-            undoManager.registerUndo(withTarget: self) { _ in state = "D2" }
-        }
-        undoManager.endUndoGrouping()
-
-        undoManager.undo()
-        XCTAssertEqual(state, "D1", "Undo 1 reverses Erase")
-        XCTAssertTrue(undoManager.canUndo)
-        undoManager.undo()
-        XCTAssertEqual(state, "D0", "Undo 2 removes only the Scribble")
-
-        undoManager.redo()
-        XCTAssertEqual(state, "D1", "Redo 1 restores the Scribble")
-        undoManager.redo()
-        XCTAssertEqual(state, "D2", "Redo 2 reapplies Erase")
     }
 
     func testDoubleTapFitTargetIsSelectedFromCurrentScale() {

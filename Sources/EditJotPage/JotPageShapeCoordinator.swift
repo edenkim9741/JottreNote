@@ -88,7 +88,15 @@ final class JotPageShapeCoordinator: NSObject {
         updated[updated.count - 1] = snapped.stroke
         cancel()
         isReplacing = true
-        canvas.undoManager?.registerUndo(withTarget: canvas) { target in target.drawing = previous }
+        let undoManager = canvas.undoManager
+        let ownsUndoGroup = undoManager?.groupingLevel == 0
+        if ownsUndoGroup {
+            undoManager?.beginUndoGrouping()
+        }
+        undoManager?.registerUndo(withTarget: canvas) { target in target.drawing = previous }
+        if ownsUndoGroup {
+            undoManager?.endUndoGrouping()
+        }
         canvas.drawing = PKDrawing(strokes: updated)
         isReplacing = false
         UIImpactFeedbackGenerator(style: .medium).impactOccurred(intensity: 0.85)
