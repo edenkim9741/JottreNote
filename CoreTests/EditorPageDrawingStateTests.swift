@@ -17,11 +17,12 @@ final class EditorPageDrawingStateTests: XCTestCase {
         let loaded = try PropertyListDecoder().decode(Jot.self, from: PropertyListEncoder().encode(old))
         let state = JotEditorDrawingState()
         state.load(drawing: try PKDrawing(data: loaded.drawing), strokePageIndices: loaded.strokePageIndices)
-        XCTAssertEqual(state.drawing(at: 2).strokes.map(\.randomSeed), [7, 8])
+        XCTAssertEqual(state.committedDrawing.strokes.map(\.randomSeed), [8, 7, 9])
+        XCTAssertEqual(state.committedStrokePageIndices, [2, 2, 0])
         let updated = PKDrawing(strokes: [pen, marker, stroke(seed: 10, force: 0.5)])
         XCTAssertTrue(state.replacePage(updated, at: 2))
-        XCTAssertEqual(state.pageRevisions, [2: 1])
-        XCTAssertEqual(state.drawing(at: 0).strokes[0].randomSeed, 9)
+        XCTAssertEqual(state.committedDrawing.strokes.map(\.randomSeed), [8, 9, 7, 10])
+        XCTAssertEqual(state.committedStrokePageIndices, [2, 0, 2, 2])
         let saved = Jot(
             drawing: state.committedDrawing.dataRepresentation(),
             width: 1_200,
@@ -51,8 +52,8 @@ final class EditorPageDrawingStateTests: XCTestCase {
         XCTAssertTrue(state.replacePage(PKDrawing(strokes: [modified]), at: 0))
         modified.transform = CGAffineTransform(translationX: 80, y: 120).scaledBy(x: 1.5, y: 1.5)
         XCTAssertTrue(state.replacePage(PKDrawing(strokes: [modified]), at: 0))
-        XCTAssertEqual(state.pageRevisions[0], 3)
-        XCTAssertFalse(state.replacePage(state.drawing(at: 0), at: 0))
+        XCTAssertEqual(state.committedDrawing.strokes.first?.path[0].force, modified.path[0].force)
+        XCTAssertFalse(state.replacePage(state.committedDrawing, at: 0))
         XCTAssertTrue(state.replacePage(PKDrawing(strokes: [original]), at: 0), "Undo restores the original")
         XCTAssertTrue(state.replacePage(PKDrawing(strokes: [modified]), at: 0), "Redo restores the edit")
     }

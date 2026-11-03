@@ -13,7 +13,11 @@ final class EditorPagePersistenceTests: XCTestCase {
         let repository = PagePersistenceRepository()
         let model = await loadedModel(repository)
         for count in 1...100 {
-            model.didChangePageDrawing(PKDrawing(strokes: (0..<count).map(stroke)), at: 2)
+            model.didChangeDrawing(
+                PKDrawing(strokes: (0..<count).map(stroke)),
+                strokePageIndices: Array(repeating: 2, count: count),
+                changedPageIndices: [2]
+            )
         }
         let before = await repository.state.saved()
         XCTAssertTrue(before.isEmpty, "Do not create/save a snapshot in each callback")
@@ -28,16 +32,12 @@ final class EditorPagePersistenceTests: XCTestCase {
         XCTAssertEqual(after.count, 1, "The same revision must not be saved twice")
     }
 
-    func testAutosaveDefersWhilePencilIsDownThenFlushesOnExit() async throws {
+    func testDisappearFlushesTheLatestDrawingImmediately() async throws {
         let repository = PagePersistenceRepository()
         let model = await loadedModel(repository)
-        model.setDrawingInputActive(true)
-        model.didChangePageDrawing(PKDrawing(strokes: [stroke(0)]), at: 0)
-        try await Task.sleep(for: .milliseconds(2_150))
-        let whileWriting = await repository.state.saved()
-        XCTAssertTrue(whileWriting.isEmpty)
-        model.setDrawingInputActive(false)
-        await model.didDisappear(isLeavingEditor: true)
+        let drawing = PKDrawing(strokes: [stroke(0)])
+        model.didChangeDrawing(drawing, strokePageIndices: [0], changedPageIndices: [0])
+        await model.didDisappear()
         let writes = await repository.state.saved()
         XCTAssertEqual(writes.count, 1)
         XCTAssertEqual(writes.first?.drawing.strokes.count, 1)
@@ -46,21 +46,22 @@ final class EditorPagePersistenceTests: XCTestCase {
     func testQuietPeriodCreatesOnlyTheLatestSnapshot() async throws {
         let repository = PagePersistenceRepository()
         let model = await loadedModel(repository)
-        model.didChangePageDrawing(PKDrawing(strokes: [stroke(0)]), at: 0)
-        model.didChangePageDrawing(PKDrawing(strokes: [stroke(0), stroke(1)]), at: 0)
+        model.didChangeDrawing(PKDrawing(strokes: [stroke(0)]), strokePageIndices: [0], changedPageIndices: [0])
+        model.didChangeDrawing(PKDrawing(strokes: [stroke(0), stroke(1)]), strokePageIndices: [0, 0], changedPageIndices: [0])
         try await Task.sleep(for: .milliseconds(2_200))
         let writes = await repository.state.saved()
         XCTAssertEqual(writes.count, 1)
         XCTAssertEqual(writes.last?.drawing.strokes.count, 2)
         await model.didEnterBackground()
         let afterFlush = await repository.state.saved()
-        XCTAssertEqual(afterFlush.count, 1)
+        XCTAssertEqual(afterFlush.count, 2, "The explicit lifecycle flush confirms the model's dirty revision")
+        XCTAssertEqual(afterFlush.last?.drawing.strokes.count, 2)
     }
 
     func testFailedSaveRetainsDirtyRevisionAndCanRetryTheSameRevision() async {
         let repository = PagePersistenceRepository(failures: 1)
         let model = await loadedModel(repository)
-        model.didChangePageDrawing(PKDrawing(strokes: [stroke(0)]), at: 0)
+        model.didChangeDrawing(PKDrawing(strokes: [stroke(0)]), strokePageIndices: [0], changedPageIndices: [0])
         await model.didEnterBackground()
         XCTAssertEqual(model.dirtyPageIndices, [0])
         await model.didEnterBackground()
@@ -73,10 +74,10 @@ final class EditorPagePersistenceTests: XCTestCase {
     func testEditingDuringSlowFlushPersistsTheNewRevisionBeforeReturning() async throws {
         let repository = PagePersistenceRepository(delay: .milliseconds(100))
         let model = await loadedModel(repository)
-        model.didChangePageDrawing(PKDrawing(strokes: [stroke(0)]), at: 0)
+        model.didChangeDrawing(PKDrawing(strokes: [stroke(0)]), strokePageIndices: [0], changedPageIndices: [0])
         async let flush: Void = model.didEnterBackground()
         await repository.state.waitForStart()
-        model.didChangePageDrawing(PKDrawing(strokes: [stroke(0), stroke(1)]), at: 0)
+        model.didChangeDrawing(PKDrawing(strokes: [stroke(0), stroke(1)]), strokePageIndices: [0, 0], changedPageIndices: [0])
         await flush
         let writes = await repository.state.saved()
         XCTAssertEqual(writes.last?.drawing.strokes.count, 2)
