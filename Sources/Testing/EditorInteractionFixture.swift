@@ -11,11 +11,54 @@ enum EditorInteractionFixture {
 
     static var tool: String? {
         let value = ProcessInfo.processInfo.environment["JOTTRE_INTERACTION_TEST_TOOL"]
-        return ["pen", "lasso", "blank-pen"].contains(value ?? "") ? value : nil
+        return ["pen", "lasso", "blank-pen", "scribble-undo"].contains(value ?? "") ? value : nil
+    }
+
+    private(set) static var scribbleRecognitionCount = 0
+    private(set) static var scribbleEraseApplicationCount = 0
+    private(set) static var undoTrace: [String] = []
+    private(set) static var fixtureUndoActionCount = 0
+    private(set) static var fixtureRedoActionCount = 0
+    private(set) static var lastFixtureUndoState = "none"
+
+    static func didRecognizeScribble() {
+        guard tool == "scribble-undo" else { return }
+        scribbleRecognitionCount += 1
+        print("[InkUndo UIFixture] Scribble recognized count=\(scribbleRecognitionCount)")
+    }
+
+    static func didApplyScribbleErase() {
+        guard tool == "scribble-undo" else { return }
+        scribbleEraseApplicationCount += 1
+        print("[InkUndo UIFixture] Scribble Erase applied count=\(scribbleEraseApplicationCount)")
+    }
+
+    static func recordUndoTrace(_ value: String) {
+        guard tool == "scribble-undo" else { return }
+        undoTrace.append(value)
+        if undoTrace.count > 120 { undoTrace.removeFirst(undoTrace.count - 120) }
     }
 
     static func publish(canvas: PKCanvasView, index: Int, pdfView: PDFView, host: UIView) {
         guard tool != nil else { return }
+        if tool == "scribble-undo" {
+            installUndoButton(in: host, identifier: "editor.test.undo", title: "Undo") { [weak canvas] in
+                guard let canvas, let manager = canvas.undoManager else { return }
+                fixtureUndoActionCount += 1
+                lastFixtureUndoState = "before canUndo=\(manager.canUndo) canRedo=\(manager.canRedo) group=\(manager.groupingLevel) undoAction=\(manager.undoActionName) redoAction=\(manager.redoActionName) seeds=\(canvas.drawing.strokes.map(\.randomSeed))"
+                print("[InkUndo UIFixture] Undo canvas=\(ObjectIdentifier(canvas)) manager=\(ObjectIdentifier(manager)) group=\(manager.groupingLevel) groupsByEvent=\(manager.groupsByEvent) canUndo=\(manager.canUndo) canRedo=\(manager.canRedo) undoAction=\(manager.undoActionName) redoAction=\(manager.redoActionName) isUndoing=\(manager.isUndoing) isRedoing=\(manager.isRedoing) seeds=\(canvas.drawing.strokes.map(\.randomSeed))")
+                manager.undo()
+                lastFixtureUndoState += " after canUndo=\(manager.canUndo) canRedo=\(manager.canRedo) group=\(manager.groupingLevel) undoAction=\(manager.undoActionName) redoAction=\(manager.redoActionName) isUndoing=\(manager.isUndoing) isRedoing=\(manager.isRedoing) seeds=\(canvas.drawing.strokes.map(\.randomSeed))"
+                print("[InkUndo UIFixture] Undo completed seeds=\(canvas.drawing.strokes.map(\.randomSeed)) canUndo=\(manager.canUndo) canRedo=\(manager.canRedo)")
+            }
+            installUndoButton(in: host, identifier: "editor.test.redo", title: "Redo") { [weak canvas] in
+                guard let canvas, let manager = canvas.undoManager else { return }
+                fixtureRedoActionCount += 1
+                print("[InkUndo UIFixture] Redo canvas=\(ObjectIdentifier(canvas)) manager=\(ObjectIdentifier(manager)) group=\(manager.groupingLevel) groupsByEvent=\(manager.groupsByEvent) canUndo=\(manager.canUndo) canRedo=\(manager.canRedo) isUndoing=\(manager.isUndoing) isRedoing=\(manager.isRedoing) seeds=\(canvas.drawing.strokes.map(\.randomSeed))")
+                manager.redo()
+                print("[InkUndo UIFixture] Redo completed seeds=\(canvas.drawing.strokes.map(\.randomSeed)) canUndo=\(manager.canUndo) canRedo=\(manager.canRedo)")
+            }
+        }
         if !host.subviews.contains(where: { $0.accessibilityIdentifier == "editor.test.nextPage" }) {
             let nextPageButton = UIButton(type: .system)
             nextPageButton.frame = CGRect(x: 12, y: 112, width: 44, height: 36)
@@ -73,6 +116,23 @@ enum EditorInteractionFixture {
             let info: [String: Any] = [
                 "midX": midX,
                 "strokes": canvas.drawing.strokes.count,
+                "strokeSeeds": canvas.drawing.strokes.map(\.randomSeed),
+                "canvasIdentity": String(describing: ObjectIdentifier(canvas)),
+                "undoManagerIdentity": canvas.undoManager.map { String(describing: ObjectIdentifier($0)) } ?? "nil",
+                "groupingLevel": canvas.undoManager?.groupingLevel ?? -1,
+                "groupsByEvent": canvas.undoManager?.groupsByEvent ?? false,
+                "canUndo": canvas.undoManager?.canUndo ?? false,
+                "canRedo": canvas.undoManager?.canRedo ?? false,
+                "isUndoing": canvas.undoManager?.isUndoing ?? false,
+                "isRedoing": canvas.undoManager?.isRedoing ?? false,
+                "undoActionName": canvas.undoManager?.undoActionName ?? "",
+                "redoActionName": canvas.undoManager?.redoActionName ?? "",
+                "scribbleRecognitionCount": scribbleRecognitionCount,
+                "scribbleEraseApplicationCount": scribbleEraseApplicationCount,
+                "undoTrace": undoTrace,
+                "fixtureUndoActionCount": fixtureUndoActionCount,
+                "fixtureRedoActionCount": fixtureRedoActionCount,
+                "lastFixtureUndoState": lastFixtureUndoState,
                 "rect": [rect.minX, rect.minY, rect.width, rect.height],
                 "viewportRect": [viewportRect.minX, viewportRect.minY, viewportRect.width, viewportRect.height],
                 "canvasRect": [canvasRect.minX, canvasRect.minY, canvasRect.width, canvasRect.height],
@@ -112,18 +172,22 @@ enum EditorInteractionFixture {
 
     static func makeDocument(using service: any JotFileServiceProtocol) throws -> JotFile.Info {
         let bounds = CGRect(x: 0, y: 0, width: 600, height: 800)
+        let pageCount = tool == "scribble-undo" ? 1 : 2
         let pdf = UIGraphicsPDFRenderer(bounds: bounds).pdfData { context in
-            for index in 0..<2 {
+            for index in 0..<pageCount {
                 context.beginPage()
                 UIColor.white.setFill()
                 context.cgContext.fill(bounds)
-                ("Selectable text page \(index + 1)" as NSString).draw(
-                    at: CGPoint(x: 40, y: 40),
-                    withAttributes: [.font: UIFont.systemFont(ofSize: 24), .foregroundColor: UIColor.black]
-                )
+                if tool != "scribble-undo" {
+                    ("Selectable text page \(index + 1)" as NSString).draw(
+                        at: CGPoint(x: 40, y: 40),
+                        withAttributes: [.font: UIFont.systemFont(ofSize: 24), .foregroundColor: UIColor.black]
+                    )
+                }
             }
         }
-        let strokes = (0..<(tool == "blank-pen" ? 1 : 2)).map { index in
+        let initialStrokeCount = tool == "blank-pen" ? 1 : (tool == "scribble-undo" ? 0 : 2)
+        let strokes = (0..<initialStrokeCount).map { index in
             let y = CGFloat(index) * (1600 + JotPageLayout.pageSpacing) + 600
             let points = [CGPoint(x: 360, y: y), CGPoint(x: 840, y: y)].enumerated().map { offset, point in
                 PKStrokePoint(
@@ -147,15 +211,32 @@ enum EditorInteractionFixture {
         try service.write(
             jotFile: JotFile(
                 info: info,
-                jot: Jot(
-                    drawing: PKDrawing(strokes: tool == "lasso" ? [] : strokes).dataRepresentation(),
+            jot: Jot(
+                    drawing: PKDrawing(strokes: tool == "lasso" || tool == "scribble-undo" ? [] : strokes).dataRepresentation(),
                     width: 1200,
                     pdfData: isBlankNote ? nil : pdf,
-                    strokePageIndices: tool == "lasso" ? [] : (isBlankNote ? [0] : [0, 1])
+                    strokePageIndices: tool == "lasso" || tool == "scribble-undo" ? [] : (isBlankNote ? [0] : [0, 1])
                 )
             )
         )
         return info
+    }
+
+    private static func installUndoButton(
+        in host: UIView,
+        identifier: String,
+        title: String,
+        action: @escaping () -> Void
+    ) {
+        guard !host.subviews.contains(where: { $0.accessibilityIdentifier == identifier }) else { return }
+        let button = UIButton(type: .system)
+        button.frame = CGRect(x: 12, y: identifier.hasSuffix("undo") ? 150 : 194, width: 76, height: 36)
+        button.setTitle(title, for: .normal)
+        button.backgroundColor = UIColor.systemBackground.withAlphaComponent(0.9)
+        button.accessibilityIdentifier = identifier
+        button.accessibilityLabel = title
+        button.addAction(UIAction { _ in action() }, for: .touchUpInside)
+        host.addSubview(button)
     }
 }
 

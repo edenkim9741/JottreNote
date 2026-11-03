@@ -11,9 +11,12 @@ enum CanvasTouchRouting {
     }
 
     static func drawingPolicy(for _: PKTool) -> PKCanvasViewDrawingPolicy {
+        #if DEBUG && targetEnvironment(simulator)
+        if EditorInteractionFixture.tool == "scribble-undo" { return .anyInput }
+        #endif
         // PencilKit owns native inking, erasing and lasso interactions. Fingers
         // stay available to PDFKit for document navigation and zoom gestures.
-        .pencilOnly
+        return .pencilOnly
     }
 
     static func shouldPassDirectTouchesThroughOverlay(rulerActive: Bool) -> Bool {

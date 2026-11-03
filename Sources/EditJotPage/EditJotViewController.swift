@@ -49,11 +49,6 @@ private final class PersistentToolPickerAnchorView: UIView {
 @MainActor
 final class EditJotViewController: UIViewController, @preconcurrency PDFPageOverlayViewProvider {
 
-    private struct UndoManagerGroupingSetting {
-        let manager: UndoManager
-        let groupsByEvent: Bool
-    }
-
     #if !targetEnvironment(macCatalyst)
     private struct ToolSelection {
         let tool: any PKTool
@@ -109,13 +104,10 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
     private var applicationBackgroundTaskGeneration: UUID?
     private var isEditingEnabled = false
     private var toolUndoManager: UndoManager?
-    private var toolUndoGroupManager: UndoManager?
-    private var toolUndoPageIndex: Int?
     private var scribbleUndoManagersByPage: [Int: UndoManager] = [:]
     private var activeScribbleUndoManager: UndoManager?
     private var activeScribbleUndoPageIndex: Int?
     private var pendingScribbleUndoEvents: [Int: [(EditJotViewModel.ScribbleEraseEvent, UndoManager?)]] = [:]
-    private var undoManagerGroupingSettings: [ObjectIdentifier: UndoManagerGroupingSetting] = [:]
     #if DEBUG
     private var undoDebugSequence: UInt64 = 0
     #endif
@@ -202,11 +194,8 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
         let undoManager = scribbleUndoManagersByPage.removeValue(forKey: event.pageIndex)
             ?? pageCanvases[event.pageIndex]?.undoManager
             ?? toolUndoManager
-        if let undoManager {
-            useExplicitUndoGroups(for: undoManager)
-        }
-        if let undoManager, toolUndoGroupManager === undoManager {
-            debugScribbleUndoState("Scribble erase queued until tool group closes", pageIndex: event.pageIndex, manager: undoManager)
+        if let undoManager, toolUndoManager === undoManager {
+            debugScribbleUndoState("Scribble erase queued until PencilKit tool gesture closes", pageIndex: event.pageIndex, manager: undoManager)
             pendingScribbleUndoEvents[event.pageIndex, default: []].append((event, undoManager))
             return
         }
@@ -229,6 +218,9 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
             pageIndex: event.pageIndex,
             action: "Scribble erase"
         )
+        #if DEBUG
+        EditorInteractionFixture.didApplyScribbleErase()
+        #endif
         debugScribbleUndoState("Scribble erase applied", pageIndex: event.pageIndex, manager: undoManager)
     }
 
@@ -354,8 +346,6 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
             overlays: pageOverlays
         )
         flushPendingDrawingChange()
-        endToolUndoGroup()
-        restoreUndoManagerGroupingSettings()
         saveScrollPosition()
         Task { @MainActor [viewModel] in await viewModel.didDisappear() }
         #if !targetEnvironment(macCatalyst)
@@ -837,9 +827,21 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
     ) {
         undoDebugSequence &+= 1
         let identity = manager.map { String(describing: ObjectIdentifier($0)) } ?? "nil"
+        let canvas = pageIndex.flatMap { pageCanvases[$0] }
+        let canvasIdentity = canvas.map { String(describing: ObjectIdentifier($0)) } ?? "nil"
+        let strokeSeeds = inkCanvasCoordinator.committedDrawing.strokes.map(\.randomSeed)
+        EditorInteractionFixture.recordUndoTrace(
+            "\(operation) page=\(pageIndex.map(String.init) ?? "unknown") canvas=\(canvasIdentity) " +
+                "manager=\(identity) groupingLevel=\(manager?.groupingLevel ?? -1) " +
+                "groupsByEvent=\(manager?.groupsByEvent ?? false) canUndo=\(manager?.canUndo ?? false) " +
+                "canRedo=\(manager?.canRedo ?? false) undoAction=\(manager?.undoActionName ?? "") " +
+                "redoAction=\(manager?.redoActionName ?? "") isUndoing=\(manager?.isUndoing ?? false) " +
+                "isRedoing=\(manager?.isRedoing ?? false) seeds=\(strokeSeeds)"
+        )
         print(
             "[InkUndo #\(undoDebugSequence)] \(operation) page=\(pageIndex.map(String.init) ?? "unknown") " +
-            "manager=\(identity) strokes=\(inkCanvasCoordinator.committedDrawing.strokes.count) " +
+            "canvas=\(canvasIdentity) manager=\(identity) strokes=\(inkCanvasCoordinator.committedDrawing.strokes.count) " +
+            "seeds=\(strokeSeeds) groupsByEvent=\(manager?.groupsByEvent ?? false) " +
             "canUndo=\(manager?.canUndo ?? false) canRedo=\(manager?.canRedo ?? false) " +
             "groupingLevel=\(manager?.groupingLevel ?? -1) " +
             "isUndoing=\(manager?.isUndoing ?? false) isRedoing=\(manager?.isRedoing ?? false)"
@@ -862,30 +864,6 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
         }
         return pageCanvases[currentPDFPageIndex]?.undoManager
 
-    }
-
-    private func useExplicitUndoGroups(for manager: UndoManager) {
-        let identity = ObjectIdentifier(manager)
-        guard undoManagerGroupingSettings[identity] == nil else { return }
-        undoManagerGroupingSettings[identity] = UndoManagerGroupingSetting(
-            manager: manager,
-            groupsByEvent: manager.groupsByEvent
-        )
-        // Event grouping can merge adjacent explicit groups from separate
-        // tool gestures. The editor owns each gesture boundary, so preserve
-        // those boundaries directly while this editor is active.
-        manager.groupsByEvent = false
-        debugScribbleUndoState("explicit grouping enabled", manager: manager)
-    }
-
-    private func restoreUndoManagerGroupingSettings() {
-        for setting in undoManagerGroupingSettings.values {
-            // Restore only the property we changed; never close a group that
-            // might belong to PencilKit or another responder.
-            setting.manager.groupsByEvent = setting.groupsByEvent
-            debugScribbleUndoState("grouping policy restored", manager: setting.manager)
-        }
-        undoManagerGroupingSettings.removeAll()
     }
 
     private func handleLoadingProgress(_ progress: Double?) {
@@ -1541,17 +1519,13 @@ extension EditJotViewController: PKCanvasViewDelegate {
             }
             #endif
             toolUndoManager = canvasView.undoManager
-            toolUndoPageIndex = pageIndexByCanvas[ObjectIdentifier(canvasView)]
-            if let undoManager = canvasView.undoManager {
-                useExplicitUndoGroups(for: undoManager)
-            }
             if let activeScribbleUndoManager,
                 let canvasUndoManager = canvasView.undoManager,
                 activeScribbleUndoManager !== canvasUndoManager {
                 self.activeScribbleUndoManager = nil
                 activeScribbleUndoPageIndex = nil
             }
-            if let pageIndex = toolUndoPageIndex {
+            if let pageIndex = pageIndexByCanvas[ObjectIdentifier(canvasView)] {
                 scribbleUndoManagersByPage[pageIndex] = canvasView.undoManager
             }
             debugScribbleUndoState(
@@ -1559,19 +1533,8 @@ extension EditJotViewController: PKCanvasViewDelegate {
                 pageIndex: pageIndexByCanvas[ObjectIdentifier(canvasView)],
                 manager: canvasView.undoManager
             )
-            // PencilKit registers drawing changes on this manager. Keep one
-            // tool gesture in its own group so a fast following stroke cannot
-            // be coalesced with the preceding stroke by the event-based group.
-            endToolUndoGroup()
-            if let undoManager = canvasView.undoManager {
-                undoManager.beginUndoGrouping()
-                toolUndoGroupManager = undoManager
-                debugScribbleUndoState(
-                    "tool undo group began",
-                    pageIndex: pageIndexByCanvas[ObjectIdentifier(canvasView)],
-                    manager: undoManager
-                )
-            }
+            // PencilKit owns ordinary gesture grouping. Jottre does not wrap
+            // native stroke registrations in another UndoManager group.
             return
         }
     }
@@ -1586,20 +1549,10 @@ extension EditJotViewController: PKCanvasViewDelegate {
                 pageIndex: pageIndex,
                 manager: canvasView.undoManager
             )
-            endToolUndoGroup()
             toolUndoManager = nil
-            toolUndoPageIndex = nil
             if let pageIndex { applyPendingScribbleUndoEvents(pageIndex: pageIndex) }
             return
         }
-    }
-
-    private func endToolUndoGroup() {
-        guard let undoManager = toolUndoGroupManager else { return }
-        toolUndoGroupManager = nil
-        debugScribbleUndoState("tool undo group ending", pageIndex: toolUndoPageIndex, manager: undoManager)
-        undoManager.endUndoGrouping()
-        debugScribbleUndoState("tool undo group ended", pageIndex: toolUndoPageIndex, manager: undoManager)
     }
 
     private func flushPendingDrawingChange() {

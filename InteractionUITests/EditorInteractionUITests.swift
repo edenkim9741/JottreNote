@@ -66,6 +66,126 @@ final class EditorInteractionUITests: XCTestCase {
         XCTAssertFalse(app.staticTexts["Insert Space"].exists)
     }
 
+    func testSimulatorFingerInkRegistersIndependentPencilKitUndoAndRedoActions() async throws {
+        let app = launch(tool: "scribble-undo")
+        let page = app.staticTexts["editor.page.0"]
+        XCTAssertTrue(page.waitForExistence(timeout: 15))
+
+        var state = try info(page)
+        XCTAssertEqual(state["strokes"] as? Int, 0, "The fixture must start with an empty page drawing")
+        XCTAssertEqual(state["drawingPolicy"] as? UInt, PKCanvasViewDrawingPolicy.anyInput.rawValue,
+            "Only the DEBUG Simulator Scribble fixture accepts direct finger ink")
+        XCTAssertEqual(state["currentPageIndex"] as? Int, 0)
+        XCTAssertNotEqual(state["undoManagerIdentity"] as? String, "nil")
+
+        let gestures: [(String, Double, Double, Double, Double)] = [
+            ("A", 0.18, 0.28, 0.42, 0.28),
+            ("B", 0.22, 0.50, 0.78, 0.50),
+            ("C", 0.56, 0.72, 0.82, 0.72),
+        ]
+        var identities: [[UInt32]] = []
+        for (name, startX, startY, endX, endY) in gestures {
+            state = try info(page)
+            let start = try point(app, info: state, x: startX, y: startY)
+            let end = try point(app, info: state, x: endX, y: endY)
+            start.press(forDuration: 0.01, thenDragTo: end)
+            state = try await waitForDrawing(page, count: identities.count + 1)
+            let seeds = try XCTUnwrap(state["strokeSeeds"] as? [UInt32])
+            identities.append(seeds)
+            XCTAssertEqual(seeds.count, identities.count, "One finger drag should create exactly one PKStroke for \(name)")
+            XCTAssertEqual(state["groupingLevel"] as? Int, 0, "The completed PencilKit tool group must close after \(name)")
+            XCTAssertEqual(state["groupsByEvent"] as? Bool, true,
+                "This Simulator-only comparison deliberately leaves PencilKit in control of native event grouping")
+            XCTAssertEqual(state["currentPageIndex"] as? Int, 0)
+            XCTAssertEqual(state["isUndoing"] as? Bool, false)
+            XCTAssertEqual(state["isRedoing"] as? Bool, false)
+            XCTContext.runActivity(named: "Touch stroke \(name): \(String(describing: seeds))") { activity in
+                activity.add(XCTAttachment(string: String(describing: state)))
+            }
+        }
+
+        let a = try XCTUnwrap(identities[0].first)
+        let b = try XCTUnwrap(identities[1].last)
+        let c = try XCTUnwrap(identities[2].last)
+        XCTAssertNotEqual(a, b)
+        XCTAssertNotEqual(b, c)
+        XCTAssertEqual(try info(page)["canUndo"] as? Bool, true)
+
+        let undo = app.buttons["editor.test.undo"]
+        let redo = app.buttons["editor.test.redo"]
+        XCTAssertTrue(undo.waitForExistence(timeout: 5))
+        XCTAssertTrue(redo.exists)
+        for expected in [[a, b], [a], []] as [[UInt32]] {
+            undo.tap()
+            state = try await waitForSeeds(page, expected)
+            XCTAssertEqual(state["canRedo"] as? Bool, true)
+            XCTAssertEqual(state["isUndoing"] as? Bool, false)
+            XCTContext.runActivity(named: "PencilKit touch Undo: \(expected)") { activity in
+                activity.add(XCTAttachment(string: String(describing: state)))
+            }
+        }
+        for expected in [[a], [a, b], [a, b, c]] as [[UInt32]] {
+            redo.tap()
+            state = try await waitForSeeds(page, expected)
+            XCTAssertEqual(state["canUndo"] as? Bool, true)
+            XCTAssertEqual(state["isRedoing"] as? Bool, false)
+            XCTContext.runActivity(named: "PencilKit touch Redo: \(expected)") { activity in
+                activity.add(XCTAttachment(string: String(describing: state)))
+            }
+        }
+
+        // XCTest's public coordinate API emits one straight drag per touch.
+        // This crossing control is intentionally not called a Scribble: it
+        // confirms the recognizer does not mistake a straight line for one.
+        state = try info(page)
+        try point(app, info: state, x: 0.18, y: 0.50)
+            .press(forDuration: 0.01, thenDragTo: point(app, info: state, x: 0.82, y: 0.50))
+        state = try await waitForDrawing(page, count: 4)
+        XCTAssertEqual(state["scribbleRecognitionCount"] as? Int, 0)
+        XCTAssertTrue((state["strokeSeeds"] as? [UInt32] ?? []).contains(b),
+            "A straight finger drag across B must not erase it as a Scribble")
+        undo.tap()
+        state = try await waitForSeeds(page, [a, b, c])
+        XCTAssertEqual(state["scribbleEraseApplicationCount"] as? Int, 0)
+
+        let managerIdentity = try XCTUnwrap(state["undoManagerIdentity"] as? String)
+        XCTAssertNotEqual(managerIdentity, "nil")
+        XCTAssertEqual(state["groupingLevel"] as? Int, 0)
+        XCTAssertEqual(state["scribbleRecognitionCount"] as? Int, 0,
+            "Linear XCUITest drags are touch input but do not synthesize the multi-reversal Scribble path")
+    }
+
+    private func waitForDrawing(_ page: XCUIElement, count: Int) async throws -> [String: Any] {
+        var state = try info(page)
+        for _ in 0..<40 where (state["strokes"] as? Int ?? -1) != count {
+            try await Task.sleep(for: .milliseconds(100))
+            state = try info(page)
+        }
+        XCTAssertEqual(state["strokes"] as? Int, count)
+        return state
+    }
+
+    private func waitForSeeds(_ page: XCUIElement, _ expected: [UInt32]) async throws -> [String: Any] {
+        var state = try info(page)
+        for _ in 0..<40 where (state["strokeSeeds"] as? [UInt32]) != expected
+            || state["isUndoing"] as? Bool == true
+            || state["isRedoing"] as? Bool == true
+            || state["groupingLevel"] as? Int != 0 {
+            try await Task.sleep(for: .milliseconds(100))
+            state = try info(page)
+        }
+        let trace = state["undoTrace"] as? [String] ?? []
+        let undoState = state["lastFixtureUndoState"] as? String ?? "none"
+        let undoCount = state["fixtureUndoActionCount"] as? Int ?? -1
+        let manager = state["undoManagerIdentity"] as? String ?? "nil"
+        XCTAssertEqual(
+            state["strokeSeeds"] as? [UInt32],
+            expected,
+            "Undo trace: \(trace); fixtureUndo=\(undoState); undoCount=\(undoCount); manager=\(manager)"
+        )
+        return state
+    }
+
     func testFingerPinchStillZoomsWithNativeMenuSuppression() async throws {
         let app = launch(tool: "pen")
         let page = app.staticTexts["editor.page.0"]

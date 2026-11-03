@@ -297,6 +297,7 @@ final class EditJotViewModel {
                 "before=\(prev.strokes.count) scribble=\(drawing.strokes.count) " +
                 "afterErase=\(processed.strokes.count)"
             )
+            EditorInteractionFixture.didRecognizeScribble()
             #endif
             dirtyPageIndices.formUnion(changedPages(
                 from: prev,
