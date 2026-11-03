@@ -54,7 +54,7 @@ enum ZoteroAttachmentDisplayStatus: Equatable {
 }
 
 enum ZoteroSyncTrigger: String {
-    case appLaunch, editorFinished, periodic, networkReconnect, manual, accountChanged
+    case appLaunch, editorFinished, periodic, networkReconnect, manual, accountChanged, requiredWork
 }
 
 enum ZoteroSyncSchedule {
@@ -62,7 +62,7 @@ enum ZoteroSyncSchedule {
 
     static func shouldRun(_ trigger: ZoteroSyncTrigger, lastAttempt: Date?, now: Date = Date()) -> Bool {
         switch trigger {
-        case .appLaunch, .editorFinished, .manual, .accountChanged: return true
+        case .appLaunch, .editorFinished, .manual, .accountChanged, .requiredWork: return true
         case .periodic, .networkReconnect:
             guard let lastAttempt else { return true }
             return now.timeIntervalSince(lastAttempt) >= minimumAutomaticInterval
@@ -510,7 +510,7 @@ private final class ZoteroLibraryViewModel: ObservableObject {
             }
             errorMessage = error.localizedDescription
             await ZoteroEditingSessionGate.shared.endSynchronization()
-            if shouldSynchronizeAfterFailure { await synchronize() }
+            if shouldSynchronizeAfterFailure { await synchronize(trigger: .requiredWork) }
             return false
         }
     }
@@ -868,7 +868,7 @@ private final class ZoteroLibraryViewModel: ObservableObject {
             guard !userID.isEmpty, !apiKey.isEmpty else {
                 return String(localized: "zotero.create.offlineDraft")
             }
-            await synchronize()
+            await synchronize(trigger: .requiredWork)
             let currentKey = cacheStore.canonicalAttachmentKey(temporaryAttachmentKey, userID: userID)
             let currentAttachment = cacheStore.load(userID: userID).attachments[currentKey]
             if currentAttachment?.isPendingSync == true { return String(localized: "zotero.create.offlineDraft") }
@@ -1002,7 +1002,7 @@ private final class ZoteroLibraryViewModel: ObservableObject {
             guard !userID.isEmpty, !apiKey.isEmpty else {
                 return String(localized: "zotero.create.offlineDraft")
             }
-            await synchronize()
+            await synchronize(trigger: .requiredWork)
             return cacheStore.load(userID: userID).attachments[temporaryAttachmentKey]?.isPendingSync == true
                 ? String(localized: "zotero.create.offlineDraft")
                 : nil
@@ -1885,7 +1885,7 @@ struct ZoteroLibraryView: View {
                         .frame(maxWidth: 260)
                         .accessibilityElement(children: .combine)
                     } else {
-                        Button { Task { await model.synchronize() } } label: {
+                        Button { Task { await model.synchronize(trigger: .manual) } } label: {
                             Image(systemName: "arrow.clockwise")
                         }
                         .accessibilityLabel(String(localized: "zotero.sidebar.syncLibrary"))
