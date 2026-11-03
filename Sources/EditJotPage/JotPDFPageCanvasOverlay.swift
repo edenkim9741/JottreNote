@@ -11,13 +11,18 @@ enum JotPDFPageRestorationPolicy {
 
 #if DEBUG
 enum JotCanvasGeometryExperimentMode: Int, CaseIterable {
-    case normal
-    case noManualContentSize
-    case noOffsetReset
-    case neither
+    case optimized
+    case manualContentSizeOnly
+    case manualContentOffsetOnly
+    case manualContentSizeAndOffset
 
-    var setsContentSize: Bool { self != .noManualContentSize && self != .neither }
-    var resetsContentOffset: Bool { self != .noOffsetReset && self != .neither }
+    var setsContentSize: Bool {
+        self == .manualContentSizeOnly || self == .manualContentSizeAndOffset
+    }
+
+    var resetsContentOffset: Bool {
+        self == .manualContentOffsetOnly || self == .manualContentSizeAndOffset
+    }
 }
 #endif
 
@@ -36,8 +41,8 @@ final class JotPDFPageCanvasOverlay: UIView {
     private var appliedGeometry: JotCanvasRenderGeometry?
     private var lastMemorySampleZoomBucket: Int?
 #if DEBUG
-    static var geometryExperimentMode: JotCanvasGeometryExperimentMode = .normal
-    private var appliedExperimentMode: JotCanvasGeometryExperimentMode = .normal
+    static var geometryExperimentMode: JotCanvasGeometryExperimentMode = .optimized
+    private var appliedExperimentMode: JotCanvasGeometryExperimentMode = .optimized
 #endif
     private weak var scaleReferenceView: UIView?
     private(set) var pdfViewScaleFactor: CGFloat = 1
@@ -182,8 +187,8 @@ final class JotPDFPageCanvasOverlay: UIView {
         let resetsContentOffset = experimentMode.resetsContentOffset
         let experimentChanged = experimentMode != appliedExperimentMode
 #else
-        let setsContentSize = true
-        let resetsContentOffset = true
+        let setsContentSize = false
+        let resetsContentOffset = false
 #endif
         var geometryAlreadyApplied = geometry == appliedGeometry
 #if DEBUG

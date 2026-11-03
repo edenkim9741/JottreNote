@@ -530,8 +530,8 @@ final class EditorInteractionUITests: XCTestCase {
             }
         }
 
-        // At the 32x stress point, compare the three independent UIScrollView
-        // state variants: automatic contentSize, natural contentOffset, and both.
+        // At the 32x stress point, compare manual contentSize, forced
+        // contentOffset, and both against the optimized default geometry.
         for _ in 0..<5 { zoomButton.tap() } // 64x -> 1x -> 2x -> 4x -> 8x -> 16x
         zoomButton.tap() // 32x
         var state = try info(page)
@@ -545,6 +545,12 @@ final class EditorInteractionUITests: XCTestCase {
         let settledRatio = try XCTUnwrap(state["scaleFactor"] as? Double)
             / (try XCTUnwrap(state["fitScaleFactor"] as? Double))
         XCTAssertEqual(settledRatio, 32, accuracy: 0.32)
+        print(
+            "[CanvasGeometryExperiment] mode=0 " +
+            "footprint=\(state["physicalFootprintBytes"] ?? "?") " +
+            "canvasBounds=\(state["canvasBounds"] ?? "?") " +
+            "contentSize=\(state["contentSize"] ?? "?")"
+        )
         let geometryButton = app.buttons["editor.test.geometryExperiment"]
         XCTAssertTrue(geometryButton.waitForExistence(timeout: 5))
         for expectedMode in 1...3 {
@@ -566,6 +572,12 @@ final class EditorInteractionUITests: XCTestCase {
             )
             let endError = try endpointDrift(
                 in: state, touchKey: "touchEndWindow", strokeKey: "lastStrokeEndWindow"
+            )
+            print(
+                "[CanvasGeometryExperiment] mode=\(expectedMode) " +
+                "footprint=\(state["physicalFootprintBytes"] ?? "?") " +
+                "canvasBounds=\(state["canvasBounds"] ?? "?") " +
+                "contentSize=\(state["contentSize"] ?? "?")"
             )
             print("[ZoomCoordinate] geometryMode=\(expectedMode) requested=32x touchToStrokeStart=\(startError)pt touchToStrokeEnd=\(endError)pt")
             XCTContext.runActivity(named: "32x geometry experiment \(expectedMode)") { activity in
