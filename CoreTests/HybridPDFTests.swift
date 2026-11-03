@@ -1442,6 +1442,50 @@ final class HybridPDFTests: XCTestCase {
         XCTAssertEqual(recovered.attachments[key]?.syncError, "previous cache unavailable")
     }
 
+    func testSuccessfulRecoveryClearsAttachmentErrorAndPendingQueue() throws {
+        let userID = "download-recovery-success-\(UUID().uuidString)"
+        let key = "RECOVER02"
+        let attachment = ZoteroAttachment(
+            key: key,
+            parentItemKey: nil,
+            contentType: "application/pdf",
+            filename: "recovery.pdf",
+            localCachePath: nil,
+            syncStatus: .cloudOnly,
+            version: 1,
+            md5: nil,
+            modificationTimeMilliseconds: nil,
+            syncError: "Could not download or open the PDF."
+        )
+        let snapshot = ZoteroCacheSnapshot(
+            userID: userID,
+            lastLibraryVersion: 1,
+            collections: [:],
+            items: [:],
+            attachments: [key: attachment],
+            lastSyncedAt: Date(),
+            pendingRemoteDownloads: [key, key]
+        )
+        let store = ZoteroCacheStore()
+        try store.save(snapshot)
+        let cacheURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("recovered-\(UUID().uuidString).pdf")
+        defer { try? FileManager.default.removeItem(at: cacheURL) }
+        try makePDF(pageSize: CGSize(width: 240, height: 320), rotation: 0).write(to: cacheURL)
+
+        let recovered = try store.markDownloaded(
+            key: key,
+            path: cacheURL,
+            md5: "recovered-hash",
+            userID: userID
+        )
+
+        XCTAssertEqual(recovered.attachments[key]?.syncStatus, .downloaded)
+        XCTAssertNil(recovered.attachments[key]?.syncError)
+        XCTAssertFalse(recovered.pendingRemoteDownloads.contains(key))
+        XCTAssertEqual(recovered.attachments[key]?.localCachePath, cacheURL.path)
+    }
+
     func testTrashedCollectionsAndTheirDescendantsAreHiddenFromSidebar() throws {
         let fromMeta = try XCTUnwrap(ZoteroAPIClient.collection(from: [
             "key": "TRASHED1",

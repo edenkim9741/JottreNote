@@ -365,7 +365,6 @@ final class ZoteroCacheStore: @unchecked Sendable {
                 where attachment.syncStatus == .downloaded && !attachment.isConflict && !attachment.isLocalOnly {
                 guard !hasUsableLocalFile(for: attachment) else { continue }
                 attachment.localCachePath = nil
-                attachment.md5 = nil
                 attachment.syncStatus = .cloudOnly
                 snapshot.attachments[key] = attachment
                 if !snapshot.pendingRemoteDownloads.contains(key) {
@@ -853,12 +852,23 @@ final class ZoteroCacheStore: @unchecked Sendable {
         }
     }
 
-    func markDownloaded(key: String, path: URL, md5: String, userID: String) throws -> ZoteroCacheSnapshot {
+    func markDownloaded(
+        key: String,
+        path: URL,
+        md5: String,
+        userID: String,
+        allowReplacingMissingDirtyAttachment: Bool = false
+    ) throws -> ZoteroCacheSnapshot {
         try withCacheAccess {
             var snapshot = loadUnlocked(userID: userID)
             guard var attachment = snapshot.attachments[key] else { throw Failure.attachmentNotFound }
             guard isUsableLocalCacheFile(at: path) else { throw Failure.invalidLocalAttachmentFile }
-            guard attachment.syncStatus != .dirty else { throw Failure.remoteDownloadWouldOverwriteDirtyAttachment }
+            if attachment.syncStatus == .dirty {
+                guard allowReplacingMissingDirtyAttachment,
+                      !attachment.isPendingSync else {
+                    throw Failure.remoteDownloadWouldOverwriteDirtyAttachment
+                }
+            }
             attachment.localCachePath = path.path
             attachment.syncStatus = .downloaded
             attachment.md5 = md5
@@ -1267,25 +1277,31 @@ final class ZoteroCacheStore: @unchecked Sendable {
                expectedRemoteMD5 != ZoteroSyncService.md5Hex(HybridPDFManager.pdfData(in: data)) {
                 throw Failure.remoteDownloadMetadataMismatch
             }
-            let url = defaultPDFCacheURL(for: key)
             guard Self.isValidPDFAttachment(data) else {
                 throw Failure.invalidLocalAttachmentFile
             }
+            let oldURL = attachment.localCachePath.map(URL.init(fileURLWithPath:))
+            let url = defaultPDFCacheURL(for: key).deletingLastPathComponent()
+                .appendingPathComponent("\(key).\(UUID().uuidString).pdf")
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try data.write(to: url, options: .atomic)
-            guard isUsableLocalCacheFile(at: url) else {
-                throw Failure.invalidLocalAttachmentFile
+            do {
+                try data.write(to: url, options: .atomic)
+                guard isUsableLocalCacheFile(at: url) else { throw Failure.invalidLocalAttachmentFile }
+                attachment.localCachePath = url.path
+                attachment.syncStatus = .downloaded
+                attachment.md5 = ZoteroSyncService.md5Hex(data)
+                attachment.verificationRemoteMD5 = nil
+                attachment.verificationRemoteMD5WasChecked = false
+                attachment.syncError = nil
+                clearParentSyncError(for: attachment, snapshot: &snapshot)
+                snapshot.attachments[key] = attachment
+                snapshot.pendingRemoteDownloads.removeAll { $0 == key }
+                try saveUnlocked(snapshot)
+            } catch {
+                try? FileManager.default.removeItem(at: url)
+                throw error
             }
-            attachment.localCachePath = url.path
-            attachment.syncStatus = .downloaded
-            attachment.md5 = ZoteroSyncService.md5Hex(data)
-            attachment.verificationRemoteMD5 = nil
-            attachment.verificationRemoteMD5WasChecked = false
-            attachment.syncError = nil
-            clearParentSyncError(for: attachment, snapshot: &snapshot)
-            snapshot.attachments[key] = attachment
-            snapshot.pendingRemoteDownloads.removeAll { $0 == key }
-            try saveUnlocked(snapshot)
+            if let oldURL, oldURL != url { try? FileManager.default.removeItem(at: oldURL) }
             return true
         }
     }

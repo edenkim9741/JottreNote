@@ -83,7 +83,10 @@ actor ZoteroSyncEngine {
                 )
 
                 if let downloadAttachment {
-                    let keys = snapshot.pendingRemoteDownloads.filter { key in
+                    let uniquePendingKeys = snapshot.pendingRemoteDownloads.reduce(into: [String]()) { keys, key in
+                        if !keys.contains(key) { keys.append(key) }
+                    }
+                    let keys = uniquePendingKeys.filter { key in
                         guard let attachment = snapshot.attachments[key] else { return false }
                         return !attachment.isConflict && !attachment.isLocalOnly
                     }
