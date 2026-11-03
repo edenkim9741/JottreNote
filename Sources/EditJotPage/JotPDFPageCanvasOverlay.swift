@@ -40,7 +40,8 @@ final class JotPDFPageCanvasOverlay: UIView {
     private var appliedExperimentMode: JotCanvasGeometryExperimentMode = .normal
 #endif
     private weak var scaleReferenceView: UIView?
-    private var pdfViewScaleFactor: CGFloat = 1
+    private(set) var pdfViewScaleFactor: CGFloat = 1
+    private(set) var fitScaleFactor: CGFloat = 1
     var viewportHostTransform: CGAffineTransform { viewportHost.transform }
 
     init(canvas: PKCanvasView, pageSize: CGSize, drawingWidth: CGFloat = 1_200) {
@@ -109,6 +110,11 @@ final class JotPDFPageCanvasOverlay: UIView {
     func configure(in coordinateView: UIView, pdfScaleFactor: CGFloat) {
         scaleReferenceView = coordinateView
         pdfViewScaleFactor = pdfScaleFactor
+        if let pdfView = coordinateView as? PDFView,
+           pdfView.scaleFactorForSizeToFit.isFinite,
+           pdfView.scaleFactorForSizeToFit > 0 {
+            fitScaleFactor = pdfView.scaleFactorForSizeToFit
+        }
         let measured = measuredDisplayScale()
         if measured.isFinite, measured > 0 { displayScale = measured }
         updateCanvasGeometry()
@@ -265,6 +271,8 @@ final class JotPDFPageCanvasOverlay: UIView {
                         diagnosticsCropBox.width, diagnosticsCropBox.height],
             "pageDimensions": [bounds.width, bounds.height],
             "pdfScaleFactor": pdfViewScaleFactor,
+            "fitScaleFactor": fitScaleFactor,
+            "relativeZoom": pdfViewScaleFactor / max(fitScaleFactor, 0.01),
             "measuredDisplayScale": displayScale,
             "screenScale": window?.screen.nativeScale ?? traitCollection.displayScale,
             "requestedCanvasZoom": requestedZoom,

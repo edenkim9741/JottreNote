@@ -382,6 +382,7 @@ final class EditorInteractionUITests: XCTestCase {
         XCTAssertEqual(state["pdfPageCount"] as? Int, 3)
         XCTAssertEqual((state["committedStrokeSeeds"] as? [UInt32])?.count, 416)
         let baselineBytes = try XCTUnwrap(state["physicalFootprintBytes"] as? UInt64)
+        print("[ZoomMemory] fixture pdfBytes=\(state["pdfDataBytes"] ?? "?") pages=\(state["pdfPageCount"] ?? "?") documentStrokes=\((state["committedStrokeSeeds"] as? [UInt32])?.count ?? -1)")
         print("[ZoomMemory] baseline footprint=\(baselineBytes) bytes (\(Double(baselineBytes) / 1_048_576) MiB) canvases=\(state["activeCanvasCount"] ?? "?") overlays=\(state["activeOverlayCount"] ?? "?")")
 
         let factors = [1.0, 2, 4, 8, 16, 32, 64]

@@ -28,6 +28,7 @@ enum EditorInteractionFixture {
     private static var zoomBaseScales: [ObjectIdentifier: CGFloat] = [:]
     private static var nextZoomStep = 0
     private static let zoomFactors: [CGFloat] = [1, 2, 4, 8, 16, 32, 64]
+    private(set) static var fixturePDFSizeBytes = 0
 
     static func didRecognizeScribble() {
         guard tool == "scribble-undo" else { return }
@@ -253,6 +254,7 @@ enum EditorInteractionFixture {
                 "screenScale": window.screen.scale,
                 "physicalFootprintBytes": JottreDiagnostics.currentFootprintBytesForTesting() ?? 0,
                 "pdfPageCount": pdfView.document?.pageCount ?? 0,
+                "pdfDataBytes": fixturePDFSizeBytes,
                 "activeCanvasCount": activeCanvasCounts.canvases,
                 "activeOverlayCount": activeCanvasCounts.overlays,
                 "currentPageIndex": currentPageIndex,
@@ -355,16 +357,33 @@ enum EditorInteractionFixture {
     static func makeDocument(using service: any JotFileServiceProtocol) throws -> JotFile.Info {
         let bounds = CGRect(x: 0, y: 0, width: 600, height: 800)
         let pageCount = tool == "scribble-undo" ? 1 : (tool == "zoom-memory" ? 3 : 2)
-        let sourcePDF = UIGraphicsPDFRenderer(bounds: bounds).pdfData { context in
-            for index in 0..<pageCount {
-                context.beginPage()
-                UIColor.white.setFill()
-                context.cgContext.fill(bounds)
-                if tool != "scribble-undo" {
-                    ("Selectable text page \(index + 1)" as NSString).draw(
+        let sourcePDF: Data
+        if tool == "zoom-memory" {
+            let image = makeMemoryFixtureImage()
+            sourcePDF = UIGraphicsPDFRenderer(bounds: bounds).pdfData { context in
+                for index in 0..<pageCount {
+                    context.beginPage()
+                    if let cgImage = image.cgImage {
+                        context.cgContext.draw(cgImage, in: bounds)
+                    }
+                    ("Memory fixture page \(index + 1)" as NSString).draw(
                         at: CGPoint(x: 40, y: 40),
                         withAttributes: [.font: UIFont.systemFont(ofSize: 24), .foregroundColor: UIColor.black]
                     )
+                }
+            }
+        } else {
+            sourcePDF = UIGraphicsPDFRenderer(bounds: bounds).pdfData { context in
+                for index in 0..<pageCount {
+                    context.beginPage()
+                    UIColor.white.setFill()
+                    context.cgContext.fill(bounds)
+                    if tool != "scribble-undo" {
+                        ("Selectable text page \(index + 1)" as NSString).draw(
+                            at: CGPoint(x: 40, y: 40),
+                            withAttributes: [.font: UIFont.systemFont(ofSize: 24), .foregroundColor: UIColor.black]
+                        )
+                    }
                 }
             }
         }
@@ -378,6 +397,7 @@ enum EditorInteractionFixture {
         } else {
             pdf = sourcePDF
         }
+        fixturePDFSizeBytes = pdf.count
         let initialStrokeCount = tool == "blank-pen" ? 1
             : (tool == "scribble-undo" ? 0 : (tool == "zoom-memory" ? 416 : 2))
         let strokeEntries: [(stroke: PKStroke, pageIndex: Int)] = (0..<initialStrokeCount).map { index in
@@ -439,6 +459,31 @@ enum EditorInteractionFixture {
             )
         )
         return info
+    }
+
+    private static func makeMemoryFixtureImage() -> UIImage {
+        let size = CGSize(width: 1_800, height: 2_400)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let renderer = UIGraphicsImageRenderer(size: size, format: format)
+        return renderer.image { context in
+            UIColor.white.setFill()
+            context.cgContext.fill(CGRect(origin: .zero, size: size))
+            var random = UInt32(0x9741_2026)
+            for _ in 0..<6_000 {
+                random = random &* 1_664_525 &+ 1_013_904_223
+                let x = CGFloat(random % UInt32(size.width))
+                random = random &* 1_664_525 &+ 1_013_904_223
+                let y = CGFloat(random % UInt32(size.height))
+                random = random &* 1_664_525 &+ 1_013_904_223
+                let diameter = CGFloat(random % 28) + 4
+                let red = CGFloat((random >> 16) & 0xFF) / 255
+                let green = CGFloat((random >> 8) & 0xFF) / 255
+                let blue = CGFloat(random & 0xFF) / 255
+                UIColor(red: red, green: green, blue: blue, alpha: 1).setFill()
+                context.cgContext.fillEllipse(in: CGRect(x: x, y: y, width: diameter, height: diameter))
+            }
+        }
     }
 
     private static func installUndoButton(
