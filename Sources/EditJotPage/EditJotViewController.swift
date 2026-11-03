@@ -790,6 +790,9 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
             "isUndoing=\(manager?.isUndoing ?? false) isRedoing=\(manager?.isRedoing ?? false)"
         )
     }
+#else
+    private func debugScribbleUndoState(_ operation: String, manager: UndoManager?) {}
+#endif
 
     private func consumePencilKitScribbleUndoIfPresent(
         _ event: EditJotViewModel.ScribbleEraseEvent,
@@ -822,9 +825,6 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
             manager: manager
         )
     }
-    #else
-    private func debugScribbleUndoState(_ operation: String, manager: UndoManager?) {}
-    #endif
 
     private var inkUndoManager: UndoManager? {
         toolUndoManager
