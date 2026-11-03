@@ -228,7 +228,18 @@ final class JottreDiagnostics: NSObject, MXMetricManagerSubscriber, @unchecked S
             session["memoryWarningCount"] = count
             var details = latestCanvasMemoryContext
             details["count"] = count
-            details["footprintBytes"] = Self.currentFootprintBytes() as Any? ?? NSNull()
+            let footprint = Self.currentFootprintBytes()
+            details["footprintBytes"] = footprint as Any? ?? NSNull()
+            if let footprint {
+                // A memory warning is an observation too. Include it in the
+                // session summary so a peak between periodic samples is not
+                // lost from the diagnostic report.
+                session["lastFootprintBytes"] = footprint
+                session["highestFootprintBytes"] = max(
+                    session["highestFootprintBytes"] as? UInt64 ?? 0,
+                    footprint
+                )
+            }
             appendEvent("memory.warning", details: details)
             appendEvent("canvas.memoryWarning", details: details)
         }
