@@ -97,6 +97,18 @@ actor ZoteroSyncEngine {
                             source: .librarySync,
                             relatedAttachmentID: conflictRelationID
                         )
+                        let isRecoveryDownload = snapshot.attachments[key]?.syncError != nil
+                            || snapshot.attachments[key]?.syncStatus == .cloudOnly && conflictRelationID != nil
+                        if isRecoveryDownload {
+                            var details = context.eventDetails
+                            details["attachmentID"] = String(ZoteroSyncService.md5Hex(Data(key.utf8)).prefix(12))
+                            details["stage"] = "downloadStarted"
+                            details["previousSyncStatus"] = snapshot.attachments[key]?.syncStatus.rawValue
+                            details["pendingQueued"] = true
+                            details["dirty"] = snapshot.attachments[key]?.syncStatus == .dirty
+                            details["conflictCopyExists"] = conflictRelationID != nil
+                            JottreDiagnostics.shared.record("zotero.recovery.downloadStarted", details: details)
+                        }
                         if isConflictRelatedDownload {
                             var details = context.eventDetails
                             details["stage"] = "remoteDownload"
@@ -127,6 +139,14 @@ actor ZoteroSyncEngine {
                                 details["cacheSaved"] = true
                                 details["byteCount"] = data.count
                                 JottreDiagnostics.shared.record("zotero.download.cacheSaved", details: details)
+                                if isRecoveryDownload {
+                                    details["stage"] = "cacheInstalled"
+                                    details["finalStatus"] = ZoteroAttachmentSyncStatus.downloaded.rawValue
+                                    details["localFileValid"] = true
+                                    JottreDiagnostics.shared.record("zotero.recovery.cacheInstalled", details: details)
+                                    JottreDiagnostics.shared.record("zotero.recovery.downloadSucceeded", details: details)
+                                    JottreDiagnostics.shared.record("zotero.recovery.completed", details: details)
+                                }
                                 if conflictRelationID != nil {
                                     details["stage"] = "remoteInstalled"
                                     JottreDiagnostics.shared.record("zotero.conflict.remoteInstalled", details: details)
@@ -134,6 +154,17 @@ actor ZoteroSyncEngine {
                             }
                         } catch {
                             if isCancellation(error) { throw CancellationError() }
+                            if isRecoveryDownload {
+                                var details = context.eventDetails
+                                details["attachmentID"] = String(ZoteroSyncService.md5Hex(Data(key.utf8)).prefix(12))
+                                details["stage"] = "webDAVDownloadOrInstall"
+                                details["previousSyncStatus"] = snapshot.attachments[key]?.syncStatus.rawValue
+                                details["errorType"] = String(reflecting: type(of: error))
+                                details["errorDomain"] = (error as NSError).domain
+                                details["errorCode"] = (error as NSError).code
+                                details["pendingRetained"] = cacheStore.load(userID: userID).pendingRemoteDownloads.contains(key)
+                                JottreDiagnostics.shared.record("zotero.recovery.downloadFailed", details: details)
+                            }
                             if isConflictRelatedDownload || cacheStore.conflictDiagnosticID(forOriginalKey: key, userID: userID) != nil {
                                 var details = context.eventDetails
                                 if details["relatedAttachmentID"] == nil {

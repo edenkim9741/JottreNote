@@ -368,6 +368,40 @@ final class ZoteroCacheStore: @unchecked Sendable {
                 attachment.md5 = nil
                 attachment.syncStatus = .cloudOnly
                 snapshot.attachments[key] = attachment
+                if !snapshot.pendingRemoteDownloads.contains(key) {
+                    snapshot.pendingRemoteDownloads.append(key)
+                }
+                JottreDiagnostics.shared.record("zotero.recovery.candidateDetected", details: [
+                    "attachmentID": Self.anonymizedRecoveryID(for: key),
+                    "previousSyncStatus": ZoteroAttachmentSyncStatus.downloaded.rawValue,
+                    "pendingBeforeRepair": false,
+                    "localFileValid": false,
+                    "dirty": false,
+                    "conflictCopyExists": snapshot.attachments.values.contains {
+                        $0.isConflict && $0.conflictOriginalKey == key
+                    },
+                    "reason": "downloadedCacheMissingOrInvalid",
+                    "finalStatus": ZoteroAttachmentSyncStatus.cloudOnly.rawValue
+                ])
+                repairedMissingLocalFiles = true
+            }
+            for (key, attachment) in snapshot.attachments
+                where attachment.syncStatus == .cloudOnly && attachment.syncError != nil
+                    && !attachment.isConflict && !attachment.isLocalOnly {
+                guard !snapshot.pendingRemoteDownloads.contains(key) else { continue }
+                snapshot.pendingRemoteDownloads.append(key)
+                JottreDiagnostics.shared.record("zotero.recovery.candidateDetected", details: [
+                    "attachmentID": Self.anonymizedRecoveryID(for: key),
+                    "previousSyncStatus": ZoteroAttachmentSyncStatus.cloudOnly.rawValue,
+                    "pendingBeforeRepair": false,
+                    "localFileValid": hasUsableLocalFile(for: attachment),
+                    "dirty": false,
+                    "conflictCopyExists": snapshot.attachments.values.contains {
+                        $0.isConflict && $0.conflictOriginalKey == key
+                    },
+                    "reason": "cloudOnlyWithPriorSyncError",
+                    "finalStatus": ZoteroAttachmentSyncStatus.cloudOnly.rawValue
+                ])
                 repairedMissingLocalFiles = true
             }
             if repairedMissingLocalFiles { try? saveUnlocked(snapshot) }
@@ -820,14 +854,27 @@ final class ZoteroCacheStore: @unchecked Sendable {
     }
 
     func markDownloaded(key: String, path: URL, md5: String, userID: String) throws -> ZoteroCacheSnapshot {
-        try updateAttachment(key: key, userID: userID) { attachment in
-            guard isUsableLocalCacheFile(at: path) else {
-                throw Failure.invalidLocalAttachmentFile
-            }
+        try withCacheAccess {
+            var snapshot = loadUnlocked(userID: userID)
+            guard var attachment = snapshot.attachments[key] else { throw Failure.attachmentNotFound }
+            guard isUsableLocalCacheFile(at: path) else { throw Failure.invalidLocalAttachmentFile }
+            guard attachment.syncStatus != .dirty else { throw Failure.remoteDownloadWouldOverwriteDirtyAttachment }
             attachment.localCachePath = path.path
             attachment.syncStatus = .downloaded
             attachment.md5 = md5
+            attachment.syncError = nil
+            attachment.verificationRemoteMD5 = nil
+            attachment.verificationRemoteMD5WasChecked = false
+            clearParentSyncError(for: attachment, snapshot: &snapshot)
+            snapshot.attachments[key] = attachment
+            snapshot.pendingRemoteDownloads.removeAll { $0 == key }
+            try saveUnlocked(snapshot)
+            return snapshot
         }
+    }
+
+    private static func anonymizedRecoveryID(for key: String) -> String {
+        String(ZoteroSyncService.md5Hex(Data(key.utf8)).prefix(12))
     }
 
     func markDirty(key: String, userID: String) throws -> ZoteroCacheSnapshot {

@@ -1406,6 +1406,42 @@ final class HybridPDFTests: XCTestCase {
         XCTAssertNil(reconciled.collections["ORPHAN01"])
     }
 
+    func testMissingDownloadedAttachmentIsQueuedForRecoveryOnCacheLoad() throws {
+        let userID = "missing-download-recovery-\(UUID().uuidString)"
+        let key = "RECOVER01"
+        let missingURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("missing-\(UUID().uuidString).pdf")
+        let attachment = ZoteroAttachment(
+            key: key,
+            parentItemKey: nil,
+            contentType: "application/pdf",
+            filename: "recovery.pdf",
+            localCachePath: missingURL.path,
+            syncStatus: .downloaded,
+            version: 1,
+            md5: "old-cache-hash",
+            modificationTimeMilliseconds: nil,
+            syncError: "previous cache unavailable"
+        )
+        let snapshot = ZoteroCacheSnapshot(
+            userID: userID,
+            lastLibraryVersion: 1,
+            collections: [:],
+            items: [:],
+            attachments: [key: attachment],
+            lastSyncedAt: Date()
+        )
+        let store = ZoteroCacheStore()
+        try store.save(snapshot)
+
+        let recovered = store.load(userID: userID)
+
+        XCTAssertEqual(recovered.attachments[key]?.syncStatus, .cloudOnly)
+        XCTAssertNil(recovered.attachments[key]?.localCachePath)
+        XCTAssertEqual(recovered.pendingRemoteDownloads.filter { $0 == key }.count, 1)
+        XCTAssertEqual(recovered.attachments[key]?.syncError, "previous cache unavailable")
+    }
+
     func testTrashedCollectionsAndTheirDescendantsAreHiddenFromSidebar() throws {
         let fromMeta = try XCTUnwrap(ZoteroAPIClient.collection(from: [
             "key": "TRASHED1",
