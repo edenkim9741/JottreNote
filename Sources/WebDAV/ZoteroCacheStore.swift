@@ -1344,8 +1344,17 @@ final class ZoteroCacheStore: @unchecked Sendable {
             let localPDFMatchesRemote = localPDFData == remotePDFData
             let localJotMatchesRemote = localJotData == remoteJotData
             let localContentMatches = localPDFMatchesRemote && localJotMatchesRemote
-            let contentMatches = baselineMD5.map { $0 == remoteMD5 || localContentMatches }
-                ?? (localPDFMatchesRemote && localJotMatchesRemote)
+            let contentMatches: Bool
+            if attachment.verificationRemoteMD5WasChecked {
+                // `remoteMD5` may already contain the newly observed server
+                // hash. It is no longer a trustworthy previous baseline, so
+                // compare both the PDF and Jot sidecar content directly.
+                contentMatches = localContentMatches
+            } else if let baselineMD5 {
+                contentMatches = baselineMD5 == remoteMD5 || localContentMatches
+            } else {
+                contentMatches = localContentMatches
+            }
 
             if contentMatches {
                 attachment.remoteMD5 = remoteMD5
@@ -1618,6 +1627,15 @@ final class ZoteroCacheStore: @unchecked Sendable {
             }
             return conflict.conflictDiagnosticID
         }
+    }
+
+    func hasUsableConflictCopy(forOriginalKey originalKey: String, userID: String) -> Bool {
+        let snapshot = load(userID: userID)
+        guard let conflict = snapshot.attachments.values.first(where: {
+            $0.isConflict && $0.conflictOriginalKey == originalKey
+        }),
+        let path = conflict.conflictLocalPath ?? conflict.localCachePath else { return false }
+        return isUsableLocalCacheFile(at: URL(fileURLWithPath: path))
     }
 
     func ensureConflictDiagnosticID(key: String, userID: String) throws -> String {

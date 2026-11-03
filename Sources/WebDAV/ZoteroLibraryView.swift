@@ -53,6 +53,40 @@ enum ZoteroAttachmentDisplayStatus: Equatable {
     }
 }
 
+enum ZoteroDownloadInstallTransaction {
+    /// A committed cache is the durable recovery point. If the atomic Jot
+    /// write fails, the next open rebuilds it from the validated cache.
+    static func commit<CacheState>(
+        installCache: () throws -> CacheState,
+        persistLocalJot: (CacheState) throws -> Void
+    ) throws -> CacheState {
+        let installedState = try installCache()
+        try persistLocalJot(installedState)
+        return installedState
+    }
+}
+
+@MainActor
+enum ZoteroLocalJotBaseline {
+    static func matches(localJot: Jot, baselineData: Data) -> Bool {
+        guard localJot.pdfData != nil,
+              let localDrawing = try? PKDrawing(data: localJot.drawing) else { return false }
+        let baselineJot = (try? HybridPDFManager.load(data: baselineData).jot) ?? Jot.makeEmpty()
+        guard let baselineDrawing = try? PKDrawing(data: baselineJot.drawing),
+              JotEditorDrawingState.drawingsMatch(localDrawing, baselineDrawing),
+              localJot.width == baselineJot.width,
+              localJot.extraPages == baselineJot.extraPages,
+              localJot.pdfInsertedPageSlots == baselineJot.pdfInsertedPageSlots,
+              localJot.strokePageIndices == baselineJot.strokePageIndices,
+              localJot.trashedPages == baselineJot.trashedPages else { return false }
+
+        // PDFKit may rewrite equivalent PDF bytes. The Jot drawing and page
+        // metadata are the local edit state; the remote PDF hash is validated
+        // separately by ZoteroSyncService.
+        return true
+    }
+}
+
 enum ZoteroLibraryAttachmentProjection {
     static func attachments(
         in snapshot: ZoteroCacheSnapshot,
@@ -1096,15 +1130,15 @@ private final class ZoteroLibraryViewModel: ObservableObject {
         let currentAttachment = cacheStore.load(userID: userID).attachments[attachment.key] ?? attachment
         var downloadContext: ZoteroDownloadContext?
         var sourceDataReady = false
+        var remoteCacheInstalled = false
+        var jotSaved = false
         var failureStage = "localCacheRead"
         do {
-            let sourceData: Data
-            let loadedFromLocalCache: Bool
+            var sourceData: Data
+            var loadedFromLocalCache: Bool
             let hasLocalFile = cacheStore.hasUsableLocalFile(for: currentAttachment)
             let jotRecoveryFileExists = FileManager.default.fileExists(atPath: jotSessionID(for: attachment.key))
-            let jotMatchesCachedBaseline = localJotMatchesCachedBaseline(for: currentAttachment)
-            let hasUnverifiedJotRecoveryData = jotRecoveryFileExists && !jotMatchesCachedBaseline
-            let hasConflictCopy = cacheStore.conflictDiagnosticID(forOriginalKey: attachment.key, userID: userID) != nil
+            let hasConflictCopy = cacheStore.hasUsableConflictCopy(forOriginalKey: attachment.key, userID: userID)
             let currentCachePathExists = currentAttachment.localCachePath.map {
                 FileManager.default.fileExists(atPath: $0)
             } ?? false
@@ -1120,21 +1154,9 @@ private final class ZoteroLibraryViewModel: ObservableObject {
                 ])
                 throw ZoteroCacheStore.Failure.invalidLocalAttachmentFile
             }
-            if !hasLocalFile && hasUnverifiedJotRecoveryData {
-                JottreDiagnostics.shared.record("zotero.recovery.blockedForLocalChanges", details: [
-                    "attachmentID": String(ZoteroSyncService.md5Hex(Data(attachment.key.utf8)).prefix(12)),
-                    "previousSyncStatus": currentAttachment.syncStatus.rawValue,
-                    "syncErrorPresent": currentAttachment.syncError != nil,
-                    "localFileValid": false,
-                    "dirty": currentAttachment.syncStatus == .dirty,
-                    "conflictCopyExists": hasConflictCopy,
-                    "reason": "localJotDiffersFromLastCachedBaseline"
-                ])
-                throw ZoteroCacheStore.Failure.invalidLocalAttachmentFile
-            }
             let canRecoverMissingDirtyCache = currentAttachment.syncStatus == .dirty
                 && !currentAttachment.isPendingSync
-                && !jotRecoveryFileExists
+                && (!jotRecoveryFileExists || hasConflictCopy)
                 && (!currentCachePathExists || hasConflictCopy)
             if currentAttachment.syncStatus == .dirty && !hasLocalFile && !canRecoverMissingDirtyCache {
                 JottreDiagnostics.shared.record("zotero.recovery.skippedForLocalChanges", details: [
@@ -1155,8 +1177,7 @@ private final class ZoteroLibraryViewModel: ObservableObject {
                    isValidEditorPDFData(localData) {
                     sourceData = localData
                     loadedFromLocalCache = true
-                } else if hasUnverifiedJotRecoveryData
-                            || currentAttachment.syncStatus == .dirty && !canRecoverMissingDirtyCache {
+                } else if currentAttachment.syncStatus == .dirty && !canRecoverMissingDirtyCache {
                     JottreDiagnostics.shared.record("zotero.recovery.skippedForLocalChanges", details: [
                         "attachmentID": String(ZoteroSyncService.md5Hex(Data(attachment.key.utf8)).prefix(12)),
                         "previousSyncStatus": currentAttachment.syncStatus.rawValue,
@@ -1191,6 +1212,37 @@ private final class ZoteroLibraryViewModel: ObservableObject {
                 )
                 loadedFromLocalCache = false
             }
+            if jotRecoveryFileExists,
+               loadedFromLocalCache,
+               !localJotMatchesBaseline(for: attachment.key, data: sourceData) {
+                if (currentAttachment.syncStatus == .dirty || currentAttachment.isPendingSync)
+                    && !hasConflictCopy {
+                    JottreDiagnostics.shared.record("zotero.recovery.blockedForLocalChanges", details: [
+                        "attachmentID": String(ZoteroSyncService.md5Hex(Data(attachment.key.utf8)).prefix(12)),
+                        "previousSyncStatus": currentAttachment.syncStatus.rawValue,
+                        "syncErrorPresent": currentAttachment.syncError != nil,
+                        "localFileValid": true,
+                        "dirty": true,
+                        "conflictCopyExists": false,
+                        "reason": "dirtyJotDiffersFromCachedPDF"
+                    ])
+                    throw ZoteroCacheStore.Failure.invalidLocalAttachmentFile
+                }
+                // A Jot may have reached disk before an older version failed
+                // to commit its PDF cache. Check the remote baseline before
+                // treating a byte mismatch as local ink or overwriting it.
+                recordRecoveryValidationFailure(for: currentAttachment, reason: "localJotDiffersFromCacheBaseline")
+                let context = ZoteroDownloadContext(source: .documentOpen)
+                downloadContext = context
+                failureStage = "localJotBaselineFetch"
+                recordRecoveryStart(for: currentAttachment, context: context)
+                sourceData = try await makeSyncService().download(
+                    documentID: attachment.key,
+                    context: context,
+                    expectedRemoteMD5: expectedRemoteMD5(for: currentAttachment)
+                )
+                loadedFromLocalCache = false
+            }
             sourceDataReady = true
             if let downloadContext {
                 var details = downloadContext.eventDetails
@@ -1198,6 +1250,21 @@ private final class ZoteroLibraryViewModel: ObservableObject {
                 details["downloadedBytes"] = sourceData.count
                 details["valid"] = isValidEditorPDFData(sourceData)
                 JottreDiagnostics.shared.record("zotero.recovery.remoteValidationCompleted", details: details)
+            }
+            if jotRecoveryFileExists,
+               !localJotMatchesBaseline(for: attachment.key, data: sourceData),
+               !hasConflictCopy {
+                failureStage = "localJotBaselineValidation"
+                JottreDiagnostics.shared.record("zotero.recovery.blockedForLocalChanges", details: [
+                    "attachmentID": String(ZoteroSyncService.md5Hex(Data(attachment.key.utf8)).prefix(12)),
+                    "previousSyncStatus": currentAttachment.syncStatus.rawValue,
+                    "syncErrorPresent": currentAttachment.syncError != nil,
+                    "localFileValid": hasLocalFile,
+                    "dirty": currentAttachment.syncStatus == .dirty || currentAttachment.isPendingSync,
+                    "conflictCopyExists": false,
+                    "reason": "localJotContentDiffersFromValidatedPDFBaseline"
+                ])
+                throw ZoteroCacheStore.Failure.invalidLocalAttachmentFile
             }
 
             failureStage = "hybridPDFValidation"
@@ -1225,54 +1292,77 @@ private final class ZoteroLibraryViewModel: ObservableObject {
                 zoteroFileName: currentAttachment.filename
             )
             let fileInfo = JotFile.Info(url: fileURL, name: title, modificationDate: nil)
-            failureStage = "localJotSave"
-            try JotFileService(fileService: LocalFileService(fileManager: .default))
-                .write(jotFile: JotFile(info: fileInfo, jot: jot))
             if !loadedFromLocalCache {
                 failureStage = "localCacheSave"
                 let previousCacheURL = currentAttachment.localCachePath.map(URL.init(fileURLWithPath:))
                 let installedCacheURL = try savePDFCache(data: sourceData, key: currentAttachment.key)
                 do {
-                    snapshot = try cacheStore.markDownloaded(
-                        key: currentAttachment.key,
-                        path: installedCacheURL,
-                        md5: ZoteroSyncService.md5Hex(sourceData),
-                        userID: userID,
-                        allowReplacingMissingDirtyAttachment: canRecoverMissingDirtyCache
+                    let installedSnapshot = try ZoteroDownloadInstallTransaction.commit(
+                        installCache: {
+                            try cacheStore.markDownloaded(
+                                key: currentAttachment.key,
+                                path: installedCacheURL,
+                                md5: ZoteroSyncService.md5Hex(sourceData),
+                                userID: userID,
+                                allowReplacingMissingDirtyAttachment: canRecoverMissingDirtyCache
+                            )
+                        },
+                        persistLocalJot: { installedSnapshot in
+                            snapshot = installedSnapshot
+                            remoteCacheInstalled = true
+                            failureStage = "localJotSave"
+                            if let downloadContext {
+                                var details = downloadContext.eventDetails
+                                details["stage"] = "cacheInstalled"
+                                details["previousSyncStatus"] = currentAttachment.syncStatus.rawValue
+                                details["finalStatus"] = ZoteroAttachmentSyncStatus.downloaded.rawValue
+                                details["localFileValid"] = true
+                                JottreDiagnostics.shared.record("zotero.recovery.cacheInstalled", details: details)
+
+                                details["stage"] = "localCache"
+                                details["attempt"] = downloadContext.attempt
+                                details["cacheSaved"] = true
+                                details["byteCount"] = sourceData.count
+                                JottreDiagnostics.shared.record("zotero.download.cacheSaved", details: details)
+                            }
+                            try JotFileService(fileService: LocalFileService(fileManager: .default))
+                                .write(jotFile: JotFile(info: fileInfo, jot: jot))
+                        }
                     )
+                    snapshot = installedSnapshot
+                    jotSaved = true
                 } catch {
-                    try? FileManager.default.removeItem(at: installedCacheURL)
+                    if !remoteCacheInstalled {
+                        try? FileManager.default.removeItem(at: installedCacheURL)
+                    }
                     throw error
                 }
                 if let previousCacheURL, previousCacheURL != installedCacheURL {
                     try? FileManager.default.removeItem(at: previousCacheURL)
                 }
-                if let downloadContext {
-                    var details = downloadContext.eventDetails
-                    details["stage"] = "cacheInstalled"
-                    details["previousSyncStatus"] = currentAttachment.syncStatus.rawValue
-                    details["finalStatus"] = ZoteroAttachmentSyncStatus.downloaded.rawValue
-                    details["localFileValid"] = true
-                    JottreDiagnostics.shared.record("zotero.recovery.cacheInstalled", details: details)
-                    JottreDiagnostics.shared.record("zotero.recovery.downloadSucceeded", details: details)
-                    JottreDiagnostics.shared.record("zotero.recovery.completed", details: details)
+            } else {
+                if currentAttachment.syncStatus != .dirty,
+                   let cachePath = currentAttachment.localCachePath {
+                    snapshot = try cacheStore.markDownloaded(
+                        key: currentAttachment.key,
+                        path: URL(fileURLWithPath: cachePath),
+                        md5: ZoteroSyncService.md5Hex(sourceData),
+                        userID: userID
+                    )
                 }
-                if let downloadContext {
-                    var details = downloadContext.eventDetails
-                    details["stage"] = "localCache"
-                    details["attempt"] = downloadContext.attempt
-                    details["cacheSaved"] = true
-                    details["byteCount"] = sourceData.count
-                    JottreDiagnostics.shared.record("zotero.download.cacheSaved", details: details)
-                }
-            } else if currentAttachment.syncStatus != .dirty,
-                      let cachePath = currentAttachment.localCachePath {
-                snapshot = try cacheStore.markDownloaded(
-                    key: currentAttachment.key,
-                    path: URL(fileURLWithPath: cachePath),
-                    md5: ZoteroSyncService.md5Hex(sourceData),
-                    userID: userID
-                )
+                failureStage = "localJotSave"
+                try JotFileService(fileService: LocalFileService(fileManager: .default))
+                    .write(jotFile: JotFile(info: fileInfo, jot: jot))
+                jotSaved = true
+            }
+            if let downloadContext {
+                var details = downloadContext.eventDetails
+                details["stage"] = "localJotSaved"
+                details["cacheInstalled"] = remoteCacheInstalled
+                details["jotSaved"] = jotSaved
+                details["finalStatus"] = snapshot.attachments[currentAttachment.key]?.syncStatus.rawValue
+                JottreDiagnostics.shared.record("zotero.recovery.downloadSucceeded", details: details)
+                JottreDiagnostics.shared.record("zotero.recovery.completed", details: details)
             }
             if let onOpenJot {
                 onOpenJot(fileInfo)
@@ -1281,7 +1371,8 @@ private final class ZoteroLibraryViewModel: ObservableObject {
             }
         } catch {
             let wasCancelled = (error as? URLError)?.code == .cancelled || error is CancellationError || Task.isCancelled
-            if let downloadContext, !wasCancelled {
+            let wasBlockedForLocalChanges = failureStage == "localJotBaselineValidation"
+            if let downloadContext, !wasCancelled, !wasBlockedForLocalChanges {
                 var details = downloadContext.eventDetails
                 details["stage"] = failureStage
                 details["errorType"] = String(reflecting: type(of: error))
@@ -1289,13 +1380,24 @@ private final class ZoteroLibraryViewModel: ObservableObject {
                 details["errorCode"] = (error as NSError).code
                 details["previousSyncStatus"] = currentAttachment.syncStatus.rawValue
                 details["attempt"] = downloadContext.attempt
+                details["cacheInstalled"] = remoteCacheInstalled
+                details["jotSaved"] = jotSaved
+                let cacheCommittedJotPending = remoteCacheInstalled && !jotSaved
+                if cacheCommittedJotPending {
+                    details["partialRecoveryState"] = "cacheCommittedJotPendingRetry"
+                    JottreDiagnostics.shared.record("zotero.recovery.partialInstall", details: details)
+                }
                 if case WebDAVService.Failure.unexpectedResponse(let status) = error {
                     details["httpStatus"] = status
                 }
-                JottreDiagnostics.shared.record("zotero.recovery.downloadFailed", details: details)
-                JottreDiagnostics.shared.record("zotero.recovery.remoteDownloadFailed", details: details)
+                if !cacheCommittedJotPending {
+                    JottreDiagnostics.shared.record("zotero.recovery.downloadFailed", details: details)
+                    JottreDiagnostics.shared.record("zotero.recovery.remoteDownloadFailed", details: details)
+                }
             }
-            if sourceDataReady, let downloadContext, !wasCancelled {
+            if sourceDataReady, let downloadContext, !wasCancelled,
+               !wasBlockedForLocalChanges,
+               !(remoteCacheInstalled && !jotSaved) {
                 ZoteroSyncService.recordDownloadFailure(
                     error,
                     context: downloadContext,
@@ -1317,7 +1419,7 @@ private final class ZoteroLibraryViewModel: ObservableObject {
         details["pendingQueued"] = cacheStore.load(userID: userID).pendingRemoteDownloads.contains(attachment.key)
         details["localFileValid"] = cacheStore.hasUsableLocalFile(for: attachment)
         details["dirty"] = attachment.syncStatus == .dirty
-        details["conflictCopyExists"] = cacheStore.conflictDiagnosticID(forOriginalKey: attachment.key, userID: userID) != nil
+        details["conflictCopyExists"] = cacheStore.hasUsableConflictCopy(forOriginalKey: attachment.key, userID: userID)
         details["syncErrorPresent"] = attachment.syncError != nil
         JottreDiagnostics.shared.record("zotero.recovery.started", details: details)
         JottreDiagnostics.shared.record("zotero.recovery.remoteDownloadStarted", details: details)
@@ -1332,22 +1434,14 @@ private final class ZoteroLibraryViewModel: ObservableObject {
         return document.pageCount > 0
     }
 
-    private func localJotMatchesCachedBaseline(for attachment: ZoteroAttachment) -> Bool {
-        guard FileManager.default.fileExists(atPath: jotSessionID(for: attachment.key)) else { return false }
-        guard let expectedMD5 = attachment.md5,
-              let info = JotFile.Info(
-                url: URL(fileURLWithPath: jotSessionID(for: attachment.key)),
-                modificationDate: nil
-              ),
+    private func localJotMatchesBaseline(for key: String, data baselineData: Data) -> Bool {
+        let jotURL = URL(fileURLWithPath: jotSessionID(for: key))
+        guard let info = JotFile.Info(url: jotURL, modificationDate: nil),
               let file = try? JotFileService(fileService: LocalFileService(fileManager: .default))
                 .readJotFile(jotFileInfo: info),
-              let pdfData = file.jot.pdfData,
-              let encodedJot = try? JotHybridPDFBuilder.encodedJotData(file.jot),
-              let hybrid = try? HybridPDFManager.embedJotPreservingSourcePDF(
-                pdfData: pdfData,
-                jotData: encodedJot
-              ) else { return false }
-        return ZoteroSyncService.md5Hex(hybrid) == expectedMD5
+              file.jot.pdfData != nil else { return false }
+
+        return ZoteroLocalJotBaseline.matches(localJot: file.jot, baselineData: baselineData)
     }
 
     private func expectedRemoteMD5(for attachment: ZoteroAttachment) -> String? {
@@ -1364,7 +1458,7 @@ private final class ZoteroLibraryViewModel: ObservableObject {
             "syncErrorPresent": attachment.syncError != nil,
             "localFileValid": false,
             "dirty": attachment.syncStatus == .dirty,
-            "conflictCopyExists": cacheStore.conflictDiagnosticID(forOriginalKey: attachment.key, userID: userID) != nil,
+            "conflictCopyExists": cacheStore.hasUsableConflictCopy(forOriginalKey: attachment.key, userID: userID),
             "reason": reason
         ])
     }

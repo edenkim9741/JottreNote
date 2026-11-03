@@ -719,11 +719,11 @@ final class HybridPDFTests: XCTestCase {
         let userID = "conflict-\(UUID().uuidString)"
         let key = "ABCD2345"
         let parentKey = "PARENT23"
+        let remotePDF = try makePDF(pageSize: CGSize(width: 240, height: 320), rotation: 0)
         let localPDF = try HybridPDFManager.embedJotPreservingSourcePDF(
-            pdfData: makePDF(pageSize: CGSize(width: 240, height: 320), rotation: 0),
+            pdfData: remotePDF,
             jotData: Data("local hybrid handwriting".utf8)
         )
-        let remotePDF = try makePDF(pageSize: CGSize(width: 240, height: 320), rotation: 0)
         let store = ZoteroCacheStore()
         let item = ZoteroItem(
             key: parentKey,
@@ -1128,7 +1128,10 @@ final class HybridPDFTests: XCTestCase {
         let afterRebaseline = try store.apply(rebaselineDelta, userID: userID)
         XCTAssertEqual(afterRebaseline.attachments[attachment.key]?.syncStatus, .dirty)
         XCTAssertEqual(afterRebaseline.attachments[attachment.key]?.remoteMD5, "same-server-pdf-hash")
-        XCTAssertTrue(afterRebaseline.attachments[attachment.key]?.remoteMD5IsPDF == true)
+        XCTAssertFalse(
+            afterRebaseline.attachments[attachment.key]?.remoteMD5IsPDF ?? true,
+            "A newly observed remote checksum is not a verified dirty-local baseline until content is compared."
+        )
         XCTAssertFalse(afterRebaseline.attachments.values.contains(where: \.isLocalOnly))
     }
 
@@ -1484,6 +1487,148 @@ final class HybridPDFTests: XCTestCase {
         XCTAssertNil(recovered.attachments[key]?.syncError)
         XCTAssertFalse(recovered.pendingRemoteDownloads.contains(key))
         XCTAssertEqual(recovered.attachments[key]?.localCachePath, cacheURL.path)
+    }
+
+    func testRemoteCacheCommitCanRecoverAfterLocalJotPersistenceFailure() throws {
+        enum InjectedFailure: Error { case jotWrite }
+
+        let userID = "partial-download-install-\(UUID().uuidString)"
+        let recoveredKey = "RECOVER03"
+        let protectedKey = "RECOVER04"
+        let recoveredAttachment = ZoteroAttachment(
+            key: recoveredKey,
+            parentItemKey: nil,
+            contentType: "application/pdf",
+            filename: "recovered.pdf",
+            localCachePath: nil,
+            syncStatus: .cloudOnly,
+            version: 1,
+            md5: nil,
+            modificationTimeMilliseconds: nil,
+            syncError: "Could not download or open the PDF."
+        )
+        let protectedAttachment = ZoteroAttachment(
+            key: protectedKey,
+            parentItemKey: nil,
+            contentType: "application/pdf",
+            filename: "dirty.pdf",
+            localCachePath: nil,
+            syncStatus: .dirty,
+            version: 1,
+            md5: nil,
+            modificationTimeMilliseconds: nil,
+            isPendingSync: true,
+            syncError: "Upload pending"
+        )
+        let store = ZoteroCacheStore()
+        try store.save(ZoteroCacheSnapshot(
+            userID: userID,
+            lastLibraryVersion: 1,
+            collections: [:],
+            items: [:],
+            attachments: [recoveredKey: recoveredAttachment, protectedKey: protectedAttachment],
+            lastSyncedAt: Date(),
+            pendingRemoteDownloads: [recoveredKey]
+        ))
+
+        let pdfData = try makePDF(pageSize: CGSize(width: 240, height: 320), rotation: 0)
+        let recoveredURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("partial-recovery-\(UUID().uuidString).pdf")
+        let protectedURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("protected-dirty-\(UUID().uuidString).pdf")
+        defer {
+            try? FileManager.default.removeItem(at: recoveredURL)
+            try? FileManager.default.removeItem(at: protectedURL)
+        }
+        try pdfData.write(to: recoveredURL)
+        try pdfData.write(to: protectedURL)
+
+        XCTAssertThrowsError(try ZoteroDownloadInstallTransaction.commit(
+            installCache: {
+                try store.markDownloaded(
+                    key: recoveredKey,
+                    path: recoveredURL,
+                    md5: ZoteroSyncService.md5Hex(pdfData),
+                    userID: userID
+                )
+            },
+            persistLocalJot: { _ in throw InjectedFailure.jotWrite }
+        ))
+
+        let afterJotFailure = store.load(userID: userID)
+        XCTAssertEqual(afterJotFailure.attachments[recoveredKey]?.syncStatus, .downloaded)
+        XCTAssertNil(afterJotFailure.attachments[recoveredKey]?.syncError)
+        XCTAssertFalse(afterJotFailure.pendingRemoteDownloads.contains(recoveredKey))
+        XCTAssertTrue(store.hasUsableLocalFile(for: try XCTUnwrap(afterJotFailure.attachments[recoveredKey])))
+
+        var attemptedDirtyJotWrite = false
+        XCTAssertThrowsError(try ZoteroDownloadInstallTransaction.commit(
+            installCache: {
+                try store.markDownloaded(
+                    key: protectedKey,
+                    path: protectedURL,
+                    md5: ZoteroSyncService.md5Hex(pdfData),
+                    userID: userID
+                )
+            },
+            persistLocalJot: { _ in attemptedDirtyJotWrite = true }
+        ))
+        XCTAssertFalse(attemptedDirtyJotWrite)
+        let afterDirtyBlock = store.load(userID: userID)
+        XCTAssertEqual(afterDirtyBlock.attachments[protectedKey]?.syncStatus, .dirty)
+        XCTAssertEqual(afterDirtyBlock.attachments[protectedKey]?.syncError, "Upload pending")
+    }
+
+    @MainActor
+    func testLocalJotBaselineUsesContentRatherThanReembeddedPlistMD5() throws {
+        let pdfData = try makePDF(pageSize: CGSize(width: 240, height: 320), rotation: 0)
+        let sidecarJot = Jot.makeEmpty()
+        let sidecarData = try JotHybridPDFBuilder.encodedJotData(sidecarJot)
+        let baselineHybrid = try HybridPDFManager.embedJotPreservingSourcePDF(
+            pdfData: pdfData,
+            jotData: sidecarData
+        )
+        let sessionPDF = try XCTUnwrap(PDFDocument(data: pdfData)?.dataRepresentation())
+        let localJot = Jot(
+            drawing: sidecarJot.drawing,
+            width: sidecarJot.width,
+            pdfData: sessionPDF,
+            extraPages: sidecarJot.extraPages,
+            pdfInsertedPageSlots: sidecarJot.pdfInsertedPageSlots,
+            strokePageIndices: sidecarJot.strokePageIndices,
+            trashedPages: sidecarJot.trashedPages,
+            zoteroItemKey: "BASELINE1",
+            zoteroFileName: "baseline.pdf"
+        )
+
+        XCTAssertNotEqual(
+            try JotHybridPDFBuilder.encodedJotData(localJot),
+            sidecarData,
+            "The session plist intentionally contains the source PDF and Zotero identity fields."
+        )
+        let rebuiltHybrid = try HybridPDFManager.embedJotPreservingSourcePDF(
+            pdfData: sessionPDF,
+            jotData: JotHybridPDFBuilder.encodedJotData(localJot)
+        )
+        XCTAssertNotEqual(
+            ZoteroSyncService.md5Hex(rebuiltHybrid),
+            ZoteroSyncService.md5Hex(baselineHybrid),
+            "Re-serializing a valid session Jot does not reproduce the cached trailer bytes."
+        )
+        XCTAssertTrue(ZoteroLocalJotBaseline.matches(localJot: localJot, baselineData: baselineHybrid))
+
+        let editedJot = Jot(
+            drawing: PKDrawing(strokes: [makeStroke()]).dataRepresentation(),
+            width: localJot.width,
+            pdfData: pdfData,
+            extraPages: localJot.extraPages,
+            pdfInsertedPageSlots: localJot.pdfInsertedPageSlots,
+            strokePageIndices: [0],
+            trashedPages: localJot.trashedPages,
+            zoteroItemKey: localJot.zoteroItemKey,
+            zoteroFileName: localJot.zoteroFileName
+        )
+        XCTAssertFalse(ZoteroLocalJotBaseline.matches(localJot: editedJot, baselineData: baselineHybrid))
     }
 
     func testTrashedCollectionsAndTheirDescendantsAreHiddenFromSidebar() throws {
@@ -2029,9 +2174,11 @@ final class HybridPDFTests: XCTestCase {
             }
         )
 
-        let requests = recorder.requests
-        XCTAssertEqual(requests.count, 1)
-        let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(requests[0].httpBody)) as? [[String: Any]])
+        let creationRequests = recorder.requests.filter {
+            $0.httpMethod == "POST" && ($0.url?.path.hasSuffix("/items/top") == true || $0.url?.path.hasSuffix("/items") == true)
+        }
+        XCTAssertEqual(creationRequests.count, 1)
+        let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(creationRequests[0].httpBody)) as? [[String: Any]])
         XCTAssertEqual(payload.count, 1)
         XCTAssertEqual(payload[0]["itemType"] as? String, "attachment")
         XCTAssertEqual(payload[0]["parentItem"] as? String, parent.key)
@@ -2047,7 +2194,8 @@ final class HybridPDFTests: XCTestCase {
             "/zotero/\(attachmentKey).prop",
         ])
         XCTAssertEqual(recorder.requests.filter { $0.httpMethod == "PUT" && $0.url?.host == "api.zotero.org" }.count, 1)
-        let archive = try XCTUnwrap(webDAVRequests.first(where: { $0.url?.path.hasSuffix(".zip") == true })?.httpBody)
+        let archiveRequest = try XCTUnwrap(webDAVRequests.first(where: { $0.url?.path.hasSuffix(".zip") == true }))
+        let archive = try Self.requestBody(from: archiveRequest)
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
