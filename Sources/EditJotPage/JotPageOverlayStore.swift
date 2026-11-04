@@ -20,6 +20,9 @@ final class JotPageOverlayStore {
         overlays[index] = overlay
         indices[ObjectIdentifier(canvas)] = index
         overlay.setDiagnosticsPage(page, index: index)
+#if DEBUG
+        updateDiagnosticsActiveCounts()
+#endif
         guard !isAlreadyRegistered else { return }
         let details: [String: Any] = [
             "pageIndex": index,
@@ -52,6 +55,10 @@ final class JotPageOverlayStore {
         indices.removeValue(forKey: ObjectIdentifier(canvas))
         canvases.removeValue(forKey: index)
         overlays.removeValue(forKey: index)
+#if DEBUG
+        overlay.setDiagnosticsActiveCounts(canvases: canvases.count, overlays: overlays.count)
+        updateDiagnosticsActiveCounts()
+#endif
         let details: [String: Any] = [
             "pageIndex": index,
             "pageRotation": page.rotation,
@@ -83,6 +90,11 @@ final class JotPageOverlayStore {
         canvases.removeAll()
         indices.removeAll()
         cached.removeAllObjects()
+#if DEBUG
+        for overlay in removedOverlays.values {
+            overlay.setDiagnosticsActiveCounts(canvases: 0, overlays: 0)
+        }
+#endif
         guard !removedOverlays.isEmpty else { return }
         var latestDetails: [String: Any] = ["activeCanvasCount": 0, "activeOverlayCount": 0]
         for (pageIndex, overlay) in removedOverlays {
@@ -109,4 +121,14 @@ final class JotPageOverlayStore {
         JottreDiagnostics.shared.updateCanvasMemoryContext(latestDetails)
         JottreDiagnostics.shared.sampleMemoryNow(for: "canvas.memorySample", details: latestDetails)
     }
+
+#if DEBUG
+    private func updateDiagnosticsActiveCounts() {
+        let canvasCount = canvases.count
+        let overlayCount = overlays.count
+        for overlay in overlays.values {
+            overlay.setDiagnosticsActiveCounts(canvases: canvasCount, overlays: overlayCount)
+        }
+    }
+#endif
 }
