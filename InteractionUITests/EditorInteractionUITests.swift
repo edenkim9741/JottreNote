@@ -445,6 +445,128 @@ final class EditorInteractionUITests: XCTestCase {
         print("[ZoomMemory] after zoom-out footprint=\(reducedBytes) bytes (\(Double(reducedBytes) / 1_048_576) MiB)")
     }
 
+    func testBoundedViewportKeepsHighZoomTouchCoordinatesRegistered() async throws {
+        let app = launch(tool: "zoom-memory")
+        let page = app.staticTexts["editor.page.0"]
+        XCTAssertTrue(page.waitForExistence(timeout: 15))
+        let zoomButton = app.buttons["editor.test.zoomFactor"]
+        let geometryButton = app.buttons["editor.test.geometryExperiment"]
+        XCTAssertTrue(zoomButton.waitForExistence(timeout: 5))
+        XCTAssertTrue(geometryButton.waitForExistence(timeout: 5))
+
+        var state = try info(page)
+        XCTAssertEqual(state["geometryExperimentMode"] as? Int, 0)
+        for factor in [1.0, 2, 4, 8, 16, 32, 64] {
+            zoomButton.tap()
+            state = try info(page)
+            for _ in 0..<40 {
+                let ratio = try XCTUnwrap(state["scaleFactor"] as? Double)
+                    / (try XCTUnwrap(state["fitScaleFactor"] as? Double))
+                if abs(ratio - factor) < max(0.05, factor * 0.01) { break }
+                try await Task.sleep(for: .milliseconds(100))
+                state = try info(page)
+            }
+            let scaleFactor = try XCTUnwrap(state["scaleFactor"] as? Double)
+            let fitScaleFactor = try XCTUnwrap(state["fitScaleFactor"] as? Double)
+            let settledRatio = scaleFactor / fitScaleFactor
+            XCTAssertEqual(settledRatio, factor, accuracy: max(0.05, factor * 0.01))
+        }
+
+        state = try info(page)
+        let rectValues = try XCTUnwrap(state["rect"] as? [Double])
+        let pageRect = CGRect(x: rectValues[0], y: rectValues[1], width: rectValues[2], height: rectValues[3])
+        let visibleRect = pageRect.intersection(app.frame)
+        let start = app.coordinate(withNormalizedOffset: .zero)
+            .withOffset(CGVector(dx: visibleRect.midX - 30, dy: visibleRect.midY))
+        let end = app.coordinate(withNormalizedOffset: .zero)
+            .withOffset(CGVector(dx: visibleRect.midX + 30, dy: visibleRect.midY))
+        let firstStrokeCount = try XCTUnwrap(state["strokes"] as? Int)
+        start.press(forDuration: 0.01, thenDragTo: end)
+        state = try await waitForDrawing(page, count: firstStrokeCount + 1)
+        try await Task.sleep(for: .seconds(5))
+        state = try info(page)
+        let baselineFootprint = try XCTUnwrap(state["physicalFootprintBytes"] as? UInt64)
+        let baselineStrokeSeeds = try XCTUnwrap(state["strokeSeeds"] as? [UInt32])
+        let undoManagerIdentity = try XCTUnwrap(state["undoManagerIdentity"] as? String)
+        let baselineVisibleAreaRatio = try XCTUnwrap(state["visibleCanvasAreaRatio"] as? Double)
+        XCTAssertTrue(state["canUndo"] as? Bool ?? false)
+
+        for expectedMode in 1...4 {
+            geometryButton.tap()
+            state = try info(page)
+            XCTAssertEqual(state["geometryExperimentMode"] as? Int, expectedMode)
+        }
+
+        try await Task.sleep(for: .seconds(5))
+        state = try info(page)
+        let drawingSize = try XCTUnwrap(state["drawingSize"] as? [Double])
+        let canvasBounds = try XCTUnwrap(state["canvasBounds"] as? [Double])
+        let boundedFootprint = try XCTUnwrap(state["physicalFootprintBytes"] as? UInt64)
+        let boundedVisibleAreaRatio = try XCTUnwrap(state["visibleCanvasAreaRatio"] as? Double)
+        XCTAssertEqual(try XCTUnwrap(state["canvasZoom"] as? Double), 1, accuracy: 0.001)
+        XCTAssertEqual(canvasBounds[0], drawingSize[0], accuracy: 0.01)
+        XCTAssertEqual(canvasBounds[1], drawingSize[1], accuracy: 0.01)
+        XCTAssertGreaterThan(boundedVisibleAreaRatio, 0)
+        XCTAssertLessThan(boundedVisibleAreaRatio, 1)
+        XCTAssertEqual(state["undoManagerIdentity"] as? String, undoManagerIdentity)
+        XCTAssertEqual(state["strokeSeeds"] as? [UInt32], baselineStrokeSeeds)
+        XCTAssertTrue(state["canUndo"] as? Bool ?? false)
+
+        let boundedRectValues = try XCTUnwrap(state["rect"] as? [Double])
+        let boundedPageRect = CGRect(x: boundedRectValues[0], y: boundedRectValues[1],
+                                     width: boundedRectValues[2], height: boundedRectValues[3])
+        let boundedVisibleRect = boundedPageRect.intersection(app.frame)
+        let boundedStart = app.coordinate(withNormalizedOffset: .zero)
+            .withOffset(CGVector(dx: boundedVisibleRect.midX - 30, dy: boundedVisibleRect.midY))
+        let boundedEnd = app.coordinate(withNormalizedOffset: .zero)
+            .withOffset(CGVector(dx: boundedVisibleRect.midX + 30, dy: boundedVisibleRect.midY))
+        let expectedStrokeCount = try XCTUnwrap(state["strokes"] as? Int) + 1
+        boundedStart.press(forDuration: 0.01, thenDragTo: boundedEnd)
+        state = try await waitForDrawing(page, count: expectedStrokeCount)
+        let startError = try endpointDrift(
+            in: state, touchKey: "touchStartWindow", strokeKey: "lastStrokeStartWindow"
+        )
+        let endError = try endpointDrift(
+            in: state, touchKey: "touchEndWindow", strokeKey: "lastStrokeEndWindow"
+        )
+        XCTAssertLessThan(startError, 12)
+        XCTAssertLessThan(endError, 12)
+
+        let boundedStrokeSeeds = try XCTUnwrap(state["strokeSeeds"] as? [UInt32])
+        let undoButton = app.buttons["editor.test.undo"]
+        let redoButton = app.buttons["editor.test.redo"]
+        XCTAssertTrue(undoButton.waitForExistence(timeout: 5))
+        XCTAssertTrue(redoButton.waitForExistence(timeout: 5))
+        undoButton.tap()
+        state = try await waitForDrawing(page, count: firstStrokeCount + 1)
+        XCTAssertEqual(state["strokeSeeds"] as? [UInt32], baselineStrokeSeeds)
+        XCTAssertTrue(state["canRedo"] as? Bool ?? false)
+        redoButton.tap()
+        state = try await waitForDrawing(page, count: firstStrokeCount + 2)
+        XCTAssertEqual(state["strokeSeeds"] as? [UInt32], boundedStrokeSeeds)
+
+        try await Task.sleep(for: .seconds(5))
+        state = try info(page)
+        print(
+            "[BoundedViewport64x] baselineFootprint=\(baselineFootprint) " +
+            "boundedFootprint=\(boundedFootprint) " +
+            "baselineVisibleAreaRatio=\(baselineVisibleAreaRatio) " +
+            "boundedVisibleAreaRatio=\(boundedVisibleAreaRatio) " +
+            "canvasBounds=\(state["canvasBounds"] ?? "?") " +
+            "visibleAreaRatio=\(state["visibleCanvasAreaRatio"] ?? "?") " +
+            "startErrorPixels=\(startError) endErrorPixels=\(endError)"
+        )
+        for sample in 1...11 {
+            try await Task.sleep(for: .seconds(5))
+            state = try info(page)
+            print(
+                "[BoundedViewport64x] hold=\((sample + 1) * 5)s " +
+                "footprint=\(state["physicalFootprintBytes"] ?? "?") " +
+                "visibleAreaRatio=\(state["visibleCanvasAreaRatio"] ?? "?")"
+            )
+        }
+    }
+
     func testSimulatorTouchInkStaysRegisteredFromOneToSixtyFourTimesZoom() async throws {
         let app = launch(tool: "scribble-undo")
         let page = app.staticTexts["editor.page.0"]
@@ -530,8 +652,8 @@ final class EditorInteractionUITests: XCTestCase {
             }
         }
 
-        // At the 32x stress point, compare manual contentSize, forced
-        // contentOffset, and both against the optimized default geometry.
+        // At the 32x stress point, compare the scroll-state variants and a
+        // DEBUG-only viewport-sized canvas against the optimized geometry.
         for _ in 0..<5 { zoomButton.tap() } // 64x -> 1x -> 2x -> 4x -> 8x -> 16x
         zoomButton.tap() // 32x
         var state = try info(page)
@@ -553,10 +675,17 @@ final class EditorInteractionUITests: XCTestCase {
         )
         let geometryButton = app.buttons["editor.test.geometryExperiment"]
         XCTAssertTrue(geometryButton.waitForExistence(timeout: 5))
-        for expectedMode in 1...3 {
+        for expectedMode in 1...4 {
             geometryButton.tap()
             state = try info(page)
             XCTAssertEqual(state["geometryExperimentMode"] as? Int, expectedMode)
+            if expectedMode == 4 {
+                let drawingSize = try XCTUnwrap(state["drawingSize"] as? [Double])
+                let canvasBounds = try XCTUnwrap(state["canvasBounds"] as? [Double])
+                XCTAssertEqual(try XCTUnwrap(state["canvasZoom"] as? Double), 1, accuracy: 0.001)
+                XCTAssertEqual(canvasBounds[0], drawingSize[0], accuracy: 0.01)
+                XCTAssertEqual(canvasBounds[1], drawingSize[1], accuracy: 0.01)
+            }
             let pageValues = try XCTUnwrap(state["rect"] as? [Double])
             let pageRect = CGRect(x: pageValues[0], y: pageValues[1], width: pageValues[2], height: pageValues[3])
             let visibleRect = pageRect.intersection(app.frame)
@@ -593,7 +722,13 @@ final class EditorInteractionUITests: XCTestCase {
         let page = app.staticTexts["editor.page.0"]
         XCTAssertTrue(page.waitForExistence(timeout: 15))
         let zoomButton = app.buttons["editor.test.zoomFactor"]
+        let geometryButton = app.buttons["editor.test.geometryExperiment"]
         XCTAssertTrue(zoomButton.waitForExistence(timeout: 5))
+        XCTAssertTrue(geometryButton.waitForExistence(timeout: 5))
+        for expectedMode in 1...4 {
+            geometryButton.tap()
+            XCTAssertEqual(try info(page)["geometryExperimentMode"] as? Int, expectedMode)
+        }
         for _ in 0..<6 { zoomButton.tap() } // 1x -> 32x
 
         var state = try info(page)
@@ -610,6 +745,11 @@ final class EditorInteractionUITests: XCTestCase {
         XCTAssertEqual(settledRatio, 32, accuracy: 0.32,
             "Rotated crop fixture did not reach 32x")
         XCTAssertEqual(state["pageRotation"] as? Int, 90)
+        XCTAssertEqual(try XCTUnwrap(state["canvasZoom"] as? Double), 1, accuracy: 0.001)
+        let canvasBounds = try XCTUnwrap(state["canvasBounds"] as? [Double])
+        let drawingSize = try XCTUnwrap(state["drawingSize"] as? [Double])
+        XCTAssertEqual(canvasBounds[0], drawingSize[0], accuracy: 0.01)
+        XCTAssertEqual(canvasBounds[1], drawingSize[1], accuracy: 0.01)
         let crop = try XCTUnwrap(state["cropBox"] as? [Double])
         XCTAssertEqual(crop[0], 40, accuracy: 0.01)
         XCTAssertEqual(crop[1], 60, accuracy: 0.01)

@@ -66,7 +66,7 @@ enum EditorInteractionFixture {
     ) {
         guard tool != nil else { return }
         installZoomControls(in: host, pdfView: pdfView)
-        if tool == "scribble-undo" {
+        if tool == "scribble-undo" || tool == "zoom-memory" {
             installUndoButton(in: host, identifier: "editor.test.undo", title: "Undo") { [weak canvas] in
                 guard let canvas, let manager = canvas.undoManager else { return }
                 fixtureUndoActionCount += 1
@@ -189,6 +189,24 @@ enum EditorInteractionFixture {
             let canvasMenuInteractions = editMenuInteractionDescriptions(in: canvas)
             let pdfMenuInteractions = editMenuInteractionDescriptions(in: pdfView)
             let synchronizedDrawings = drawingStateProvider?()
+            let visibleCanvasRect: CGRect
+            if overlay != nil {
+                let visiblePageRect = rect.intersection(viewportRect).intersection(window.bounds)
+                let convertedVisibleCanvasRect = canvas.convert(visiblePageRect, from: window).intersection(canvas.bounds)
+                let components = [
+                    convertedVisibleCanvasRect.minX, convertedVisibleCanvasRect.minY,
+                    convertedVisibleCanvasRect.width, convertedVisibleCanvasRect.height
+                ]
+                visibleCanvasRect = components.allSatisfy(\.isFinite)
+                    && !convertedVisibleCanvasRect.isNull
+                    ? convertedVisibleCanvasRect
+                    : .zero
+            } else {
+                visibleCanvasRect = .zero
+            }
+            let canvasArea = max(canvas.bounds.width * canvas.bounds.height, 1)
+            let rawVisibleCanvasAreaRatio = max(0, visibleCanvasRect.width * visibleCanvasRect.height) / canvasArea
+            let visibleCanvasAreaRatio = rawVisibleCanvasAreaRatio.isFinite ? rawVisibleCanvasAreaRatio : 0
             let midX = canvas.drawing.strokes.isEmpty ? 0 : canvas.drawing.bounds.midX
             let toolName: String
             if canvas.tool is PKLassoTool {
@@ -235,13 +253,18 @@ enum EditorInteractionFixture {
                 "minimumCanvasZoom": canvas.minimumZoomScale,
                 "maximumCanvasZoom": canvas.maximumZoomScale,
                 "canvasBounds": [canvas.bounds.width, canvas.bounds.height],
+                "canvasFrame": [canvas.frame.minX, canvas.frame.minY, canvas.frame.width, canvas.frame.height],
                 "canvasContentScaleFactor": canvas.contentScaleFactor,
                 "contentSize": [canvas.contentSize.width, canvas.contentSize.height],
                 "contentOffset": [canvas.contentOffset.x, canvas.contentOffset.y],
+                "visibleCanvasRect": [visibleCanvasRect.minX, visibleCanvasRect.minY,
+                                      visibleCanvasRect.width, visibleCanvasRect.height],
+                "visibleCanvasAreaRatio": visibleCanvasAreaRatio,
                 "overlayBounds": [overlay?.bounds.width ?? 0, overlay?.bounds.height ?? 0],
                 "drawingSize": [overlay?.drawingSize.width ?? 0, overlay?.drawingSize.height ?? 0],
                 "measuredDisplayScale": overlay?.displayScale ?? 0,
                 "viewportHostTransform": [overlay?.viewportHostTransform.a ?? 0, overlay?.viewportHostTransform.d ?? 0],
+                "viewportHostBounds": [overlay?.viewportHostBounds.width ?? 0, overlay?.viewportHostBounds.height ?? 0],
                 "pageRotation": page.rotation,
                 "cropBox": rectArray(page.bounds(for: .cropBox)),
                 "lastStrokeStart": [strokeStart.x, strokeStart.y],

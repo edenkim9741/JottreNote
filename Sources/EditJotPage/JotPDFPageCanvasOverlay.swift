@@ -15,6 +15,7 @@ enum JotCanvasGeometryExperimentMode: Int, CaseIterable {
     case manualContentSizeOnly
     case manualContentOffsetOnly
     case manualContentSizeAndOffset
+    case boundedViewport
 
     var setsContentSize: Bool {
         self == .manualContentSizeOnly || self == .manualContentSizeAndOffset
@@ -48,6 +49,7 @@ final class JotPDFPageCanvasOverlay: UIView {
     private(set) var pdfViewScaleFactor: CGFloat = 1
     private(set) var fitScaleFactor: CGFloat = 1
     var viewportHostTransform: CGAffineTransform { viewportHost.transform }
+    var viewportHostBounds: CGRect { viewportHost.bounds }
 
     init(canvas: PKCanvasView, pageSize: CGSize, drawingWidth: CGFloat = 1_200) {
         self.canvas = canvas
@@ -170,11 +172,23 @@ final class JotPDFPageCanvasOverlay: UIView {
             screenScale: window?.screen.nativeScale ?? traitCollection.displayScale
         ) else { return }
         let requestedZoom = geometry.canvasZoom
-        let nativeZoom = min(requestedZoom, max(canvas.maximumZoomScale, canvas.minimumZoomScale))
-        let viewportSize = CGSize(
-            width: drawingSize.width * nativeZoom,
-            height: drawingSize.height * nativeZoom
-        )
+        let useBoundedViewport: Bool
+#if DEBUG
+        // Compare a logical-page-sized canvas while preserving the same
+        // Drawing-to-page transform and effective render scale.
+        useBoundedViewport = Self.geometryExperimentMode == .boundedViewport
+#else
+        useBoundedViewport = false
+#endif
+        let nativeZoom = useBoundedViewport
+            ? 1
+            : min(requestedZoom, max(canvas.maximumZoomScale, canvas.minimumZoomScale))
+        let viewportSize = useBoundedViewport
+            ? drawingSize
+            : CGSize(
+                width: drawingSize.width * nativeZoom,
+                height: drawingSize.height * nativeZoom
+            )
         let pageToViewport = CGAffineTransform(
             scaleX: bounds.width / max(viewportSize.width, 1),
             y: bounds.height / max(viewportSize.height, 1)
@@ -183,8 +197,8 @@ final class JotPDFPageCanvasOverlay: UIView {
         let scaledContentSize = viewportSize
 #if DEBUG
         let experimentMode = Self.geometryExperimentMode
-        let setsContentSize = experimentMode.setsContentSize
-        let resetsContentOffset = experimentMode.resetsContentOffset
+        let setsContentSize = !useBoundedViewport && experimentMode.setsContentSize
+        let resetsContentOffset = !useBoundedViewport && experimentMode.resetsContentOffset
         let experimentChanged = experimentMode != appliedExperimentMode
 #else
         let setsContentSize = false
@@ -269,6 +283,28 @@ final class JotPDFPageCanvasOverlay: UIView {
         let bucket = Int(floor(log2(max(displayScale, 0.01))))
         guard bucket != lastMemorySampleZoomBucket else { return }
         lastMemorySampleZoomBucket = bucket
+        let visiblePageRect: CGRect
+        if let scaleReferenceView {
+            let pageRectInReference = convert(bounds, to: scaleReferenceView)
+            let visibleRectInReference = pageRectInReference.intersection(scaleReferenceView.bounds)
+            visiblePageRect = visibleRectInReference.isNull || visibleRectInReference.isEmpty
+                ? .zero
+                : convert(visibleRectInReference, from: scaleReferenceView).intersection(bounds)
+        } else {
+            visiblePageRect = bounds
+        }
+        let convertedVisibleCanvasRect = canvas.convert(visiblePageRect, from: self).intersection(canvas.bounds)
+        let visibleRectComponents = [
+            convertedVisibleCanvasRect.minX, convertedVisibleCanvasRect.minY,
+            convertedVisibleCanvasRect.width, convertedVisibleCanvasRect.height
+        ]
+        let visibleCanvasRect = visibleRectComponents.allSatisfy(\.isFinite)
+            && !convertedVisibleCanvasRect.isNull
+            ? convertedVisibleCanvasRect
+            : .zero
+        let canvasArea = max(canvas.bounds.width * canvas.bounds.height, 1)
+        let rawVisibleCanvasAreaRatio = max(0, visibleCanvasRect.width * visibleCanvasRect.height) / canvasArea
+        let visibleCanvasAreaRatio = rawVisibleCanvasAreaRatio.isFinite ? rawVisibleCanvasAreaRatio : 0
         let details: [String: Any] = [
             "pageIndex": diagnosticsPageIndex as Any? ?? NSNull(),
             "pageRotation": diagnosticsPageRotation,
@@ -287,8 +323,13 @@ final class JotPDFPageCanvasOverlay: UIView {
             "canvasContentScaleFactor": canvas.contentScaleFactor,
             "contentSize": [canvas.contentSize.width, canvas.contentSize.height],
             "canvasBounds": [canvas.bounds.width, canvas.bounds.height],
+            "canvasFrame": [canvas.frame.minX, canvas.frame.minY, canvas.frame.width, canvas.frame.height],
+            "viewportHostBounds": [viewportHost.bounds.width, viewportHost.bounds.height],
             "contentOffset": [canvas.contentOffset.x, canvas.contentOffset.y],
             "viewportTransform": [viewportTransform.a, viewportTransform.d],
+            "visibleCanvasRect": [visibleCanvasRect.minX, visibleCanvasRect.minY,
+                                  visibleCanvasRect.width, visibleCanvasRect.height],
+            "visibleCanvasAreaRatio": visibleCanvasAreaRatio,
             "strokeCount": canvas.drawing.strokes.count,
             "zoomBucket": bucket
         ]
