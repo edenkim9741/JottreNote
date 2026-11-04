@@ -17,6 +17,10 @@ final class JottreDiagnostics: NSObject, MXMetricManagerSubscriber, @unchecked S
     private let queue = DispatchQueue(label: "com.edenkim.jottre.diagnostics", qos: .utility)
     private let fileManager = FileManager.default
     private let inkStateLock = NSLock()
+#if DEBUG
+    private let drawingPipelineLock = NSLock()
+    private var drawingPipelineTotals: [String: Double] = [:]
+#endif
     private var sessionID = ""
     private var session: [String: Any] = [:]
     private var latestStrokeCount = 0
@@ -59,6 +63,11 @@ final class JottreDiagnostics: NSObject, MXMetricManagerSubscriber, @unchecked S
                     "lastFootprintBytes": NSNull(),
                     "highestFootprintBytes": 0
                 ]
+#if DEBUG
+                drawingPipelineLock.lock()
+                drawingPipelineTotals.removeAll(keepingCapacity: true)
+                drawingPipelineLock.unlock()
+#endif
                 persistSession()
                 appendEvent("app.launch", details: [:])
                 trimOldSessions(in: directoryURL, keeping: 20)
@@ -200,6 +209,9 @@ final class JottreDiagnostics: NSObject, MXMetricManagerSubscriber, @unchecked S
             session["highestFootprintBytes"] = max(session["highestFootprintBytes"] as? UInt64 ?? 0, footprint)
             var sample = latestCanvasMemoryContext
             sample.merge(safeDetails.value) { _, new in new }
+#if DEBUG
+            sample.merge(drawingPipelineSnapshot()) { _, new in new }
+#endif
             sample["timestamp"] = Self.timestamp()
             sample["event"] = event
             sample["footprintBytes"] = footprint
@@ -227,6 +239,9 @@ final class JottreDiagnostics: NSObject, MXMetricManagerSubscriber, @unchecked S
             let count = (session["memoryWarningCount"] as? Int ?? 0) + 1
             session["memoryWarningCount"] = count
             var details = latestCanvasMemoryContext
+#if DEBUG
+            details.merge(drawingPipelineSnapshot()) { _, new in new }
+#endif
             details["count"] = count
             let footprint = Self.currentFootprintBytes()
             details["footprintBytes"] = footprint as Any? ?? NSNull()
@@ -259,9 +274,33 @@ final class JottreDiagnostics: NSObject, MXMetricManagerSubscriber, @unchecked S
         session["highestFootprintBytes"] = max(session["highestFootprintBytes"] as? UInt64 ?? 0, footprint)
         persistLatestInkState()
         updateActivity("memory.sample")
-        let sample: [String: Any] = ["timestamp": Self.timestamp(), "footprintBytes": footprint]
+        var sample: [String: Any] = ["timestamp": Self.timestamp(), "footprintBytes": footprint]
+#if DEBUG
+        sample.merge(drawingPipelineSnapshot()) { _, new in new }
+#endif
         appendJSONLine(sample, to: "memory-\(sessionID).jsonl")
     }
+
+#if DEBUG
+    /// Accumulates coarse drawing-pipeline measurements in memory. Callers
+    /// must not serialize a Drawing or write one diagnostic event per input
+    /// point; totals are attached to the next memory sample/warning instead.
+    func recordDrawingPipelineMetrics(_ values: [String: Double]) {
+        drawingPipelineLock.lock()
+        for (key, value) in values where value.isFinite {
+            drawingPipelineTotals[key, default: 0] += value
+        }
+        drawingPipelineLock.unlock()
+    }
+
+    private func drawingPipelineSnapshot() -> [String: Double] {
+        drawingPipelineLock.lock()
+        defer { drawingPipelineLock.unlock() }
+        return drawingPipelineTotals.reduce(into: [:]) { result, entry in
+            result["drawingPipeline.\(entry.key)"] = entry.value
+        }
+    }
+#endif
 
     private func appendEvent(_ name: String, details: [String: Any]) {
         persistLatestInkState()

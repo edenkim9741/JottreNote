@@ -1052,6 +1052,9 @@ extension EditJotViewModel {
     }
 
     fileprivate func makePersistenceSnapshot() -> EditJotPersistenceSnapshot {
+#if DEBUG
+        let snapshotStarted = ProcessInfo.processInfo.systemUptime
+#endif
         persistenceRevision += 1
         let content = JotContent(
             drawing: currentDrawing,
@@ -1075,7 +1078,16 @@ extension EditJotViewModel {
             zoteroFileName: currentZoteroFileName
         )
         currentStrokePageIndices = content.strokePageIndices
-        return EditJotPersistenceSnapshot(revision: persistenceRevision, content: content)
+        let snapshot = EditJotPersistenceSnapshot(revision: persistenceRevision, content: content)
+#if DEBUG
+        let snapshotMilliseconds = max(0, ProcessInfo.processInfo.systemUptime - snapshotStarted) * 1_000
+        EditorInteractionFixture.recordPersistenceSnapshot(milliseconds: snapshotMilliseconds)
+        JottreDiagnostics.shared.recordDrawingPipelineMetrics([
+            "persistenceSnapshotCount": 1,
+            "persistenceSnapshotMilliseconds": snapshotMilliseconds
+        ])
+#endif
+        return snapshot
     }
 
     fileprivate func yieldBackground() {

@@ -25,10 +25,144 @@ enum EditorInteractionFixture {
     private(set) static var fixtureRedoActionCount = 0
     private(set) static var customNoDrawingUndoCount = 0
     private(set) static var lastFixtureUndoState = "none"
+    private(set) static var drawingChangeCallbackCount = 0
+    private(set) static var canonicalConversionMilliseconds = 0.0
+    private(set) static var shapeProcessingMilliseconds = 0.0
+    private(set) static var pageReplaceMilliseconds = 0.0
+    private(set) static var viewModelChangeMilliseconds = 0.0
+    private(set) static var persistenceSnapshotCount = 0
+    private(set) static var persistenceSnapshotMilliseconds = 0.0
+    private(set) static var mappedStrokeCount = 0
+    private(set) static var interpolationStrokeCount = 0
+    private(set) static var originalPathPointCount = 0
+    private(set) static var mappedPathPointCount = 0
+    private(set) static var interpolatedPathPointCount = 0
+    private(set) static var coordinateTransformProbe: [String: Any] = [:]
     private static var zoomBaseScales: [ObjectIdentifier: CGFloat] = [:]
     private static var nextZoomStep = 0
     private static let zoomFactors: [CGFloat] = [1, 2, 4, 8, 16, 32, 64]
     private(set) static var fixturePDFSizeBytes = 0
+
+    static var drawingPipelineEnabled: Bool {
+        tool != "zoom-memory" || ProcessInfo.processInfo.environment["JOTTRE_INTERACTION_TEST_PIPELINE"] != "off"
+    }
+
+    static func beginDrawingPipelineStroke() {
+        drawingChangeCallbackCount = 0
+        canonicalConversionMilliseconds = 0
+        shapeProcessingMilliseconds = 0
+        pageReplaceMilliseconds = 0
+        viewModelChangeMilliseconds = 0
+        persistenceSnapshotCount = 0
+        persistenceSnapshotMilliseconds = 0
+        mappedStrokeCount = 0
+        interpolationStrokeCount = 0
+        originalPathPointCount = 0
+        mappedPathPointCount = 0
+        interpolatedPathPointCount = 0
+    }
+
+    static func recordDrawingChangeCallback() { drawingChangeCallbackCount += 1 }
+
+    static func recordCanonicalConversion(milliseconds: Double) {
+        canonicalConversionMilliseconds += milliseconds
+    }
+
+    static func recordShapeProcessing(milliseconds: Double) {
+        shapeProcessingMilliseconds += milliseconds
+    }
+
+    static func recordPageReplace(milliseconds: Double) {
+        pageReplaceMilliseconds += milliseconds
+    }
+
+    static func recordViewModelChange(milliseconds: Double) {
+        viewModelChangeMilliseconds += milliseconds
+    }
+
+    static func recordPersistenceSnapshot(milliseconds: Double) {
+        persistenceSnapshotCount += 1
+        persistenceSnapshotMilliseconds += milliseconds
+    }
+
+    static func recordMappedStroke(_ sample: JotStrokeCoordinateTransformSample) {
+        mappedStrokeCount += 1
+        originalPathPointCount += sample.inputPointCount
+        mappedPathPointCount += sample.outputPointCount
+        if sample.interpolated {
+            interpolationStrokeCount += 1
+            interpolatedPathPointCount += sample.outputPointCount
+        }
+    }
+
+    private static func runCoordinateTransformProbeIfRequested() {
+        guard ProcessInfo.processInfo.environment["JOTTRE_INTERACTION_TEST_TRANSFORM_PROBE"] == "1" else {
+            return
+        }
+        let points = [
+            PKStrokePoint(location: CGPoint(x: 0, y: 0), timeOffset: 0, size: CGSize(width: 2, height: 2),
+                          opacity: 1, force: 0.3, azimuth: 0.2, altitude: 0.8),
+            PKStrokePoint(location: CGPoint(x: 10, y: 3), timeOffset: 1, size: CGSize(width: 4, height: 3),
+                          opacity: 0.8, force: 0.9, azimuth: 0.7, altitude: 1.1)
+        ]
+        let sourcePath = PKStrokePath(controlPoints: points, creationDate: .distantPast)
+        let source = PKStroke(
+            ink: PKInk(.pen, color: .black),
+            path: sourcePath,
+            transform: CGAffineTransform(scaleX: 2, y: 2)
+        )
+        let expectedSourcePoints = Array(sourcePath.interpolatedPoints(by: .distance(0.5)))
+        let expectedTransform = source.transform.concatenating(CGAffineTransform(scaleX: 2, y: 2))
+        var sample: JotStrokeCoordinateTransformSample?
+        let mapped = JotPageCanvasCoordinateAdapter.documentDrawing(
+            from: PKDrawing(strokes: [source]),
+            pageIndex: 0,
+            overlaySize: CGSize(width: 10, height: 10),
+            normalizedPageSize: CGSize(width: 20, height: 20),
+            pageSpacing: 0,
+            onStrokeMapped: { sample = $0 }
+        )
+        let actual = mapped.strokes[0].path
+        let expectedPoints = expectedSourcePoints.map { point -> PKStrokePoint in
+            let location = point.location.applying(expectedTransform)
+            let size = CGSize(width: point.size.width * 4, height: point.size.height * 4)
+            let direction = atan2(
+                sin(point.azimuth) * expectedTransform.d + cos(point.azimuth) * expectedTransform.b,
+                cos(point.azimuth) * expectedTransform.a + sin(point.azimuth) * expectedTransform.c
+            )
+            let azimuth = (direction + 2 * .pi).truncatingRemainder(dividingBy: 2 * .pi)
+            if #available(iOS 27.0, *) {
+                return PKStrokePoint(location: location, timeOffset: point.timeOffset, size: size,
+                                     opacity: point.opacity, force: point.force, azimuth: azimuth,
+                                     altitude: point.altitude, secondaryScale: point.secondaryScale,
+                                     threshold: point.threshold, lateralJitter: point.lateralJitter)
+            } else if #available(iOS 26.0, *) {
+                return PKStrokePoint(location: location, timeOffset: point.timeOffset, size: size,
+                                     opacity: point.opacity, force: point.force, azimuth: azimuth,
+                                     altitude: point.altitude, secondaryScale: point.secondaryScale,
+                                     threshold: point.threshold)
+            }
+            return PKStrokePoint(location: location, timeOffset: point.timeOffset, size: size,
+                                 opacity: point.opacity, force: point.force, azimuth: azimuth,
+                                 altitude: point.altitude, secondaryScale: point.secondaryScale)
+        }
+        var expectedStroke = source
+        expectedStroke.path = PKStrokePath(controlPoints: expectedPoints, creationDate: sourcePath.creationDate)
+        expectedStroke.transform = .identity
+        let expectedMatches = JotEditorDrawingState.drawingsMatch(
+            mapped,
+            PKDrawing(strokes: [expectedStroke])
+        )
+        coordinateTransformProbe = [
+            "passed": expectedMatches && actual.count == expectedSourcePoints.count,
+            "inputPointCount": sourcePath.count,
+            "interpolatedPointCount": expectedSourcePoints.count,
+            "mappedPointCount": actual.count,
+            "interpolationTriggered": sample?.interpolated ?? false,
+            "pageScaleX": sample?.pageScaleX ?? 0,
+            "storedScale": sample?.storedScale ?? 0
+        ]
+    }
 
     static func didRecognizeScribble() {
         guard tool == "scribble-undo" else { return }
@@ -276,6 +410,20 @@ enum EditorInteractionFixture {
                 "lastStrokeStartErrorPixels": startErrorPixels ?? -1,
                 "screenScale": window.screen.scale,
                 "physicalFootprintBytes": JottreDiagnostics.currentFootprintBytesForTesting() ?? 0,
+                "drawingPipelineEnabled": Self.drawingPipelineEnabled,
+                "drawingChangeCallbackCount": Self.drawingChangeCallbackCount,
+                "canonicalConversionMilliseconds": Self.canonicalConversionMilliseconds,
+                "shapeProcessingMilliseconds": Self.shapeProcessingMilliseconds,
+                "pageReplaceMilliseconds": Self.pageReplaceMilliseconds,
+                "viewModelChangeMilliseconds": Self.viewModelChangeMilliseconds,
+                "persistenceSnapshotCount": Self.persistenceSnapshotCount,
+                "persistenceSnapshotMilliseconds": Self.persistenceSnapshotMilliseconds,
+                "mappedStrokeCount": Self.mappedStrokeCount,
+                "interpolationStrokeCount": Self.interpolationStrokeCount,
+                "originalPathPointCount": Self.originalPathPointCount,
+                "mappedPathPointCount": Self.mappedPathPointCount,
+                "interpolatedPathPointCount": Self.interpolatedPathPointCount,
+                "coordinateTransformProbe": Self.coordinateTransformProbe,
                 "pdfPageCount": pdfView.document?.pageCount ?? 0,
                 "pdfDataBytes": fixturePDFSizeBytes,
                 "activeCanvasCount": activeCanvasCounts.canvases,
@@ -378,6 +526,7 @@ enum EditorInteractionFixture {
     }
 
     static func makeDocument(using service: any JotFileServiceProtocol) throws -> JotFile.Info {
+        runCoordinateTransformProbeIfRequested()
         let bounds = CGRect(x: 0, y: 0, width: 600, height: 800)
         let pageCount = tool == "scribble-undo" ? 1 : (tool == "zoom-memory" ? 3 : 2)
         let sourcePDF: Data

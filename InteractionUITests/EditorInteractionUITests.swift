@@ -6,11 +6,18 @@ import UIKit
 final class EditorInteractionUITests: XCTestCase {
     override func setUpWithError() throws { continueAfterFailure = false }
 
-    private func launch(tool: String? = nil, rotatedCrop: Bool = false) -> XCUIApplication {
+    private func launch(
+        tool: String? = nil,
+        rotatedCrop: Bool = false,
+        drawingPipelineEnabled: Bool = true,
+        coordinateTransformProbe: Bool = false
+    ) -> XCUIApplication {
         let app = XCUIApplication()
         app.launchArguments = ["-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
         app.launchEnvironment["JOTTRE_INTERACTION_TEST_TOOL"] = tool
         app.launchEnvironment["JOTTRE_INTERACTION_TEST_ROTATED_CROP"] = rotatedCrop ? "1" : "0"
+        app.launchEnvironment["JOTTRE_INTERACTION_TEST_PIPELINE"] = drawingPipelineEnabled ? "on" : "off"
+        app.launchEnvironment["JOTTRE_INTERACTION_TEST_TRANSFORM_PROBE"] = coordinateTransformProbe ? "1" : "0"
         app.launch()
         return app
     }
@@ -443,6 +450,82 @@ final class EditorInteractionUITests: XCTestCase {
         state = try info(page)
         let reducedBytes = try XCTUnwrap(state["physicalFootprintBytes"] as? UInt64)
         print("[ZoomMemory] after zoom-out footprint=\(reducedBytes) bytes (\(Double(reducedBytes) / 1_048_576) MiB)")
+    }
+
+    func testStreamingCoordinateTransformMatchesInterpolatedPathSamples() throws {
+        let app = launch(tool: "zoom-memory", coordinateTransformProbe: true)
+        let page = app.staticTexts["editor.page.0"]
+        XCTAssertTrue(page.waitForExistence(timeout: 15))
+        let state = try info(page)
+        let probe = try XCTUnwrap(state["coordinateTransformProbe"] as? [String: Any])
+        print("[CoordinateTransformProbe] \(probe)")
+        XCTAssertEqual(probe["passed"] as? Bool, true)
+        XCTAssertEqual(probe["interpolationTriggered"] as? Bool, true)
+        XCTAssertGreaterThan(probe["interpolatedPointCount"] as? Int ?? 0,
+                             probe["inputPointCount"] as? Int ?? Int.max)
+        XCTAssertEqual(probe["mappedPointCount"] as? Int, probe["interpolatedPointCount"] as? Int)
+        app.terminate()
+    }
+
+    func testHighZoomInputSeparatesPencilKitFromDrawingPipelineMemory() async throws {
+        for pipelineEnabled in [true, false] {
+            let app = launch(tool: "zoom-memory", drawingPipelineEnabled: pipelineEnabled)
+            let page = app.staticTexts["editor.page.0"]
+            XCTAssertTrue(page.waitForExistence(timeout: 15))
+            let zoomButton = app.buttons["editor.test.zoomFactor"]
+            XCTAssertTrue(zoomButton.waitForExistence(timeout: 5))
+            var state = try info(page)
+            XCTAssertEqual(state["drawingPipelineEnabled"] as? Bool, pipelineEnabled)
+
+            for factor in [1.0, 2, 4, 8, 16, 32, 64] {
+                zoomButton.tap()
+                state = try info(page)
+                for _ in 0..<40 {
+                    let ratio = try XCTUnwrap(state["scaleFactor"] as? Double)
+                        / (try XCTUnwrap(state["fitScaleFactor"] as? Double))
+                    if abs(ratio - factor) < max(0.05, factor * 0.01) { break }
+                    try await Task.sleep(for: .milliseconds(100))
+                    state = try info(page)
+                }
+                let ratio = try XCTUnwrap(state["scaleFactor"] as? Double)
+                    / (try XCTUnwrap(state["fitScaleFactor"] as? Double))
+                XCTAssertEqual(ratio, factor, accuracy: max(0.05, factor * 0.01))
+            }
+
+            let baselineFootprint = try XCTUnwrap(state["physicalFootprintBytes"] as? UInt64)
+            var expectedStrokeCount = try XCTUnwrap(state["strokes"] as? Int)
+            for index in 0..<5 {
+                state = try info(page)
+                let pageValues = try XCTUnwrap(state["rect"] as? [Double])
+                let pageRect = CGRect(x: pageValues[0], y: pageValues[1], width: pageValues[2], height: pageValues[3])
+                let visible = pageRect.intersection(app.frame)
+                let y = visible.minY + visible.height * (0.35 + Double(index % 2) * 0.3)
+                let start = app.coordinate(withNormalizedOffset: .zero)
+                    .withOffset(CGVector(dx: visible.midX - 36, dy: y))
+                let end = app.coordinate(withNormalizedOffset: .zero)
+                    .withOffset(CGVector(dx: visible.midX + 36, dy: y))
+                expectedStrokeCount += 1
+                start.press(forDuration: 0.01, thenDragTo: end)
+                state = try await waitForDrawing(page, count: expectedStrokeCount)
+            }
+
+            try await Task.sleep(for: .seconds(5))
+            state = try info(page)
+            print(
+                "[HighZoomPipeline] enabled=\(pipelineEnabled) baselineFootprint=\(baselineFootprint) " +
+                "footprint=\(state["physicalFootprintBytes"] ?? "?") " +
+                "callbacks=\(state["drawingChangeCallbackCount"] ?? "?") " +
+                "inputPoints=\(state["originalPathPointCount"] ?? "?") " +
+                "mappedPoints=\(state["mappedPathPointCount"] ?? "?") " +
+                "interpolationStrokes=\(state["interpolationStrokeCount"] ?? "?") " +
+                "canonicalMs=\(state["canonicalConversionMilliseconds"] ?? "?") " +
+                "replaceMs=\(state["pageReplaceMilliseconds"] ?? "?") " +
+                "viewModelMs=\(state["viewModelChangeMilliseconds"] ?? "?") " +
+                "snapshots=\(state["persistenceSnapshotCount"] ?? "?") " +
+                "snapshotMs=\(state["persistenceSnapshotMilliseconds"] ?? "?")"
+            )
+            app.terminate()
+        }
     }
 
     func testBoundedViewportKeepsHighZoomTouchCoordinatesRegistered() async throws {

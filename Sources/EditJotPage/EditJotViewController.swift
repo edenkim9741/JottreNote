@@ -675,6 +675,43 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
         pageIndex: Int,
         overlaySize: CGSize
     ) -> PKDrawing {
+#if DEBUG
+        let started = ProcessInfo.processInfo.systemUptime
+        var mappingSampleCount = 0
+        var interpolationSampleCount = 0
+        var originalPointCount = 0
+        var mappedPointCount = 0
+        var interpolatedPointCount = 0
+        let drawing = JotPageCanvasCoordinateAdapter.documentDrawing(
+            from: localDrawing,
+            pageIndex: pageIndex,
+            overlaySize: overlaySize,
+            normalizedPageSize: currentPageSize,
+            pageSpacing: JotPageLayout.pageSpacing,
+            onStrokeMapped: { sample in
+                EditorInteractionFixture.recordMappedStroke(sample)
+                mappingSampleCount += 1
+                originalPointCount += sample.inputPointCount
+                mappedPointCount += sample.outputPointCount
+                if sample.interpolated {
+                    interpolationSampleCount += 1
+                    interpolatedPointCount += sample.outputPointCount
+                }
+            }
+        )
+        let elapsedMilliseconds = max(0, ProcessInfo.processInfo.systemUptime - started) * 1_000
+        EditorInteractionFixture.recordCanonicalConversion(milliseconds: elapsedMilliseconds)
+        JottreDiagnostics.shared.recordDrawingPipelineMetrics([
+            "canonicalConversionCount": 1,
+            "canonicalConversionMilliseconds": elapsedMilliseconds,
+            "mappedStrokeCount": Double(mappingSampleCount),
+            "interpolationStrokeCount": Double(interpolationSampleCount),
+            "originalPathPointCount": Double(originalPointCount),
+            "mappedPathPointCount": Double(mappedPointCount),
+            "interpolatedPathPointCount": Double(interpolatedPointCount)
+        ])
+        return drawing
+#else
         JotPageCanvasCoordinateAdapter.documentDrawing(
             from: localDrawing,
             pageIndex: pageIndex,
@@ -682,6 +719,7 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
             normalizedPageSize: currentPageSize,
             pageSpacing: JotPageLayout.pageSpacing
         )
+#endif
     }
 
     private func localDrawing(
@@ -1542,7 +1580,23 @@ extension EditJotViewController: PKCanvasViewDelegate {
     func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
         if let pageIndex = pageIndexByCanvas[ObjectIdentifier(canvasView)] {
             guard !isApplyingOverlayDrawing else { return }
+#if DEBUG
+            let callbackStarted = ProcessInfo.processInfo.systemUptime
+            EditorInteractionFixture.recordDrawingChangeCallback()
+            guard EditorInteractionFixture.drawingPipelineEnabled else {
+                JottreDiagnostics.shared.recordDrawingPipelineMetrics([
+                    "drawingChangeCallbackCount": 1,
+                    "drawingChangePipelineDisabledCallbackCount": 1
+                ])
+                return
+            }
+            let shapeStarted = ProcessInfo.processInfo.systemUptime
+#endif
             shapeCoordinator.drawingDidChange(canvasView)
+#if DEBUG
+            let shapeMilliseconds = max(0, ProcessInfo.processInfo.systemUptime - shapeStarted) * 1_000
+            EditorInteractionFixture.recordShapeProcessing(milliseconds: shapeMilliseconds)
+#endif
             #if DEBUG
             if let canvas = canvasView as? JotCanvasView {
                 publishInteractionFixture(canvas: canvas, pageIndex: pageIndex)
@@ -1553,7 +1607,15 @@ extension EditJotViewController: PKCanvasViewDelegate {
                 pageIndex: pageIndex,
                 overlaySize: pageOverlays[pageIndex]?.drawingSize ?? currentPageSize
             )
-            guard inkCanvasCoordinator.replacePage(converted, at: pageIndex) else { return }
+#if DEBUG
+            let replaceStarted = ProcessInfo.processInfo.systemUptime
+#endif
+            let didReplacePage = inkCanvasCoordinator.replacePage(converted, at: pageIndex)
+#if DEBUG
+            let pageReplaceMilliseconds = max(0, ProcessInfo.processInfo.systemUptime - replaceStarted) * 1_000
+            EditorInteractionFixture.recordPageReplace(milliseconds: pageReplaceMilliseconds)
+#endif
+            guard didReplacePage else { return }
             let undoManager = canvasView.undoManager
             let isUndoRedoReplay = undoManager?.isUndoing == true || undoManager?.isRedoing == true
             if isUndoRedoReplay {
@@ -1563,12 +1625,26 @@ extension EditJotViewController: PKCanvasViewDelegate {
                     manager: undoManager
                 )
             }
+#if DEBUG
+            let viewModelChangeStarted = ProcessInfo.processInfo.systemUptime
+#endif
             viewModel.didChangeDrawing(
                 inkCanvasCoordinator.committedDrawing,
                 strokePageIndices: inkCanvasCoordinator.committedStrokePageIndices,
                 detectsScribbleErase: !isUndoRedoReplay,
                 changedPageIndices: [pageIndex]
             )
+#if DEBUG
+            let viewModelChangeMilliseconds = max(0, ProcessInfo.processInfo.systemUptime - viewModelChangeStarted) * 1_000
+            EditorInteractionFixture.recordViewModelChange(milliseconds: viewModelChangeMilliseconds)
+            JottreDiagnostics.shared.recordDrawingPipelineMetrics([
+                "drawingChangeCallbackCount": 1,
+                "drawingChangeCallbackMilliseconds": max(0, ProcessInfo.processInfo.systemUptime - callbackStarted) * 1_000,
+                "shapeProcessingMilliseconds": shapeMilliseconds,
+                "pageReplaceMilliseconds": pageReplaceMilliseconds,
+                "viewModelChangeMilliseconds": viewModelChangeMilliseconds
+            ])
+#endif
             JottreDiagnostics.shared.updateInkState(strokeCount: inkCanvasCoordinator.committedDrawing.strokes.count)
             return
         }
@@ -1581,6 +1657,7 @@ extension EditJotViewController: PKCanvasViewDelegate {
             if canvas.tool is PKLassoTool { activateLassoCanvas(canvas) }
             #if DEBUG
             if let index = pageIndexByCanvas[ObjectIdentifier(canvas)] {
+                EditorInteractionFixture.beginDrawingPipelineStroke()
                 publishInteractionFixture(canvas: canvas, pageIndex: index)
                 recordCanvasTouchStart(canvas, pageIndex: index)
             }
