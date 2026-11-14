@@ -133,7 +133,7 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
     }
 
     private static func isGestureActive(_ pan: UIPanGestureRecognizer) -> Bool {
-        pan.state == .began || pan.state == .changed
+        pan.state == .began || pan.state == .changed || (pan.state == .possible && pan.numberOfTouches > 0)
     }
 
 #if DEBUG

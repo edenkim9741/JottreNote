@@ -7,9 +7,13 @@ enum CanvasTouchRouting {
     @MainActor
     private final class OriginalPDFPanConfiguration: NSObject {
         let allowedTouchTypes: [NSNumber]
+        let minimumNumberOfTouches: Int
+        let maximumNumberOfTouches: Int
 
         init(pan: UIPanGestureRecognizer) {
             allowedTouchTypes = pan.allowedTouchTypes
+            minimumNumberOfTouches = pan.minimumNumberOfTouches
+            maximumNumberOfTouches = pan.maximumNumberOfTouches
         }
     }
 
@@ -40,24 +44,33 @@ enum CanvasTouchRouting {
         false
     }
 
-    /// PencilKit owns Pencil input. PDFKit's document pan always accepts direct
-    /// touches, regardless of the selected PencilKit tool or picker state.
-    /// Restore the recognizer's original touch types when editing ends.
+    /// PencilKit owns Pencil input; PDFKit navigation accepts one direct touch
+    /// and permits two-touch navigation while editing. Restore the complete
+    /// original pan configuration when editing ends. Never mutate an in-flight recognizer.
     static func apply(
         to panGestureRecognizers: [UIPanGestureRecognizer],
         pencilInputHasPriority: Bool = false
     ) {
         #if !targetEnvironment(macCatalyst)
         for pan in panGestureRecognizers {
+            guard pan.state != .began, pan.state != .changed, pan.numberOfTouches == 0 else { continue }
             if pencilInputHasPriority {
                 if originalPDFPanConfigurations.object(forKey: pan) == nil {
                     originalPDFPanConfigurations.setObject(OriginalPDFPanConfiguration(pan: pan), forKey: pan)
                 }
                 let directTouch = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
                 if pan.allowedTouchTypes != directTouch { pan.allowedTouchTypes = directTouch }
+                if pan.minimumNumberOfTouches != 1 { pan.minimumNumberOfTouches = 1 }
+                if pan.maximumNumberOfTouches < 2 { pan.maximumNumberOfTouches = 2 }
             } else if let original = originalPDFPanConfigurations.object(forKey: pan) {
                 if pan.allowedTouchTypes != original.allowedTouchTypes {
                     pan.allowedTouchTypes = original.allowedTouchTypes
+                }
+                if pan.minimumNumberOfTouches != original.minimumNumberOfTouches {
+                    pan.minimumNumberOfTouches = original.minimumNumberOfTouches
+                }
+                if pan.maximumNumberOfTouches != original.maximumNumberOfTouches {
+                    pan.maximumNumberOfTouches = original.maximumNumberOfTouches
                 }
                 originalPDFPanConfigurations.removeObject(forKey: pan)
             }
