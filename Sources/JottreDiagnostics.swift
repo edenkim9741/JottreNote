@@ -1,4 +1,5 @@
 import Foundation
+import CoreFoundation
 import CryptoKit
 import MachO
 import MetricKit
@@ -328,14 +329,14 @@ final class JottreDiagnostics: NSObject, MXMetricManagerSubscriber, @unchecked S
 
     private func persistSession() {
         guard let directoryURL, !sessionID.isEmpty,
-              let data = try? JSONSerialization.data(withJSONObject: session, options: [.prettyPrinted, .sortedKeys]) else { return }
+              let data = serializedJSONData(session, options: [.prettyPrinted, .sortedKeys], source: "session-\(sessionID).json") else { return }
         try? data.write(to: directoryURL.appendingPathComponent("session-\(sessionID).json"), options: .atomic)
         try? data.write(to: directoryURL.appendingPathComponent("active-session.json"), options: .atomic)
     }
 
     private func appendJSONLine(_ object: [String: Any], to filename: String) {
         guard let directoryURL,
-              let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else { return }
+              let data = serializedJSONData(object, options: [.sortedKeys], source: filename) else { return }
         let url = directoryURL.appendingPathComponent(filename)
         var line = data
         line.append(0x0A)
@@ -416,7 +417,7 @@ final class JottreDiagnostics: NSObject, MXMetricManagerSubscriber, @unchecked S
         var closedPrevious = previous
         closedPrevious["active"] = false
         closedPrevious["termination"] = "Unconfirmed"
-        if let closedData = try? JSONSerialization.data(withJSONObject: closedPrevious, options: [.prettyPrinted, .sortedKeys]) {
+        if let closedData = serializedJSONData(closedPrevious, options: [.prettyPrinted, .sortedKeys], source: "session-\(previousID).json") {
             try? closedData.write(to: directory.appendingPathComponent("session-\(previousID).json"), options: .atomic)
         }
         try? fileManager.removeItem(at: activeURL)
@@ -504,6 +505,76 @@ final class JottreDiagnostics: NSObject, MXMetricManagerSubscriber, @unchecked S
     static func milliseconds(_ duration: Duration) -> Double {
         let components = duration.components
         return Double(components.seconds) * 1_000 + Double(components.attoseconds) / 1_000_000_000_000_000
+    }
+
+    /// JSONSerialization raises an Objective-C exception for non-finite numeric
+    /// values, which Swift's `try?` cannot catch. Normalize every nested value
+    /// before calling it; preserve finite NSNumber values and CFBoolean values.
+    static func sanitizedJSONObject(
+        _ object: [String: Any],
+        nonFiniteNumberPaths: inout [String]
+    ) -> [String: Any] {
+        object.reduce(into: [:]) { result, entry in
+            result[entry.key] = sanitizedJSONValue(
+                entry.value,
+                path: entry.key,
+                nonFiniteNumberPaths: &nonFiniteNumberPaths
+            )
+        }
+    }
+
+    private static func sanitizedJSONValue(
+        _ value: Any,
+        path: String,
+        nonFiniteNumberPaths: inout [String]
+    ) -> Any {
+        if value is NSNull { return NSNull() }
+        if let dictionary = value as? [String: Any] {
+            return dictionary.reduce(into: [String: Any]()) { result, entry in
+                result[entry.key] = sanitizedJSONValue(
+                    entry.value,
+                    path: "\(path).\(entry.key)",
+                    nonFiniteNumberPaths: &nonFiniteNumberPaths
+                )
+            }
+        }
+        if let array = value as? [Any] {
+            return array.enumerated().map { index, element in
+                sanitizedJSONValue(
+                    element,
+                    path: "\(path)[\(index)]",
+                    nonFiniteNumberPaths: &nonFiniteNumberPaths
+                )
+            }
+        }
+        if let number = value as? NSNumber {
+            if CFGetTypeID(number) == CFBooleanGetTypeID() { return number }
+            guard number.doubleValue.isFinite else {
+                nonFiniteNumberPaths.append(path)
+                return NSNull()
+            }
+            return number
+        }
+        if let string = value as? String { return string }
+
+        // Diagnostics accepts only the JSON value types above. Unknown values
+        // are made harmless instead of being handed to JSONSerialization.
+        return NSNull()
+    }
+
+    private func serializedJSONData(
+        _ object: [String: Any],
+        options: JSONSerialization.WritingOptions,
+        source: String
+    ) -> Data? {
+        var nonFinitePaths: [String] = []
+        let safeObject = Self.sanitizedJSONObject(object, nonFiniteNumberPaths: &nonFinitePaths)
+        if !nonFinitePaths.isEmpty {
+            // This metadata contains field paths only; never emit diagnostic values,
+            // document data, or PencilKit stroke data to the console.
+            NSLog("[JottreDiagnostics] Replaced non-finite number(s) in %@: %@", source, nonFinitePaths.joined(separator: ", "))
+        }
+        return try? JSONSerialization.data(withJSONObject: safeObject, options: options)
     }
 }
 
