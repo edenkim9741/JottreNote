@@ -9,8 +9,9 @@ enum JotPDFPageRestorationPolicy {
     }
 }
 
-/// PDFKit owns document zoom. This overlay keeps PKDrawing in page-local logical
-/// coordinates and maps it into a bounded PencilKit viewport once.
+/// PDFKit owns document zoom. The canvas retains the complete page drawing as
+/// scrollable content while its frame covers only the currently visible page
+/// viewport. PencilKit's native zoom keeps that viewport sharp at display scale.
 @MainActor
 final class JotPDFPageCanvasOverlay: UIView {
     let canvas: PKCanvasView
@@ -25,6 +26,7 @@ final class JotPDFPageCanvasOverlay: UIView {
     private(set) var diagnosticsActiveOverlayCount = 0
 #endif
     private var appliedGeometry: JotCanvasRenderGeometry?
+    private var appliedDrawingContentSize: CGSize?
     private var lastMemorySampleZoomBucket: Int?
 #if DEBUG
     private var isPencilHoverActive = false
@@ -186,44 +188,69 @@ final class JotPDFPageCanvasOverlay: UIView {
             displayScale: measuredDisplayScale(),
             screenScale: window?.screen.nativeScale ?? traitCollection.displayScale
         ) else { return }
-        // PKDrawing stays in its page-sized logical coordinate system. Keep
-        // the actual PencilKit view bounded to that same size at every PDF
-        // zoom; PDFKit owns document zoom and this host maps page coordinates
-        // into the overlay exactly once.
+        // Keep the full PKDrawing in logical page coordinates. Size the actual
+        // canvas to the visible portion of the page, expressed in PencilKit's
+        // zoomed content coordinates. This keeps its drawable viewport near
+        // the device viewport instead of scaling the whole page into a huge
+        // layer at high PDF zoom.
         let requestedZoom = geometry.canvasZoom
-        let nativeZoom: CGFloat = 1
-        let viewportSize = drawingSize
-        let pageToViewport = CGAffineTransform(
-            scaleX: bounds.width / max(viewportSize.width, 1),
-            y: bounds.height / max(viewportSize.height, 1)
+        let nativeZoom = requestedZoom
+        let visiblePageRect = visibleOverlayRect()
+        guard !visiblePageRect.isNull, !visiblePageRect.isEmpty else { return }
+        let drawingToPageX = drawingSize.width / max(bounds.width, 1)
+        let drawingToPageY = drawingSize.height / max(bounds.height, 1)
+        let viewportSize = CGSize(
+            width: visiblePageRect.width * drawingToPageX * nativeZoom,
+            height: visiblePageRect.height * drawingToPageY * nativeZoom
         )
+        guard viewportSize.width.isFinite, viewportSize.height.isFinite,
+              viewportSize.width > 0, viewportSize.height > 0 else { return }
+        let contentOffset = CGPoint(
+            x: visiblePageRect.minX * drawingToPageX * nativeZoom,
+            y: visiblePageRect.minY * drawingToPageY * nativeZoom
+        )
+        let pageToViewport = CGAffineTransform(
+            scaleX: bounds.width / max(drawingSize.width * nativeZoom, 1),
+            y: bounds.height / max(drawingSize.height * nativeZoom, 1)
+        )
+        let hostCenter = CGPoint(x: visiblePageRect.midX, y: visiblePageRect.midY)
         let geometryAlreadyApplied = appliedGeometry != nil
+            && appliedDrawingContentSize == drawingSize
             && canvas.bounds.size == viewportSize
             && canvas.frame == CGRect(origin: .zero, size: viewportSize)
             && abs(canvas.zoomScale - nativeZoom) <= 0.0001
+            && abs(canvas.contentOffset.x - contentOffset.x) <= 0.05
+            && abs(canvas.contentOffset.y - contentOffset.y) <= 0.05
             && viewportHost.bounds.size == viewportSize
-            && viewportHost.center == CGPoint(x: bounds.midX, y: bounds.midY)
+            && viewportHost.center == hostCenter
             && viewportHost.transform == pageToViewport
         guard !geometryAlreadyApplied else { return }
 #if DEBUG
         if isPencilHoverActive { hoverGeometryReapplyCount += 1 }
 #endif
         appliedGeometry = geometry
+        if appliedDrawingContentSize != drawingSize {
+            canvas.contentSize = drawingSize
+            appliedDrawingContentSize = drawingSize
+        }
         let nextBounds = CGRect(origin: .zero, size: viewportSize)
         if viewportHost.bounds != nextBounds { viewportHost.bounds = nextBounds }
-        let nextCenter = CGPoint(x: bounds.midX, y: bounds.midY)
-        if viewportHost.center != nextCenter { viewportHost.center = nextCenter }
+        if viewportHost.center != hostCenter { viewportHost.center = hostCenter }
         if viewportHost.transform != pageToViewport { viewportHost.transform = pageToViewport }
-        // Keep the PKCanvasView itself untransformed. Its frame and bounds
-        // must both describe the real display viewport used by its tiler.
         if canvas.frame != nextBounds { canvas.frame = nextBounds }
-        if canvas.minimumZoomScale != nativeZoom { canvas.minimumZoomScale = nativeZoom }
-        if canvas.maximumZoomScale != nativeZoom { canvas.maximumZoomScale = nativeZoom }
+        let minimumZoom = min(0.01, nativeZoom)
+        if canvas.minimumZoomScale != minimumZoom { canvas.minimumZoomScale = minimumZoom }
+        if nativeZoom > canvas.maximumZoomScale { canvas.maximumZoomScale = nativeZoom }
         if abs(canvas.zoomScale - nativeZoom) > 0.0001 {
 #if DEBUG
             if isPencilHoverActive { hoverZoomSetCount += 1 }
 #endif
             canvas.setZoomScale(nativeZoom, animated: false)
+        }
+        if abs(canvas.contentOffset.x - contentOffset.x) > 0.05
+            || abs(canvas.contentOffset.y - contentOffset.y) > 0.05
+        {
+            canvas.setContentOffset(contentOffset, animated: false)
         }
         recordGeometryMilestoneIfNeeded(
             requestedZoom: geometry.canvasZoom,
@@ -248,10 +275,17 @@ final class JotPDFPageCanvasOverlay: UIView {
             JottreDiagnostics.shared.record("zoom.geometryUpdated", details: details)
         }
         #endif
-        // Setting a UIScrollView zoom range can lazily create or re-enable its
-        // pinch recognizer. Disable it after all native zoom configuration so
         // PDFView remains the only owner of the user's document pinch gesture.
         disableCanvasPinchGestures(in: canvas)
+    }
+
+    private func visibleOverlayRect() -> CGRect {
+        guard let scaleReferenceView, bounds.width > 0, bounds.height > 0 else { return bounds }
+        let pageInReference = convert(bounds, to: scaleReferenceView)
+        let visibleInReference = pageInReference.intersection(scaleReferenceView.bounds)
+        guard !visibleInReference.isNull, !visibleInReference.isEmpty else { return .zero }
+        let visible = convert(visibleInReference, from: scaleReferenceView).intersection(bounds)
+        return visible.isNull || visible.isEmpty ? .zero : visible
     }
 
 #if DEBUG

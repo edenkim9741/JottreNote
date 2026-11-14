@@ -19,6 +19,7 @@ final class JotCanvasZoomCoordinator: NSObject, UIGestureRecognizerDelegate {
     private let refresh: @MainActor () -> Void
     private var settleTask: Task<Void, Never>?
     private let pinches = NSHashTable<UIPinchGestureRecognizer>.weakObjects()
+    private let pans = NSHashTable<UIPanGestureRecognizer>.weakObjects()
     private let nativeDoubleTapStates = NSMapTable<UITapGestureRecognizer, NSNumber>.weakToStrongObjects()
     private weak var doubleTapHost: PDFView?
     private(set) var doubleTapRecognizer: UITapGestureRecognizer?
@@ -37,9 +38,15 @@ final class JotCanvasZoomCoordinator: NSObject, UIGestureRecognizerDelegate {
 
     func observe(_ scrollViews: [UIScrollView]) {
         for scrollView in scrollViews {
-            guard let pinch = scrollView.pinchGestureRecognizer, !pinches.contains(pinch) else { continue }
-            pinches.add(pinch)
-            pinch.addTarget(self, action: #selector(pinchChanged))
+            if let pinch = scrollView.pinchGestureRecognizer, !pinches.contains(pinch) {
+                pinches.add(pinch)
+                pinch.addTarget(self, action: #selector(pinchChanged))
+            }
+            let pan = scrollView.panGestureRecognizer
+            if !pans.contains(pan) {
+                pans.add(pan)
+                pan.addTarget(self, action: #selector(pagePanChanged))
+            }
         }
     }
 
@@ -217,6 +224,14 @@ final class JotCanvasZoomCoordinator: NSObject, UIGestureRecognizerDelegate {
             schedule(delay: .zero)
         default: break
         }
+    }
+
+    @objc private func pagePanChanged(_ pan: UIPanGestureRecognizer) {
+        guard pan.state == .began || pan.state == .changed || pan.state == .ended else { return }
+        // A bounded canvas follows the part of the PDF page currently visible
+        // in the PDFView. Recompute its viewport as the document scrolls while
+        // leaving PKDrawing and the PencilKit undo stack untouched.
+        refresh()
     }
 
     private func suppressNativeDoubleTapRecognizers(in view: UIView) {
