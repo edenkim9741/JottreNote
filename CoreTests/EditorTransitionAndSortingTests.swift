@@ -66,7 +66,7 @@ final class EditorTransitionAndSortingTests: XCTestCase {
             activePageIndex: 0,
             overlays: [0: page]
         )
-        XCTAssertTrue(CanvasTouchRouting.shouldSuppressNativeEditMenuInteractions(isEditing: true, tool: PKEraserTool(.bitmap)))
+        XCTAssertFalse(CanvasTouchRouting.shouldSuppressNativeEditMenuInteractions(isEditing: true, tool: PKEraserTool(.bitmap)))
         XCTAssertTrue(canvas.suppressesStandardEditActions)
         XCTAssertFalse(canvas.canPerformAction(#selector(UIResponderStandardEditActions.selectAll(_:)), withSender: nil))
     }
@@ -466,7 +466,7 @@ final class EditorTransitionAndSortingTests: XCTestCase {
         XCTAssertFalse(coordinator.pdfNavigationScrollViews().contains { $0 === canvas })
     }
 
-    func testCanvasEditMenuInteractionTracksInkAndLassoToolsWithoutDisablingDrawing() throws {
+    func testNativeEditMenuInteractionsStayAttachedAcrossToolChanges() throws {
         let pdf = JotPDFView()
         let page = overlay()
         pdf.addSubview(page)
@@ -478,15 +478,15 @@ final class EditorTransitionAndSortingTests: XCTestCase {
 
         coordinator.update(isEditing: true, tool: PKInkingTool(.pen), pickerVisible: true,
             rulerActive: false, activePageIndex: 0, overlays: [0: page])
-        XCTAssertFalse(canvas.interactions.contains { $0 === editMenu })
-        XCTAssertFalse(pdf.interactions.contains { $0 === pdfKitMenu })
+        XCTAssertTrue(canvas.interactions.contains { $0 === editMenu })
+        XCTAssertTrue(pdf.interactions.contains { $0 === pdfKitMenu })
         XCTAssertTrue(canvas.isUserInteractionEnabled)
         XCTAssertTrue(canvas.drawingGestureRecognizer.isEnabled)
 
         coordinator.update(isEditing: true, tool: PKLassoTool(), pickerVisible: true,
             rulerActive: false, activePageIndex: 0, overlays: [0: page])
         XCTAssertTrue(canvas.interactions.contains { $0 === editMenu },
-            "PencilKit's native edit menu is restored for lasso selection and copy/paste")
+            "PencilKit's native edit menu remains attached for lasso selection and copy/paste")
         XCTAssertTrue(pdf.interactions.contains { $0 === pdfKitMenu })
 
         coordinator.update(isEditing: false, tool: PKInkingTool(.pen), pickerVisible: false,
@@ -510,7 +510,7 @@ final class EditorTransitionAndSortingTests: XCTestCase {
         )
 
         XCTAssertTrue(page.canvas.isRulerActive)
-        XCTAssertTrue(CanvasTouchRouting.shouldSuppressNativeEditMenuInteractions(isEditing: true, tool: PKInkingTool(.pen)))
+        XCTAssertFalse(CanvasTouchRouting.shouldSuppressNativeEditMenuInteractions(isEditing: true, tool: PKInkingTool(.pen)))
         XCTAssertTrue(canvas.suppressesStandardEditActions)
     }
 
@@ -527,7 +527,7 @@ final class EditorTransitionAndSortingTests: XCTestCase {
             rulerActive: false, activePageIndex: nil, overlays: [:])
         XCTAssertTrue(pdf.isInMarkupMode)
         XCTAssertTrue(pdf.suppressesStandardEditActions)
-        XCTAssertTrue(CanvasTouchRouting.shouldSuppressNativeEditMenuInteractions(isEditing: true, tool: PKInkingTool(.pen)))
+        XCTAssertFalse(CanvasTouchRouting.shouldSuppressNativeEditMenuInteractions(isEditing: true, tool: PKInkingTool(.pen)))
         XCTAssertTrue(longPress.isEnabled, "PDFKit recognizers are left under PDFKit's control")
 
         coordinator.update(isEditing: false, tool: PKInkingTool(.pen), pickerVisible: false,

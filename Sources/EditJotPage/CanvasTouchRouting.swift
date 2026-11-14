@@ -35,7 +35,9 @@ enum CanvasTouchRouting {
     }
 
     static func shouldSuppressNativeEditMenuInteractions(isEditing: Bool, tool: any PKTool) -> Bool {
-        isEditing && !(tool is PKLassoTool)
+        // Jottre owns no UIEditMenuInteraction instances. PDFKit and
+        // PencilKit keep their native interactions for every tool.
+        false
     }
 
     /// PencilKit owns Pencil input. PDFKit's document pan always accepts direct

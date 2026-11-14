@@ -361,6 +361,14 @@ final class JotPDFPageCanvasOverlay: UIView {
         let pdfScrollView = pdfDocumentScrollView()
         let pdfPan = pdfScrollView?.panGestureRecognizer
         let canvasPan = canvas.panGestureRecognizer
+        let pdfInset = pdfScrollView?.adjustedContentInset ?? .zero
+        let pdfMinimumOffset = CGPoint(x: -pdfInset.left, y: -pdfInset.top)
+        let pdfMaximumOffset = CGPoint(
+            x: max(pdfMinimumOffset.x, (pdfScrollView?.contentSize.width ?? 0)
+                - (pdfScrollView?.bounds.width ?? 0) + pdfInset.right),
+            y: max(pdfMinimumOffset.y, (pdfScrollView?.contentSize.height ?? 0)
+                - (pdfScrollView?.bounds.height ?? 0) + pdfInset.bottom)
+        )
         let touches: [[String: Any]] = beganTouches.map { touch in
             let location = touch.location(in: window)
             return [
@@ -398,6 +406,13 @@ final class JotPDFPageCanvasOverlay: UIView {
             "pdfScrollEnabled": pdfScrollView?.isScrollEnabled ?? false,
             "pdfContentOffset": pdfScrollView.map { [Double($0.contentOffset.x), Double($0.contentOffset.y)] } ?? [],
             "pdfContentSize": pdfScrollView.map { [Double($0.contentSize.width), Double($0.contentSize.height)] } ?? [],
+            "pdfMinimumContentOffset": [Double(pdfMinimumOffset.x), Double(pdfMinimumOffset.y)],
+            "pdfMaximumContentOffset": [Double(pdfMaximumOffset.x), Double(pdfMaximumOffset.y)],
+            "pdfCanScrollHorizontally": pdfMaximumOffset.x - pdfMinimumOffset.x > 0.5,
+            "pdfCanScrollVertically": pdfMaximumOffset.y - pdfMinimumOffset.y > 0.5,
+            "pdfPanTouchCount": pdfPan?.numberOfTouches ?? 0,
+            "pdfPinchIdentity": pdfScrollView?.pinchGestureRecognizer.map { String(describing: ObjectIdentifier($0)) } ?? "nil",
+            "pdfPinchState": pdfScrollView?.pinchGestureRecognizer.map { $0.state.rawValue } ?? -1,
             "viewportHostIdentity": String(describing: ObjectIdentifier(viewportHost)),
             "viewportHostBounds": [Double(viewportHost.bounds.width), Double(viewportHost.bounds.height)],
             "viewportHostTransform": [Double(viewportHost.transform.a), Double(viewportHost.transform.b),
@@ -640,29 +655,36 @@ final class JotPDFPageCanvasOverlay: UIView {
         if isPencilHoverActive, recordDiagnostics { hoverGeometryReapplyCount += 1 }
         if recordDiagnostics { recordGeometryDiagnostic("geometry.beforeApply") }
 #endif
-        if viewportSizeChanged || canvas.frame.origin != .zero {
-            let nextBounds = CGRect(origin: .zero, size: viewportSize)
-            if viewportHost.bounds != nextBounds { viewportHost.bounds = nextBounds }
-            if canvas.frame != nextBounds { canvas.frame = nextBounds }
-        }
-        if viewportHost.center != hostCenter { viewportHost.center = hostCenter }
-        if abs(canvas.contentOffset.x - contentOffset.x) > 0.05
+        let shouldResizeViewport = viewportSizeChanged || canvas.frame.origin != .zero
+        let shouldMoveHost = viewportHost.center != hostCenter
+        let shouldMoveCanvas = abs(canvas.contentOffset.x - contentOffset.x) > 0.05
             || abs(canvas.contentOffset.y - contentOffset.y) > 0.05
-        {
+        guard shouldResizeViewport || shouldMoveHost || shouldMoveCanvas else { return }
+
 #if DEBUG
-            let oldOffset = canvas.contentOffset
+        let oldOffset = canvas.contentOffset
 #endif
-            canvas.setContentOffset(contentOffset, animated: false)
-#if DEBUG
-            if recordDiagnostics {
-                recordGeometryDiagnostic("canvas.offsetChanged", extra: [
-                    "source": "updateCanvasVisibleRegion",
-                    "oldValue": [Double(oldOffset.x), Double(oldOffset.y)],
-                    "newValue": [Double(canvas.contentOffset.x), Double(canvas.contentOffset.y)]
-                ])
+        UIView.performWithoutAnimation {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            if shouldResizeViewport {
+                let nextBounds = CGRect(origin: .zero, size: viewportSize)
+                if viewportHost.bounds != nextBounds { viewportHost.bounds = nextBounds }
+                if canvas.frame != nextBounds { canvas.frame = nextBounds }
             }
-#endif
+            if shouldMoveHost { viewportHost.center = hostCenter }
+            if shouldMoveCanvas { canvas.setContentOffset(contentOffset, animated: false) }
+            CATransaction.commit()
         }
+#if DEBUG
+        if recordDiagnostics, shouldMoveCanvas {
+            recordGeometryDiagnostic("canvas.offsetChanged", extra: [
+                "source": "updateCanvasVisibleRegion",
+                "oldValue": [Double(oldOffset.x), Double(oldOffset.y)],
+                "newValue": [Double(canvas.contentOffset.x), Double(canvas.contentOffset.y)]
+            ])
+        }
+#endif
     }
 
     private func visibleOverlayRect() -> CGRect {

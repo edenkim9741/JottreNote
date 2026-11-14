@@ -1693,6 +1693,9 @@ extension EditJotViewController: PKCanvasViewDelegate {
         if let canvas = canvasView as? JotCanvasView,
             pageIndexByCanvas[ObjectIdentifier(canvas)] != nil
         {
+#if DEBUG
+            canvas.setDiagnosticToolSequenceActive(true)
+#endif
             if canvas.tool is PKLassoTool { activateLassoCanvas(canvas) }
             #if DEBUG
             if let index = pageIndexByCanvas[ObjectIdentifier(canvas)] {
@@ -1763,6 +1766,9 @@ extension EditJotViewController: PKCanvasViewDelegate {
                 recordCommittedCanvasStroke(canvas, pageIndex: pageIndex)
             }
 #endif
+#if DEBUG
+            canvas.setDiagnosticToolSequenceActive(false)
+#endif
             debugScribbleUndoState(
                 "tool stroke ended",
                 pageIndex: pageIndex,
@@ -1772,6 +1778,18 @@ extension EditJotViewController: PKCanvasViewDelegate {
             if let pageIndex { applyPendingScribbleUndoEvents(pageIndex: pageIndex) }
             return
         }
+    }
+
+    func canvasViewSelectionDidChange(_ canvasView: PKCanvasView) {
+#if DEBUG
+        guard let canvas = canvasView as? JotCanvasView,
+              let pageIndex = pageIndexByCanvas[ObjectIdentifier(canvas)],
+              let overlay = pageOverlays[pageIndex] else { return }
+        overlay.recordGeometryDiagnostic("pencil.selectionStateChanged", extra: [
+            "activeTool": canvas.tool is PKLassoTool ? "lasso" : "other",
+            "selectionMovementState": "notExposedByPublicCanvasDelegate"
+        ])
+#endif
     }
 
 #if DEBUG

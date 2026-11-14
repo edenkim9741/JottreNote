@@ -12,7 +12,6 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
     private var isRulerActive = false
     private var activePageIndex: Int?
     private weak var activeCanvas: JotCanvasView?
-    private let editMenuInteractions = JotEditMenuInteractionController()
     private(set) var undoDoubleTapRecognizer: UITapGestureRecognizer?
     private let observedPDFPans = NSHashTable<UIPanGestureRecognizer>.weakObjects()
 #if DEBUG
@@ -22,6 +21,7 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
     private var isPDFScrollRoutingPending = false
 #if DEBUG
     private var pdfPanStartOffsets: [ObjectIdentifier: CGPoint] = [:]
+    private var pdfPanStartCanvasOffsets: [ObjectIdentifier: CGPoint] = [:]
     private var pdfPanSuccessLogged = Set<ObjectIdentifier>()
     private var lastLoggedPDFPanStates: [ObjectIdentifier: Int] = [:]
     private var lastLoggedCanvasPanStates: [ObjectIdentifier: Int] = [:]
@@ -80,12 +80,6 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
             tool: tool
         )
         pdfView.suppressesStandardEditActions = suppressesEditActions
-        let suppressesNativeEditMenus = CanvasTouchRouting.shouldSuppressNativeEditMenuInteractions(
-            isEditing: isEditing,
-            tool: tool
-        )
-        editMenuInteractions.apply(suppressed: suppressesNativeEditMenus, in: pdfView)
-
         for (index, overlay) in overlays {
             guard let canvas = overlay.canvas as? JotCanvasView else { continue }
             configure(canvas, overlay: overlay, pageIndex: index)
@@ -173,6 +167,7 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
         switch pan.state {
         case .began:
             pdfPanStartOffsets[key] = scrollView.contentOffset
+            pdfPanStartCanvasOffsets[key] = activeCanvas?.contentOffset
             pdfPanSuccessLogged.remove(key)
         case .changed:
             guard !pdfPanSuccessLogged.contains(key),
@@ -200,9 +195,16 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
                 "currentPanState": Self.stateName(pan.state.rawValue),
                 "startContentOffset": pdfPanStartOffsets[key].map { [Double($0.x), Double($0.y)] } ?? [],
                 "finalContentOffset": [Double(scrollView.contentOffset.x), Double(scrollView.contentOffset.y)],
-                "offsetChanged": pdfPanSuccessLogged.contains(key)
+                "offsetChanged": pdfPanSuccessLogged.contains(key),
+                "startCanvasContentOffset": pdfPanStartCanvasOffsets[key].map { [Double($0.x), Double($0.y)] } ?? [],
+                "finalCanvasContentOffset": activeCanvas.map { [Double($0.contentOffset.x), Double($0.contentOffset.y)] } ?? [],
+                "canvasOffsetChanged": pdfPanStartCanvasOffsets[key].map {
+                    guard let activeCanvas else { return false }
+                    return hypot(activeCanvas.contentOffset.x - $0.x, activeCanvas.contentOffset.y - $0.y) > 0.05
+                } ?? false
             ])
             pdfPanStartOffsets.removeValue(forKey: key)
+            pdfPanStartCanvasOffsets.removeValue(forKey: key)
             pdfPanSuccessLogged.remove(key)
         default:
             break
@@ -291,6 +293,8 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
             "pdfPanEnabled": pan.isEnabled,
             "pdfPanState": pan.state.rawValue,
             "pdfPanStateName": Self.stateName(pan.state.rawValue),
+            "pdfPinchIdentity": scrollView?.pinchGestureRecognizer.map { String(describing: ObjectIdentifier($0)) } ?? "nil",
+            "pdfPinchState": scrollView?.pinchGestureRecognizer.map { Self.stateName($0.state.rawValue) } ?? "unknown",
             "numberOfTouches": pan.numberOfTouches,
             "minimumTouches": pan.minimumNumberOfTouches,
             "maximumTouches": pan.maximumNumberOfTouches,
@@ -311,7 +315,8 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
             "viewportHostIdentity": canvasHost.map { String(describing: ObjectIdentifier($0)) } ?? "nil",
             "viewportHostBounds": canvasHost.map { [Double($0.bounds.width), Double($0.bounds.height)] } ?? [],
             "viewportHostTransform": canvasHost.map { [Double($0.transform.a), Double($0.transform.b), Double($0.transform.c), Double($0.transform.d)] } ?? [],
-            "canvasTool": activeCanvas.map { $0.tool is PKLassoTool ? "lasso" : $0.tool is PKEraserTool ? "eraser" : "ink" } ?? "none"
+            "canvasTool": activeCanvas.map { $0.tool is PKLassoTool ? "lasso" : $0.tool is PKEraserTool ? "eraser" : "ink" } ?? "none",
+            "canvasPencilKitToolSequenceActive": activeCanvas?.diagnosticToolSequenceActive ?? false
         ]
         details.merge(extra) { _, new in new }
         JottreDiagnostics.shared.record(event, details: details)
@@ -359,13 +364,6 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
             isEditing: isEditingEnabled,
             tool: selectedTool
         )
-        editMenuInteractions.apply(
-            suppressed: CanvasTouchRouting.shouldSuppressNativeEditMenuInteractions(
-                isEditing: isEditingEnabled,
-                tool: selectedTool
-            ),
-            in: overlay
-        )
         let shouldActivateRuler = isEditingEnabled && isRulerActive && pageIndex == activePageIndex
         if canvas.isRulerActive != shouldActivateRuler {
             canvas.isRulerActive = shouldActivateRuler
@@ -373,7 +371,6 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
     }
 
     func detach(_ canvas: JotCanvasView) {
-        editMenuInteractions.restore(in: canvas)
         canvas.isUserInteractionEnabled = false
         canvas.delegate = nil
     }
@@ -409,95 +406,6 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
     }
 }
 
-/// PDFKit and PencilKit retain their native recognizers and touch routing.
-/// Standard responder actions remain suppressed for ordinary ink tools.
-/// Keeps PDFKit/PencilKit's native edit-menu interactions intact, but removes
-/// only those interactions while pen or eraser input is active. The same
-/// interaction objects are restored for lasso and when editing ends.
-@MainActor
-final class JotEditMenuInteractionController {
-    private final class DetachedInteraction {
-        weak var owner: UIView?
-        let interaction: UIEditMenuInteraction
-
-        init(owner: UIView, interaction: UIEditMenuInteraction) {
-            self.owner = owner
-            self.interaction = interaction
-        }
-    }
-
-    private var detached: [ObjectIdentifier: DetachedInteraction] = [:]
-    #if DEBUG
-    private var diagnosed = Set<ObjectIdentifier>()
-    #endif
-
-    var detachedCount: Int { detached.count }
-
-    func apply(suppressed: Bool, in root: UIView) {
-        detached = detached.filter { $0.value.owner != nil }
-        if suppressed {
-            visit(root) { owner in
-                for interaction in owner.interactions.compactMap({ $0 as? UIEditMenuInteraction }) {
-                    let key = ObjectIdentifier(interaction)
-                    diagnose(interaction, owner: owner)
-                    guard detached[key] == nil else {
-                        owner.removeInteraction(interaction)
-                        continue
-                    }
-                    detached[key] = DetachedInteraction(owner: owner, interaction: interaction)
-                    owner.removeInteraction(interaction)
-                }
-            }
-        } else {
-            restore(in: root)
-        }
-    }
-
-    func restore(in root: UIView) {
-        let keys = detached.compactMap { entry -> ObjectIdentifier? in
-            let (key, record) = entry
-            guard let owner = record.owner,
-                owner === root || owner.isDescendant(of: root)
-            else { return nil }
-            return key
-        }
-        for key in keys {
-            guard let record = detached.removeValue(forKey: key), let owner = record.owner else { continue }
-            if !owner.interactions.contains(where: { $0 === record.interaction }) {
-                owner.addInteraction(record.interaction)
-            }
-        }
-    }
-
-    private func visit(_ view: UIView, body: (UIView) -> Void) {
-        body(view)
-        for child in view.subviews { visit(child, body: body) }
-    }
-
-    private func diagnose(_ interaction: UIEditMenuInteraction, owner: UIView) {
-        #if DEBUG
-        let key = ObjectIdentifier(interaction)
-        guard diagnosed.insert(key).inserted else { return }
-        var hierarchy: [String] = []
-        var current: UIView? = owner
-        while let view = current {
-            hierarchy.append(String(describing: type(of: view)))
-            current = view.superview
-        }
-        let responder = owner.window.flatMap(firstResponder(in:)).map { String(describing: type(of: $0)) } ?? "none"
-        print("[EditMenuDiagnostic] UIEditMenuInteraction owner=\(type(of: owner)) path=\(hierarchy.joined(separator: " <- ")) delegate=\(interaction.delegate.map { String(describing: type(of: $0)) } ?? "system") firstResponder=\(responder)")
-        #endif
-    }
-
-    private func firstResponder(in view: UIView) -> UIResponder? {
-        if view.isFirstResponder { return view }
-        for child in view.subviews {
-            if let responder = firstResponder(in: child) { return responder }
-        }
-        return nil
-    }
-}
-
 final class JotPDFView: PDFView {
     var suppressesStandardEditActions = false
 
@@ -514,6 +422,11 @@ final class JotCanvasView: PKCanvasView {
     private(set) var diagnosticTouchStartType: String?
     private(set) var diagnosticTouchEndType: String?
     private(set) var diagnosticStrokeCountAtTouchStart = 0
+    private(set) var diagnosticToolSequenceActive = false
+
+    func setDiagnosticToolSequenceActive(_ isActive: Bool) {
+        diagnosticToolSequenceActive = isActive
+    }
 
     func resetDiagnosticTouches() {
         diagnosticTouchStartInWindow = nil
