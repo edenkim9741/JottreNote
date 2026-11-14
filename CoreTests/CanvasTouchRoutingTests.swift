@@ -13,12 +13,6 @@ final class CanvasTouchRoutingTests: XCTestCase {
     }
 
     @MainActor
-    func testDirectTouchesPassThroughOverlayUnlessRulerNeedsFingerInteraction() {
-        XCTAssertTrue(CanvasTouchRouting.shouldPassDirectTouchesThroughOverlay(rulerActive: false))
-        XCTAssertFalse(CanvasTouchRouting.shouldPassDirectTouchesThroughOverlay(rulerActive: true))
-    }
-
-    @MainActor
     func testNativeEditMenuSuppressionTargetsInkAndEraserButPreservesLassoAndRuler() {
         XCTAssertTrue(CanvasTouchRouting.suppressesStandardEditActions(isEditing: true, tool: PKInkingTool(.pen)))
         XCTAssertTrue(CanvasTouchRouting.suppressesStandardEditActions(isEditing: true, tool: PKEraserTool(.bitmap)))
@@ -76,7 +70,6 @@ final class CanvasTouchRoutingTests: XCTestCase {
         XCTAssertTrue(secondCanvas.isUserInteractionEnabled)
         XCTAssertTrue(secondCanvas.drawingGestureRecognizer.isEnabled)
         XCTAssertTrue(secondCanvas.suppressesStandardEditActions)
-        XCTAssertFalse(CanvasTouchRouting.shouldPassDirectTouchesThroughOverlay(rulerActive: secondCanvas.isRulerActive))
 
         coordinator.update(
             isEditing: true,
@@ -121,45 +114,6 @@ final class CanvasTouchRoutingTests: XCTestCase {
     }
 
     @MainActor
-    func testPencilOnlyAndViewingModesKeepOneFingerPDFNavigation() {
-        let editing = CanvasTouchRouting.configuration(
-            isEditingEnabled: true,
-            drawingPolicy: CanvasTouchRouting.drawingPolicy(for: PKLassoTool()),
-            isToolPickerVisible: true,
-            prefersPencilOnlyDrawing: false
-        )
-        let viewing = CanvasTouchRouting.configuration(
-            isEditingEnabled: false,
-            drawingPolicy: .anyInput,
-            isToolPickerVisible: true,
-            prefersPencilOnlyDrawing: false
-        )
-
-        XCTAssertFalse(editing.isFingerDrawingEnabled)
-        XCTAssertEqual(editing.documentPanMinimumNumberOfTouches, 1)
-        XCTAssertEqual(viewing.documentPanMinimumNumberOfTouches, 1)
-    }
-
-    @MainActor
-    func testAnyInputAndDefaultPoliciesSetDocumentPanTouchCount() {
-        let anyInput = CanvasTouchRouting.configuration(
-            isEditingEnabled: true,
-            drawingPolicy: .anyInput,
-            isToolPickerVisible: false,
-            prefersPencilOnlyDrawing: true
-        )
-        let systemDefault = CanvasTouchRouting.configuration(
-            isEditingEnabled: true,
-            drawingPolicy: .default,
-            isToolPickerVisible: true,
-            prefersPencilOnlyDrawing: false
-        )
-
-        XCTAssertEqual(anyInput.documentPanMinimumNumberOfTouches, 2)
-        XCTAssertEqual(systemDefault.documentPanMinimumNumberOfTouches, 2)
-    }
-
-    @MainActor
     func testPDFPanAcceptsFingerOnlyDuringEditingAndRestoresOriginalTypes() throws {
         #if targetEnvironment(macCatalyst)
         throw XCTSkip("Touch-type routing is unavailable on Mac Catalyst")
@@ -167,15 +121,19 @@ final class CanvasTouchRoutingTests: XCTestCase {
         let pan = UIPanGestureRecognizer()
         pan.minimumNumberOfTouches = 1
         let originalTypes = pan.allowedTouchTypes
-        let input = CanvasTouchRouting.Configuration(isFingerDrawingEnabled: false)
+        let originalMinimum = pan.minimumNumberOfTouches
+        let originalMaximum = pan.maximumNumberOfTouches
 
-        CanvasTouchRouting.apply(input, to: [pan], pencilInputHasPriority: true)
+        CanvasTouchRouting.apply(to: [pan], pencilInputHasPriority: true)
 
         XCTAssertEqual(pan.allowedTouchTypes, [NSNumber(value: UITouch.TouchType.direct.rawValue)])
-        XCTAssertEqual(pan.minimumNumberOfTouches, 1)
+        XCTAssertEqual(pan.minimumNumberOfTouches, originalMinimum)
+        XCTAssertEqual(pan.maximumNumberOfTouches, originalMaximum)
 
-        CanvasTouchRouting.apply(input, to: [pan], pencilInputHasPriority: false)
+        CanvasTouchRouting.apply(to: [pan], pencilInputHasPriority: false)
         XCTAssertEqual(pan.allowedTouchTypes, originalTypes)
+        XCTAssertEqual(pan.minimumNumberOfTouches, originalMinimum)
+        XCTAssertEqual(pan.maximumNumberOfTouches, originalMaximum)
         #endif
     }
 

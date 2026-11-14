@@ -4,7 +4,17 @@ import UIKit
 /// Separates PencilKit input from PDFKit document navigation.
 @MainActor
 enum CanvasTouchRouting {
-    private static let originalPDFPanTouchTypes = NSMapTable<UIPanGestureRecognizer, NSArray>.weakToStrongObjects()
+    @MainActor
+    private final class OriginalPDFPanConfiguration: NSObject {
+        let allowedTouchTypes: [NSNumber]
+
+        init(pan: UIPanGestureRecognizer) {
+            allowedTouchTypes = pan.allowedTouchTypes
+        }
+    }
+
+    private static let originalPDFPanConfigurations =
+        NSMapTable<UIPanGestureRecognizer, OriginalPDFPanConfiguration>.weakToStrongObjects()
 
     static func usesPersistentResponder(isEditing: Bool, tool: any PKTool) -> Bool {
         isEditing && !(tool is PKLassoTool)
@@ -20,10 +30,6 @@ enum CanvasTouchRouting {
         return .pencilOnly
     }
 
-    static func shouldPassDirectTouchesThroughOverlay(rulerActive: Bool) -> Bool {
-        !rulerActive
-    }
-
     static func suppressesStandardEditActions(isEditing: Bool, tool: any PKTool) -> Bool {
         isEditing && !(tool is PKLassoTool)
     }
@@ -32,58 +38,26 @@ enum CanvasTouchRouting {
         isEditing && !(tool is PKLassoTool)
     }
 
-    struct Configuration: Equatable, Sendable {
-        let isFingerDrawingEnabled: Bool
-
-        var documentPanMinimumNumberOfTouches: Int {
-            isFingerDrawingEnabled ? 2 : 1
-        }
-    }
-
-    static func configuration(
-        isEditingEnabled: Bool,
-        drawingPolicy: PKCanvasViewDrawingPolicy,
-        isToolPickerVisible: Bool,
-        prefersPencilOnlyDrawing: Bool
-    ) -> Configuration {
-        guard isEditingEnabled else { return Configuration(isFingerDrawingEnabled: false) }
-
-        switch drawingPolicy {
-        case .anyInput:
-            return Configuration(isFingerDrawingEnabled: true)
-        case .pencilOnly:
-            return Configuration(isFingerDrawingEnabled: false)
-        case .default:
-            return Configuration(
-                isFingerDrawingEnabled: isToolPickerVisible && !prefersPencilOnlyDrawing
-            )
-        @unknown default:
-            return Configuration(isFingerDrawingEnabled: false)
-        }
-    }
-
-    /// PDFKit sees direct touches only while PencilKit handles Apple Pencil.
-    /// Recognizers are restored to their original input types on editor exit.
+    /// PencilKit owns Pencil input. PDFKit's document pan always accepts direct
+    /// touches, regardless of the selected PencilKit tool or picker state.
+    /// Restore the recognizer's original touch types when editing ends.
     static func apply(
-        _ configuration: Configuration,
         to panGestureRecognizers: [UIPanGestureRecognizer],
         pencilInputHasPriority: Bool = false
     ) {
         #if !targetEnvironment(macCatalyst)
         for pan in panGestureRecognizers {
-            let minimum = configuration.documentPanMinimumNumberOfTouches
-            if pan.maximumNumberOfTouches < minimum { pan.maximumNumberOfTouches = minimum }
-            if pan.minimumNumberOfTouches != minimum { pan.minimumNumberOfTouches = minimum }
-
             if pencilInputHasPriority {
-                if originalPDFPanTouchTypes.object(forKey: pan) == nil {
-                    originalPDFPanTouchTypes.setObject(pan.allowedTouchTypes as NSArray, forKey: pan)
+                if originalPDFPanConfigurations.object(forKey: pan) == nil {
+                    originalPDFPanConfigurations.setObject(OriginalPDFPanConfiguration(pan: pan), forKey: pan)
                 }
                 let directTouch = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
                 if pan.allowedTouchTypes != directTouch { pan.allowedTouchTypes = directTouch }
-            } else if let original = originalPDFPanTouchTypes.object(forKey: pan) as? [NSNumber] {
-                pan.allowedTouchTypes = original
-                originalPDFPanTouchTypes.removeObject(forKey: pan)
+            } else if let original = originalPDFPanConfigurations.object(forKey: pan) {
+                if pan.allowedTouchTypes != original.allowedTouchTypes {
+                    pan.allowedTouchTypes = original.allowedTouchTypes
+                }
+                originalPDFPanConfigurations.removeObject(forKey: pan)
             }
         }
         #endif

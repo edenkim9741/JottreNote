@@ -45,6 +45,7 @@ final class JotPDFPageCanvasOverlay: UIView {
     private var appliedDrawingContentSize: CGSize?
     private var lastMemorySampleZoomBucket: Int?
 #if DEBUG
+    private weak var lastHitTestTouchEvent: UIEvent?
     private var canvasGeometryObservations: [NSKeyValueObservation] = []
     private var pdfGeometryObservations: [NSKeyValueObservation] = []
     private weak var observedPDFScrollView: UIScrollView?
@@ -109,17 +110,12 @@ final class JotPDFPageCanvasOverlay: UIView {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
-        if CanvasTouchRouting.shouldPassDirectTouchesThroughOverlay(rulerActive: canvas.isRulerActive),
-            event?.allTouches?.contains(where: { $0.type == .direct }) == true
-        {
-            // `.pencilOnly` controls drawing, not UIKit hit testing. Let direct
-            // touches reach PDFKit's page recognizers; Pencil input still hits
-            // the page-local PKCanvasView. Keep the overlay hit-testable while
-            // the PencilKit ruler is active so fingers can manipulate it.
-            return false
-        }
-        return super.point(inside: point, with: event)
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        let target = super.hitTest(point, with: event)
+#if DEBUG
+        recordTouchHitTestIfNeeded(point, event: event, target: target)
+#endif
+        return target
     }
 
     func prepareForPage(size: CGSize, drawingWidth: CGFloat) {
@@ -354,6 +350,60 @@ final class JotPDFPageCanvasOverlay: UIView {
         let state = drawingBoundsState(bounds)
         guard state == "finite" || state == "empty" else { return NSNull() }
         return rectComponents(bounds)
+    }
+
+    private func recordTouchHitTestIfNeeded(_ point: CGPoint, event: UIEvent?, target: UIView?) {
+        guard let event, event !== lastHitTestTouchEvent,
+              let beganTouches = event.allTouches?.filter({ $0.phase == .began }),
+              !beganTouches.isEmpty else { return }
+        lastHitTestTouchEvent = event
+        let pdfScrollView = pdfDocumentScrollView()
+        let pdfPan = pdfScrollView?.panGestureRecognizer
+        let canvasPan = canvas.panGestureRecognizer
+        let touches: [[String: Any]] = beganTouches.map { touch in
+            let location = touch.location(in: window)
+            return [
+                "identity": String(describing: ObjectIdentifier(touch)),
+                "type": Self.touchTypeName(touch.type),
+                "typeRawValue": touch.type.rawValue,
+                "locationInWindow": [Double(location.x), Double(location.y)]
+            ]
+        }
+        JottreDiagnostics.shared.record("touch.hitTest", details: [
+            "eventSequence": JotCanvasGeometryDiagnosticSequence.next(),
+            "eventTimestamp": Date().timeIntervalSince1970,
+            "eventIdentity": String(describing: ObjectIdentifier(event)),
+            "touches": touches,
+            "hitTestPointInOverlay": [Double(point.x), Double(point.y)],
+            "hitTestTargetClass": target.map { String(describing: type(of: $0)) } ?? "nil",
+            "hitTestTargetIdentity": target.map { String(describing: ObjectIdentifier($0)) } ?? "nil",
+            "activeTool": canvas.tool is PKLassoTool ? "lasso" : canvas.tool is PKEraserTool ? "eraser" : "ink",
+            "canvasPanIdentity": String(describing: ObjectIdentifier(canvasPan)),
+            "canvasPanState": canvasPan.state.rawValue,
+            "canvasPanEnabled": canvasPan.isEnabled,
+            "canvasPanAllowedTouchTypes": canvasPan.allowedTouchTypes.map(\.intValue),
+            "canvasPanMinimumTouches": canvasPan.minimumNumberOfTouches,
+            "canvasPanMaximumTouches": canvasPan.maximumNumberOfTouches,
+            "canvasScrollEnabled": canvas.isScrollEnabled,
+            "pdfPanIdentity": pdfPan.map { String(describing: ObjectIdentifier($0)) } ?? "nil",
+            "pdfPanState": pdfPan?.state.rawValue ?? -1,
+            "pdfPanEnabled": pdfPan?.isEnabled ?? false,
+            "pdfPanAllowedTouchTypes": pdfPan?.allowedTouchTypes.map(\.intValue) ?? [],
+            "pdfPanMinimumTouches": pdfPan?.minimumNumberOfTouches ?? 0,
+            "pdfPanMaximumTouches": pdfPan?.maximumNumberOfTouches ?? 0,
+            "pdfScrollEnabled": pdfScrollView?.isScrollEnabled ?? false,
+            "pdfContentOffset": pdfScrollView.map { [Double($0.contentOffset.x), Double($0.contentOffset.y)] } ?? []
+        ])
+    }
+
+    private static func touchTypeName(_ type: UITouch.TouchType) -> String {
+        switch type {
+        case .direct: return "direct"
+        case .pencil: return "pencil"
+        case .indirect: return "indirect"
+        case .indirectPointer: return "indirectPointer"
+        @unknown default: return "unknown(\(type.rawValue))"
+        }
     }
 #endif
 

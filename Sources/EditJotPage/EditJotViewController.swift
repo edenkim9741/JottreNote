@@ -409,7 +409,6 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
         gestureCoordinator.update(
             isEditing: false,
             tool: selectedCanvasTool,
-            pickerVisible: false,
             rulerActive: false,
             activePageIndex: nil,
             overlays: pageOverlays
@@ -471,6 +470,7 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         zoomCoordinator.updateScaleRange(in: pdfView)
+        gestureCoordinator.refreshPDFScrollRoutingIfNavigationViewChanged()
     }
 
     private func setUpViews() {
@@ -654,7 +654,6 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
         gestureCoordinator.update(
             isEditing: isEditingEnabled,
             tool: selectedToolFromPickerIfAvailable(),
-            pickerVisible: toolPicker.isVisible,
             rulerActive: cachedRulerActive,
             activePageIndex: currentPDFPageIndex,
             overlays: pageOverlays
@@ -1750,9 +1749,6 @@ extension EditJotViewController: PKCanvasViewDelegate {
                 recordCommittedCanvasStroke(canvas, pageIndex: pageIndex)
             }
 #endif
-            if canvas.tool is PKLassoTool {
-                gestureCoordinator.refreshPDFScrollRoutingAfterCanvasContact()
-            }
             debugScribbleUndoState(
                 "tool stroke ended",
                 pageIndex: pageIndex,

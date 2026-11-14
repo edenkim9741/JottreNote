@@ -9,16 +9,22 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
     private unowned let pdfView: JotPDFView
     private var isEditingEnabled = false
     private var selectedTool: any PKTool = PKInkingTool(.pen)
-    private var isToolPickerVisible = false
     private var isRulerActive = false
     private var activePageIndex: Int?
     private weak var activeCanvas: JotCanvasView?
     private let editMenuInteractions = JotEditMenuInteractionController()
     private(set) var undoDoubleTapRecognizer: UITapGestureRecognizer?
-#if DEBUG
     private let observedPDFPans = NSHashTable<UIPanGestureRecognizer>.weakObjects()
+#if DEBUG
+    private let observedCanvasPans = NSHashTable<UIPanGestureRecognizer>.weakObjects()
+#endif
+    private let routedPDFPans = NSHashTable<UIPanGestureRecognizer>.weakObjects()
+    private var isPDFScrollRoutingPending = false
+#if DEBUG
     private var pdfPanStartOffsets: [ObjectIdentifier: CGPoint] = [:]
     private var pdfPanSuccessLogged = Set<ObjectIdentifier>()
+    private var lastLoggedPDFPanStates: [ObjectIdentifier: Int] = [:]
+    private var lastLoggedCanvasPanStates: [ObjectIdentifier: Int] = [:]
 #endif
 
     init(pdfView: JotPDFView) {
@@ -51,14 +57,12 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
     func update(
         isEditing: Bool,
         tool: any PKTool,
-        pickerVisible: Bool,
         rulerActive: Bool,
         activePageIndex: Int?,
         overlays: [Int: JotPDFPageCanvasOverlay]
     ) {
         isEditingEnabled = isEditing
         selectedTool = tool
-        isToolPickerVisible = pickerVisible
         if isEditing {
             isRulerActive = rulerActive
             if let activePageIndex { self.activePageIndex = activePageIndex }
@@ -87,27 +91,24 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
         applyPDFScrollRouting()
     }
 
-    /// Reapply the current, touch-type-specific PDF navigation policy after
-    /// PencilKit ends a native tool interaction. This does not enable/disable
-    /// recognizers and does not change PencilKit's own scroll state.
-    func refreshPDFScrollRoutingAfterCanvasContact() {
-        guard isEditingEnabled else { return }
-        applyPDFScrollRouting()
-    }
-
     private func applyPDFScrollRouting() {
         let pans = pdfNavigationScrollViews().map(\.panGestureRecognizer)
+        let currentIdentities = Set(pans.map(ObjectIdentifier.init))
+        let stalePans = routedPDFPans.allObjects.filter { !currentIdentities.contains(ObjectIdentifier($0)) }
+        let allPans = pans + stalePans
+        observePDFPanGestures(allPans)
+        guard !allPans.contains(where: Self.isGestureActive) else {
+            isPDFScrollRoutingPending = true
+            return
+        }
+        isPDFScrollRoutingPending = false
 #if DEBUG
-        observePDFPanGestures(pans)
-        let oldStates = pans.map { ($0, scrollPolicyState(for: $0)) }
+        let oldStates = allPans.map { ($0, scrollPolicyState(for: $0)) }
 #endif
-        let input = CanvasTouchRouting.configuration(
-            isEditingEnabled: isEditingEnabled,
-            drawingPolicy: CanvasTouchRouting.drawingPolicy(for: selectedTool),
-            isToolPickerVisible: isToolPickerVisible,
-            prefersPencilOnlyDrawing: UIPencilInteraction.prefersPencilOnlyDrawing
-        )
-        CanvasTouchRouting.apply(input, to: pans, pencilInputHasPriority: isEditingEnabled)
+        CanvasTouchRouting.apply(to: pans, pencilInputHasPriority: isEditingEnabled)
+        CanvasTouchRouting.apply(to: stalePans, pencilInputHasPriority: false)
+        stalePans.forEach { routedPDFPans.remove($0) }
+        pans.forEach { routedPDFPans.add($0) }
 #if DEBUG
         for (pan, oldState) in oldStates {
             let newState = scrollPolicyState(for: pan)
@@ -120,22 +121,52 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
 #endif
     }
 
-#if DEBUG
     private func observePDFPanGestures(_ pans: [UIPanGestureRecognizer]) {
         for pan in pans where !observedPDFPans.contains(pan) {
             observedPDFPans.add(pan)
             pan.addTarget(self, action: #selector(pdfPanStateChanged(_:)))
+#if DEBUG
+            lastLoggedPDFPanStates[ObjectIdentifier(pan)] = pan.state.rawValue
+#endif
         }
     }
 
+    private static func isGestureActive(_ pan: UIPanGestureRecognizer) -> Bool {
+        pan.state == .began || pan.state == .changed
+    }
+
+#if DEBUG
+    private func observeCanvasPan(_ canvas: JotCanvasView) {
+        let pan = canvas.panGestureRecognizer
+        guard !observedCanvasPans.contains(pan) else { return }
+        observedCanvasPans.add(pan)
+        pan.addTarget(self, action: #selector(canvasPanStateChanged(_:)))
+        lastLoggedCanvasPanStates[ObjectIdentifier(pan)] = pan.state.rawValue
+    }
+#endif
+
     @objc private func pdfPanStateChanged(_ pan: UIPanGestureRecognizer) {
+#if DEBUG
         guard let scrollView = pan.view as? UIScrollView else { return }
         let key = ObjectIdentifier(pan)
+        let previousState = lastLoggedPDFPanStates[key]
+        let didChangeState = previousState != pan.state.rawValue
+        if didChangeState { lastLoggedPDFPanStates[key] = pan.state.rawValue }
+        if didChangeState, pan.state == .began {
+            recordScrollDiagnostic("pdf.scrollAttempted", pan: pan, extra: [
+                "previousPanState": Self.stateName(previousState),
+                "currentPanState": Self.stateName(pan.state.rawValue)
+            ])
+        } else if didChangeState, pan.state == .changed {
+            recordScrollDiagnostic("gesture.pdfPanStateChanged", pan: pan, extra: [
+                "previousPanState": Self.stateName(previousState),
+                "currentPanState": Self.stateName(pan.state.rawValue)
+            ])
+        }
         switch pan.state {
         case .began:
             pdfPanStartOffsets[key] = scrollView.contentOffset
             pdfPanSuccessLogged.remove(key)
-            recordScrollDiagnostic("pdf.scrollAttempted", pan: pan)
         case .changed:
             guard !pdfPanSuccessLogged.contains(key),
                   let start = pdfPanStartOffsets[key],
@@ -151,7 +182,15 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
                 pdfPanSuccessLogged.insert(key)
                 recordScrollDiagnostic("pdf.scrollSucceeded", pan: pan, extra: ["observedDuring": "terminal"])
             }
-            recordScrollDiagnostic("pdf.scrollPanEnded", pan: pan, extra: [
+            let terminalEvent: String
+            switch pan.state {
+            case .cancelled: terminalEvent = "pdf.scrollPanCancelled"
+            case .failed: terminalEvent = "pdf.scrollPanFailed"
+            default: terminalEvent = "pdf.scrollPanEnded"
+            }
+            recordScrollDiagnostic(terminalEvent, pan: pan, extra: [
+                "previousPanState": Self.stateName(previousState),
+                "currentPanState": Self.stateName(pan.state.rawValue),
                 "startContentOffset": pdfPanStartOffsets[key].map { [Double($0.x), Double($0.y)] } ?? [],
                 "finalContentOffset": [Double(scrollView.contentOffset.x), Double(scrollView.contentOffset.y)],
                 "offsetChanged": pdfPanSuccessLogged.contains(key)
@@ -161,8 +200,42 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
         default:
             break
         }
+#endif
+        if !Self.isGestureActive(pan), isPDFScrollRoutingPending {
+            isPDFScrollRoutingPending = false
+            applyPDFScrollRouting()
+        }
     }
 
+#if DEBUG
+    @objc private func canvasPanStateChanged(_ pan: UIPanGestureRecognizer) {
+        let key = ObjectIdentifier(pan)
+        let previousState = lastLoggedCanvasPanStates[key]
+        guard previousState != pan.state.rawValue else { return }
+        lastLoggedCanvasPanStates[key] = pan.state.rawValue
+        let canvas = pan.view as? JotCanvasView
+        let pdfPan = pdfNavigationScrollViews().first?.panGestureRecognizer
+        JottreDiagnostics.shared.record("gesture.canvasPanStateChanged", details: [
+            "eventSequence": JotCanvasGeometryDiagnosticSequence.next(),
+            "eventTimestamp": Date().timeIntervalSince1970,
+            "canvasPanIdentity": String(describing: ObjectIdentifier(pan)),
+            "previousPanState": Self.stateName(previousState),
+            "currentPanState": Self.stateName(pan.state.rawValue),
+            "canvasPanEnabled": pan.isEnabled,
+            "canvasPanAllowedTouchTypes": pan.allowedTouchTypes.map(\.intValue),
+            "canvasPanMinimumTouches": pan.minimumNumberOfTouches,
+            "canvasPanMaximumTouches": pan.maximumNumberOfTouches,
+            "canvasScrollEnabled": canvas?.isScrollEnabled ?? false,
+            "activeTool": canvas.map { $0.tool is PKLassoTool ? "lasso" : $0.tool is PKEraserTool ? "eraser" : "ink" } ?? "none",
+            "pdfPanIdentity": pdfPan.map { String(describing: ObjectIdentifier($0)) } ?? "nil",
+            "pdfPanState": pdfPan.map { Self.stateName($0.state.rawValue) } ?? "unknown",
+            "pdfScrollEnabled": (pdfPan?.view as? UIScrollView)?.isScrollEnabled ?? false,
+            "pdfContentOffset": (pdfPan?.view as? UIScrollView).map { [Double($0.contentOffset.x), Double($0.contentOffset.y)] } ?? []
+        ])
+    }
+#endif
+
+#if DEBUG
     private func scrollPolicyState(for pan: UIPanGestureRecognizer) -> [String: Any] {
         [
             "enabled": pan.isEnabled,
@@ -170,6 +243,19 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
             "maximumTouches": pan.maximumNumberOfTouches,
             "allowedTouchTypes": pan.allowedTouchTypes.map(\.intValue)
         ]
+    }
+
+    private static func stateName(_ rawValue: Int?) -> String {
+        guard let rawValue, let state = UIGestureRecognizer.State(rawValue: rawValue) else { return "unknown" }
+        switch state {
+        case .possible: return "possible"
+        case .began: return "began"
+        case .changed: return "changed"
+        case .ended: return "ended"
+        case .cancelled: return "cancelled"
+        case .failed: return "failed"
+        @unknown default: return "unknown(\(rawValue))"
+        }
     }
 
     private func recordScrollDiagnostic(
@@ -185,7 +271,9 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
             "isEditing": isEditingEnabled,
             "activePageIndex": activePageIndex as Any? ?? NSNull(),
             "pdfViewInteractionEnabled": pdfView.isUserInteractionEnabled,
+            "pdfScrollViewIdentity": scrollView.map { String(describing: ObjectIdentifier($0)) } ?? "nil",
             "pdfScrollEnabled": scrollView?.isScrollEnabled ?? false,
+            "pdfPanIdentity": String(describing: ObjectIdentifier(pan)),
             "pdfPanEnabled": pan.isEnabled,
             "pdfPanState": pan.state.rawValue,
             "numberOfTouches": pan.numberOfTouches,
@@ -197,6 +285,7 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
             "canvasScrollEnabled": activeCanvas?.isScrollEnabled ?? false,
             "canvasPanEnabled": activeCanvas?.panGestureRecognizer.isEnabled ?? false,
             "canvasPanState": activeCanvas?.panGestureRecognizer.state.rawValue ?? -1,
+            "canvasPanIdentity": activeCanvas.map { String(describing: ObjectIdentifier($0.panGestureRecognizer)) } ?? "nil",
             "canvasContentOffset": activeCanvas.map { [Double($0.contentOffset.x), Double($0.contentOffset.y)] } ?? [],
             "canvasTool": activeCanvas.map { $0.tool is PKLassoTool ? "lasso" : $0.tool is PKEraserTool ? "eraser" : "ink" } ?? "none"
         ]
@@ -228,6 +317,9 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
     }
 
     func configure(_ canvas: JotCanvasView, overlay: JotPDFPageCanvasOverlay, pageIndex: Int?) {
+#if DEBUG
+        observeCanvasPan(canvas)
+#endif
         let nextTool = overlay.toolInDrawingCoordinates(selectedTool)
         if !toolsMatch(canvas.tool, nextTool) { canvas.tool = nextTool }
 
@@ -262,29 +354,24 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
         canvas.delegate = nil
     }
 
+    /// PDFKit's public documentView is the content whose pan/zoom navigation
+    /// policy we own. Restrict routing to its nearest scroll ancestor; scanning
+    /// every PDFView descendant also changes unrelated private/internal scrolls.
     func pdfNavigationScrollViews() -> [UIScrollView] {
-        var scrollViews: [UIScrollView] = []
-        if let documentView = pdfView.documentView {
-            var ancestor = documentView.superview
-            while let view = ancestor {
-                if let scrollView = view as? UIScrollView { scrollViews.append(scrollView) }
-                ancestor = view.superview
-            }
+        guard let documentView = pdfView.documentView else { return [] }
+        var ancestor = documentView.superview
+        while let view = ancestor {
+            if let scrollView = view as? UIScrollView { return [scrollView] }
+            ancestor = view.superview
         }
-        collectPDFScrollViews(in: pdfView, into: &scrollViews)
-        var seen = Set<ObjectIdentifier>()
-        return scrollViews.filter { seen.insert(ObjectIdentifier($0)).inserted }
+        return []
     }
 
-    private func collectPDFScrollViews(in view: UIView, into result: inout [UIScrollView]) {
-        guard !(view is PKCanvasView), !(view is JotPDFPageCanvasOverlay) else { return }
-        for child in view.subviews {
-            guard !(child is PKCanvasView), !(child is JotPDFPageCanvasOverlay) else { continue }
-            if let scrollView = child as? UIScrollView, scrollView.isScrollEnabled {
-                result.append(scrollView)
-            }
-            collectPDFScrollViews(in: child, into: &result)
-        }
+    func refreshPDFScrollRoutingIfNavigationViewChanged() {
+        let current = Set(pdfNavigationScrollViews().map { ObjectIdentifier($0.panGestureRecognizer) })
+        let routed = Set(routedPDFPans.allObjects.map(ObjectIdentifier.init))
+        guard current != routed else { return }
+        applyPDFScrollRouting()
     }
 
     private func toolsMatch(_ lhs: any PKTool, _ rhs: any PKTool) -> Bool {
