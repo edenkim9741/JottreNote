@@ -77,7 +77,14 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
         view.autoScales = true
         return view
     }()
+#if DEBUG
+    private lazy var zoomCoordinator = JotCanvasZoomCoordinator(
+        refresh: { [weak self] in self?.updatePageOverlayRendererZoom() },
+        debugEventHandler: { [weak self] eventName in self?.recordPageOverlayGeometryDiagnostic(eventName) }
+    )
+#else
     private lazy var zoomCoordinator = JotCanvasZoomCoordinator { [weak self] in self?.updatePageOverlayRendererZoom() }
+#endif
     private lazy var gestureCoordinator: JotEditorGestureCoordinator = {
         let coordinator = JotEditorGestureCoordinator(pdfView: pdfView)
         return coordinator
@@ -573,6 +580,10 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
             overlaySize: overlay.drawingSize
         )
         isApplyingOverlayDrawing = false
+#if DEBUG
+        overlay.beginGeometryDiagnosticTracking()
+        overlay.recordGeometryDiagnostic("pdf.pageDisplayed.drawingLoaded", includeCoordinateProbes: true)
+#endif
         #if DEBUG
         publishInteractionFixture(canvas: canvas, pageIndex: pageIndex)
         #endif
@@ -590,6 +601,7 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
             canvas.layoutIfNeeded()
             updatePageCanvasRenderer(for: canvas)
             #if DEBUG
+            overlay.recordGeometryDiagnostic("pdf.pageDisplayed.settled", includeCoordinateProbes: true)
             publishInteractionFixture(canvas: canvas, pageIndex: pageIndex)
             #endif
 
@@ -608,6 +620,9 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
             let canvas = overlay.canvas as? JotCanvasView
         else { return }
         guard overlayStore.overlay(for: page) === overlay else { return }
+#if DEBUG
+        overlay.endGeometryDiagnosticTracking()
+#endif
         // Capture any final sample before detaching the page delegate.
         canvasViewDrawingDidChange(canvas)
         #if DEBUG
@@ -838,6 +853,14 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
 
         }
     }
+
+#if DEBUG
+    private func recordPageOverlayGeometryDiagnostic(_ eventName: String) {
+        for overlay in pageOverlays.values {
+            overlay.recordPDFGeometryDiagnostic(eventName)
+        }
+    }
+#endif
 
     private func updatePageCanvasRenderer(for canvas: PKCanvasView) {
         guard let pageIndex = pageIndexByCanvas[ObjectIdentifier(canvas)],
@@ -1657,6 +1680,17 @@ extension EditJotViewController: PKCanvasViewDelegate {
             if canvas.tool is PKLassoTool { activateLassoCanvas(canvas) }
             #if DEBUG
             if let index = pageIndexByCanvas[ObjectIdentifier(canvas)] {
+                pageOverlays[index]?.recordGeometryDiagnostic(
+                    "pencil.contact.started",
+                    includeCoordinateProbes: true,
+                    extra: [
+                        "touchType": canvas.diagnosticTouchStartType as Any? ?? NSNull(),
+                        "touchWindowPoint": canvas.diagnosticTouchStartInWindow.map {
+                            [Double($0.x), Double($0.y)]
+                        } ?? [],
+                        "strokeCountAtTouchStart": canvas.diagnosticStrokeCountAtTouchStart
+                    ]
+                )
                 EditorInteractionFixture.beginDrawingPipelineStroke()
                 publishInteractionFixture(canvas: canvas, pageIndex: index)
                 recordCanvasTouchStart(canvas, pageIndex: index)
@@ -1689,7 +1723,19 @@ extension EditJotViewController: PKCanvasViewDelegate {
         {
             let pageIndex = pageIndexByCanvas[ObjectIdentifier(canvasView)]
 #if DEBUG
-            if let pageIndex { recordCommittedCanvasStroke(canvas, pageIndex: pageIndex) }
+            if let pageIndex {
+                pageOverlays[pageIndex]?.recordGeometryDiagnostic(
+                    "pencil.contact.ended",
+                    includeCoordinateProbes: true,
+                    extra: [
+                        "touchType": canvas.diagnosticTouchEndType as Any? ?? NSNull(),
+                        "touchWindowPoint": canvas.diagnosticTouchEndInWindow.map {
+                            [Double($0.x), Double($0.y)]
+                        } ?? []
+                    ]
+                )
+                recordCommittedCanvasStroke(canvas, pageIndex: pageIndex)
+            }
 #endif
             debugScribbleUndoState(
                 "tool stroke ended",

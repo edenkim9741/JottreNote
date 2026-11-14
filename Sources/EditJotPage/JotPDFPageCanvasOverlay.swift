@@ -9,6 +9,18 @@ enum JotPDFPageRestorationPolicy {
     }
 }
 
+#if DEBUG
+@MainActor
+enum JotCanvasGeometryDiagnosticSequence {
+    private static var value: UInt64 = 0
+
+    static func next() -> UInt64 {
+        value &+= 1
+        return value
+    }
+}
+#endif
+
 /// PDFKit owns document zoom. The canvas retains the complete page drawing as
 /// scrollable content while its frame covers only the currently visible page
 /// viewport. PencilKit's native zoom keeps that viewport sharp at display scale.
@@ -29,6 +41,16 @@ final class JotPDFPageCanvasOverlay: UIView {
     private var appliedDrawingContentSize: CGSize?
     private var lastMemorySampleZoomBucket: Int?
 #if DEBUG
+    private var canvasGeometryObservations: [NSKeyValueObservation] = []
+    private var pdfGeometryObservations: [NSKeyValueObservation] = []
+    private weak var observedPDFScrollView: UIScrollView?
+    private var isPDFZoomDiagnosticActive = false
+    private var geometryObservationEventCount = 0
+    private var didLogObservationLimit = false
+    private var didLogFirstHoverGeometryChange = false
+    private var didLogUnchangedGeometryDuringHover = false
+    private var lastLoggedCoordinateError: Double?
+    private var lastHoverPoint: CGPoint?
     private var isPencilHoverActive = false
     private var hoverBaselineGeometry: [String: Any]?
     private var hoverLayoutCount = 0
@@ -114,6 +136,175 @@ final class JotPDFPageCanvasOverlay: UIView {
     func setDiagnosticsActiveCounts(canvases: Int, overlays: Int) {
         diagnosticsActiveCanvasCount = max(0, canvases)
         diagnosticsActiveOverlayCount = max(0, overlays)
+    }
+
+    func beginGeometryDiagnosticTracking() {
+        installGeometryDiagnosticObservations()
+        recordGeometryDiagnostic("pdf.pageDisplayed", includeCoordinateProbes: true)
+    }
+
+    func endGeometryDiagnosticTracking() {
+        canvasGeometryObservations.forEach { $0.invalidate() }
+        pdfGeometryObservations.forEach { $0.invalidate() }
+        canvasGeometryObservations.removeAll(keepingCapacity: false)
+        pdfGeometryObservations.removeAll(keepingCapacity: false)
+        observedPDFScrollView = nil
+        isPDFZoomDiagnosticActive = false
+    }
+
+    func recordPDFGeometryDiagnostic(_ eventName: String) {
+        if eventName == "pdf.zoom.started" {
+            isPDFZoomDiagnosticActive = true
+            geometryObservationEventCount = 0
+            didLogObservationLimit = false
+        }
+        recordGeometryDiagnostic(
+            eventName,
+            includeCoordinateProbes: eventName == "pdf.zoom.completed" || eventName == "pdf.geometry.stable"
+        )
+        if eventName == "pdf.geometry.stable" { isPDFZoomDiagnosticActive = false }
+    }
+
+    func recordGeometryDiagnostic(
+        _ eventName: String,
+        includeCoordinateProbes: Bool = false,
+        extra: [String: Any] = [:]
+    ) {
+        var details = geometryDiagnosticSnapshot(includeCoordinateProbes: includeCoordinateProbes)
+        details.merge(extra) { _, new in new }
+        details["eventName"] = eventName
+        details["timestamp"] = Date().timeIntervalSince1970
+        details["sequence"] = JotCanvasGeometryDiagnosticSequence.next()
+        JottreDiagnostics.shared.record(eventName, details: details)
+        guard includeCoordinateProbes,
+              let probes = details["coordinateProbes"] as? [[String: Any]] else { return }
+        let maximumError = probes.compactMap { $0["errorDistance"] as? Double }
+            .filter(\.isFinite).max() ?? 0
+        if maximumError > 0.5,
+           lastLoggedCoordinateError.map({ abs($0 - maximumError) > 0.1 }) ?? true
+        {
+            lastLoggedCoordinateError = maximumError
+            recordGeometryDiagnostic("inkAlignmentErrorDetected", extra: [
+                "maximumCoordinateModelError": maximumError,
+                "errorThresholdPDFViewPoints": 0.5,
+                "comparedEvent": eventName
+            ])
+        }
+    }
+
+    private func installGeometryDiagnosticObservations() {
+        guard canvasGeometryObservations.isEmpty else { return }
+        observeGeometry(on: canvas, prefix: "canvas", into: &canvasGeometryObservations)
+        observeGeometry(on: viewportHost, prefix: "viewportHost", into: &canvasGeometryObservations)
+        observeGeometry(on: self, prefix: "overlay", into: &canvasGeometryObservations)
+        installPDFScrollViewObservationsIfNeeded()
+    }
+
+    private func installPDFScrollViewObservationsIfNeeded() {
+        guard let pdfView = scaleReferenceView as? PDFView,
+              let documentView = pdfView.documentView else { return }
+        var ancestor = documentView.superview
+        var scrollView: UIScrollView?
+        while let view = ancestor {
+            if let candidate = view as? UIScrollView {
+                scrollView = candidate
+                break
+            }
+            ancestor = view.superview
+        }
+        guard let scrollView, observedPDFScrollView !== scrollView else { return }
+        pdfGeometryObservations.forEach { $0.invalidate() }
+        pdfGeometryObservations.removeAll(keepingCapacity: true)
+        observedPDFScrollView = scrollView
+        observeGeometry(on: scrollView, prefix: "pdfScroll", into: &pdfGeometryObservations)
+    }
+
+    private func observeGeometry(
+        on view: UIView,
+        prefix: String,
+        into observations: inout [NSKeyValueObservation]
+    ) {
+        if let scrollView = view as? UIScrollView {
+            observations.append(scrollView.observe(\.contentOffset, options: [.old, .new]) { [weak self] _, change in
+                guard let old = change.oldValue, let new = change.newValue, old != new else { return }
+                MainActor.assumeIsolated {
+                    self?.recordObservedGeometryChange("\(prefix).offsetChanged", property: "contentOffset",
+                        old: [Double(old.x), Double(old.y)], new: [Double(new.x), Double(new.y)])
+                }
+            })
+            observations.append(scrollView.observe(\.contentSize, options: [.old, .new]) { [weak self] _, change in
+                guard let old = change.oldValue, let new = change.newValue, old != new else { return }
+                MainActor.assumeIsolated {
+                    self?.recordObservedGeometryChange("\(prefix).contentSizeChanged", property: "contentSize",
+                        old: [Double(old.width), Double(old.height)], new: [Double(new.width), Double(new.height)])
+                }
+            })
+            observations.append(scrollView.observe(\.zoomScale, options: [.old, .new]) { [weak self] _, change in
+                guard let old = change.oldValue, let new = change.newValue, old != new else { return }
+                MainActor.assumeIsolated {
+                    self?.recordObservedGeometryChange("\(prefix).zoomChanged", property: "zoomScale",
+                        old: [Double(old)], new: [Double(new)])
+                }
+            })
+        }
+        observations.append(view.observe(\.bounds, options: [.old, .new]) { [weak self] _, change in
+            guard let old = change.oldValue, let new = change.newValue, old != new else { return }
+            MainActor.assumeIsolated {
+                self?.recordObservedGeometryChange("\(prefix).boundsChanged", property: "bounds",
+                    old: Self.rectComponents(old), new: Self.rectComponents(new))
+            }
+        })
+        observations.append(view.observe(\.frame, options: [.old, .new]) { [weak self] _, change in
+            guard let old = change.oldValue, let new = change.newValue, old != new else { return }
+            MainActor.assumeIsolated {
+                self?.recordObservedGeometryChange("\(prefix).frameChanged", property: "frame",
+                    old: Self.rectComponents(old), new: Self.rectComponents(new))
+            }
+        })
+        observations.append(view.observe(\.transform, options: [.old, .new]) { [weak self] _, change in
+            guard let old = change.oldValue, let new = change.newValue, old != new else { return }
+            MainActor.assumeIsolated {
+                self?.recordObservedGeometryChange("\(prefix).transformChanged", property: "transform",
+                    old: Self.transformComponents(old), new: Self.transformComponents(new))
+            }
+        })
+    }
+
+    private func recordObservedGeometryChange(
+        _ eventName: String,
+        property: String,
+        old: [Double],
+        new: [Double]
+    ) {
+        guard isPencilHoverActive || isPDFZoomDiagnosticActive else { return }
+        guard geometryObservationEventCount < 128 else {
+            if !didLogObservationLimit {
+                didLogObservationLimit = true
+                recordGeometryDiagnostic("geometry.observationLimitReached", extra: ["limit": 128])
+            }
+            return
+        }
+        geometryObservationEventCount += 1
+        recordGeometryDiagnostic(eventName, extra: ["property": property, "oldValue": old, "newValue": new])
+        guard isPencilHoverActive else { return }
+        if !didLogFirstHoverGeometryChange {
+            didLogFirstHoverGeometryChange = true
+            recordGeometryDiagnostic("hover.geometryChanged.first", includeCoordinateProbes: true, extra: [
+                "sourceEvent": eventName, "property": property, "oldValue": old, "newValue": new
+            ])
+        }
+        recordGeometryDiagnostic("hover.geometryChanged", extra: [
+            "sourceEvent": eventName, "property": property, "oldValue": old, "newValue": new
+        ])
+    }
+
+    private static func rectComponents(_ rect: CGRect) -> [Double] {
+        [Double(rect.minX), Double(rect.minY), Double(rect.width), Double(rect.height)]
+    }
+
+    private static func transformComponents(_ transform: CGAffineTransform) -> [Double] {
+        [Double(transform.a), Double(transform.b), Double(transform.c), Double(transform.d),
+         Double(transform.tx), Double(transform.ty)]
     }
 #endif
 
@@ -224,33 +415,80 @@ final class JotPDFPageCanvasOverlay: UIView {
             && viewportHost.bounds.size == viewportSize
             && viewportHost.center == hostCenter
             && viewportHost.transform == pageToViewport
-        guard !geometryAlreadyApplied else { return }
+        if geometryAlreadyApplied {
+#if DEBUG
+            if isPencilHoverActive, !didLogUnchangedGeometryDuringHover {
+                didLogUnchangedGeometryDuringHover = true
+                recordGeometryDiagnostic("geometry.skippedUnchanged")
+            }
+#endif
+            return
+        }
 #if DEBUG
         if isPencilHoverActive { hoverGeometryReapplyCount += 1 }
+        recordGeometryDiagnostic("geometry.beforeApply")
 #endif
         appliedGeometry = geometry
         if appliedDrawingContentSize != drawingSize {
+#if DEBUG
+            let oldContentSize = canvas.contentSize
+#endif
             canvas.contentSize = drawingSize
             appliedDrawingContentSize = drawingSize
+#if DEBUG
+            recordGeometryDiagnostic("canvas.contentSizeChanged", extra: [
+                "source": "updateCanvasGeometry",
+                "oldValue": [Double(oldContentSize.width), Double(oldContentSize.height)],
+                "newValue": [Double(canvas.contentSize.width), Double(canvas.contentSize.height)]
+            ])
+#endif
         }
         let nextBounds = CGRect(origin: .zero, size: viewportSize)
         if viewportHost.bounds != nextBounds { viewportHost.bounds = nextBounds }
         if viewportHost.center != hostCenter { viewportHost.center = hostCenter }
-        if viewportHost.transform != pageToViewport { viewportHost.transform = pageToViewport }
+        if viewportHost.transform != pageToViewport {
+#if DEBUG
+            let oldTransform = viewportHost.transform
+#endif
+            viewportHost.transform = pageToViewport
+#if DEBUG
+            recordGeometryDiagnostic("viewport.transformChanged", extra: [
+                "source": "updateCanvasGeometry",
+                "oldValue": Self.transformComponents(oldTransform),
+                "newValue": Self.transformComponents(viewportHost.transform)
+            ])
+#endif
+        }
         if canvas.frame != nextBounds { canvas.frame = nextBounds }
         let minimumZoom = min(0.01, nativeZoom)
         if canvas.minimumZoomScale != minimumZoom { canvas.minimumZoomScale = minimumZoom }
         if nativeZoom > canvas.maximumZoomScale { canvas.maximumZoomScale = nativeZoom }
         if abs(canvas.zoomScale - nativeZoom) > 0.0001 {
 #if DEBUG
+            let oldZoom = canvas.zoomScale
             if isPencilHoverActive { hoverZoomSetCount += 1 }
 #endif
             canvas.setZoomScale(nativeZoom, animated: false)
+#if DEBUG
+            recordGeometryDiagnostic("canvas.zoomChanged", extra: [
+                "source": "updateCanvasGeometry", "oldValue": oldZoom, "newValue": canvas.zoomScale
+            ])
+#endif
         }
         if abs(canvas.contentOffset.x - contentOffset.x) > 0.05
             || abs(canvas.contentOffset.y - contentOffset.y) > 0.05
         {
+#if DEBUG
+            let oldOffset = canvas.contentOffset
+#endif
             canvas.setContentOffset(contentOffset, animated: false)
+#if DEBUG
+            recordGeometryDiagnostic("canvas.offsetChanged", extra: [
+                "source": "updateCanvasGeometry",
+                "oldValue": [Double(oldOffset.x), Double(oldOffset.y)],
+                "newValue": [Double(canvas.contentOffset.x), Double(canvas.contentOffset.y)]
+            ])
+#endif
         }
         recordGeometryMilestoneIfNeeded(
             requestedZoom: geometry.canvasZoom,
@@ -274,6 +512,7 @@ final class JotPDFPageCanvasOverlay: UIView {
             ]
             JottreDiagnostics.shared.record("zoom.geometryUpdated", details: details)
         }
+        recordGeometryDiagnostic("geometry.afterApply", includeCoordinateProbes: true)
         #endif
         // PDFView remains the only owner of the user's document pinch gesture.
         disableCanvasPinchGestures(in: canvas)
@@ -293,6 +532,12 @@ final class JotPDFPageCanvasOverlay: UIView {
         switch recognizer.state {
         case .began:
             isPencilHoverActive = true
+            lastHoverPoint = recognizer.location(in: self)
+            didLogFirstHoverGeometryChange = false
+            didLogUnchangedGeometryDuringHover = false
+            lastLoggedCoordinateError = nil
+            geometryObservationEventCount = 0
+            didLogObservationLimit = false
             hoverSessionID = UUID()
             hoverLayoutCount = 0
             hoverGeometryUpdateCount = 0
@@ -302,22 +547,36 @@ final class JotPDFPageCanvasOverlay: UIView {
             hoverContentOffsetSetCount = 0
             hoverContentScaleSetCount = 0
             hoverMoveCount = 0
-            hoverBaselineGeometry = hoverGeometrySnapshot()
+            var baseline = hoverGeometrySnapshot()
+            baseline["coordinateProbes"] = coordinateAlignmentProbes()
+            baseline["coordinateProbeRenderingNote"] = "coordinate model only; does not measure PencilKit rendered pixels"
+            hoverBaselineGeometry = baseline
             var details = hoverBaselineGeometry ?? [:]
             details["hoverSessionID"] = hoverSessionID.uuidString
             details["recognizer"] = String(describing: type(of: recognizer))
             details["observationPhase"] = "UIHoverGestureRecognizer.began"
             details["preEventGuarantee"] = false
+            details["eventName"] = "hover.entered"
+            details["timestamp"] = Date().timeIntervalSince1970
+            details["sequence"] = JotCanvasGeometryDiagnosticSequence.next()
+            details["coordinateProbes"] = coordinateAlignmentProbes()
             JottreDiagnostics.shared.record("pencil.hover.entered", details: details)
             JottreDiagnostics.shared.record("canvas.geometry.atHoverBegin", details: details)
             JottreDiagnostics.shared.sampleMemoryNow(for: "canvas.memorySample", details: details)
         case .changed:
+            lastHoverPoint = recognizer.location(in: self)
             hoverMoveCount += 1
             if hoverMoveCount == 1 {
-                JottreDiagnostics.shared.record("pencil.hover.moved", details: [
+                var details = geometryDiagnosticSnapshot(includeCoordinateProbes: false)
+                details["sequence"] = JotCanvasGeometryDiagnosticSequence.next()
+                details["timestamp"] = Date().timeIntervalSince1970
+                details["eventName"] = "hover.moved.first"
+                details["hoverSessionID"] = hoverSessionID.uuidString
+                details["pageIndex"] = diagnosticsPageIndex as Any? ?? NSNull()
+                JottreDiagnostics.shared.record("pencil.hover.moved", details: details.merging([
                     "hoverSessionID": hoverSessionID.uuidString,
                     "pageIndex": diagnosticsPageIndex as Any? ?? NSNull()
-                ])
+                ]) { _, new in new })
             }
         case .ended, .cancelled, .failed:
             let session = hoverSessionID
@@ -338,6 +597,14 @@ final class JotPDFPageCanvasOverlay: UIView {
         after["hoverSessionID"] = sessionID.uuidString
         after["recognizerState"] = recognizerState
         after["observationPhase"] = "after UIHoverGestureRecognizer terminal state and next main-actor yield"
+        after["eventName"] = "hover.exited"
+        after["timestamp"] = Date().timeIntervalSince1970
+        after["sequence"] = JotCanvasGeometryDiagnosticSequence.next()
+        after["coordinateProbes"] = coordinateAlignmentProbes()
+        let beforeCoordinateError = maximumCoordinateError(before["coordinateProbes"])
+        let afterCoordinateError = maximumCoordinateError(after["coordinateProbes"])
+        after["maximumCoordinateErrorBeforeHover"] = beforeCoordinateError as Any? ?? NSNull()
+        after["maximumCoordinateErrorAfterHover"] = afterCoordinateError as Any? ?? NSNull()
         after["hoverMoveCount"] = hoverMoveCount
         after["layoutTriggeredCount"] = hoverLayoutCount
         after["geometryUpdateCount"] = hoverGeometryUpdateCount
@@ -348,15 +615,19 @@ final class JotPDFPageCanvasOverlay: UIView {
         after["contentScaleSetCount"] = hoverContentScaleSetCount
 
         let geometryKeys = [
+            "pageRotation", "cropBox",
             "pdfScaleFactor", "measuredDisplayScale", "requestedCanvasZoom", "canvasZoomScale",
             "canvasMinimumZoom", "canvasMaximumZoom", "canvasBounds", "canvasFrame", "canvasTransform",
             "canvasContentSize", "canvasContentOffset", "canvasContentInset", "canvasAdjustedContentInset",
-            "canvasContentScaleFactor", "canvasLayerContentsScale", "overlayBounds", "overlayFrame",
-            "overlayTransform", "viewportHostBounds", "viewportHostFrame", "viewportHostTransform"
+            "canvasContentScaleFactor", "canvasLayerContentsScale", "canvasLayerAffineTransform",
+            "overlayBounds", "overlayFrame", "overlayTransform", "pdfViewBounds", "pdfScrollViewIdentity",
+            "pdfScrollViewContentOffset", "pdfScrollViewContentSize", "pdfScrollViewBounds",
+            "viewportHostBounds", "viewportHostFrame", "viewportHostTransform", "overlayIdentity",
+            "canvasIdentity", "viewportHostIdentity", "pageIdentity"
         ]
         let inkKeys = [
             "strokeCount", "pointCount", "drawingBounds", "firstStrokeSeed", "lastStrokeSeed",
-            "strokeStructureFingerprint"
+            "strokeStructureFingerprint", "drawingContentIdentity"
         ]
         let undoKeys = ["undoManagerIdentity", "canUndo", "canRedo"]
         let changedGeometryKeys = changedKeys(geometryKeys, before: before, after: after)
@@ -373,6 +644,10 @@ final class JotPDFPageCanvasOverlay: UIView {
         after["changedGeometryKeys"] = changedGeometryKeys
         after["changedInkKeys"] = changedInkKeys
         after["changedUndoKeys"] = changedUndoKeys
+        after["candidateFailureClass"] = candidateFailureClass(
+            geometryKeys: changedGeometryKeys,
+            inkKeys: changedInkKeys
+        )
         JottreDiagnostics.shared.record("pencil.hover.exited", details: after)
         JottreDiagnostics.shared.record("canvas.geometry.afterHover", details: after)
         if !changedGeometryKeys.isEmpty {
@@ -534,6 +809,7 @@ final class JotPDFPageCanvasOverlay: UIView {
                                            canvas.adjustedContentInset.bottom, canvas.adjustedContentInset.right],
             "canvasContentScaleFactor": canvas.contentScaleFactor,
             "canvasLayerContentsScale": canvas.layer.contentsScale,
+            "canvasLayerAffineTransform": Self.transformComponents(canvas.layer.affineTransform()),
             "overlayBounds": [bounds.width, bounds.height],
             "overlayFrame": [frame.minX, frame.minY, frame.width, frame.height],
             "overlayTransform": [overlayTransform.a, overlayTransform.b, overlayTransform.c,
@@ -547,11 +823,26 @@ final class JotPDFPageCanvasOverlay: UIView {
                                   visibleCanvasRect.width, visibleCanvasRect.height],
             "visibleCanvasAreaRatio": visibleCanvasAreaRatio,
             "pdfPageCornerPoints": pdfPageCornerPoints,
+            "overlayIdentity": String(describing: ObjectIdentifier(self)),
+            "canvasIdentity": String(describing: ObjectIdentifier(canvas)),
+            "viewportHostIdentity": String(describing: ObjectIdentifier(viewportHost)),
+            "pageIdentity": pageIdentity,
+            "pdfViewBounds": (scaleReferenceView.map { Self.rectComponents($0.bounds) } ?? []),
+            "pdfScrollViewIdentity": pdfDocumentScrollView().map { String(describing: ObjectIdentifier($0)) } ?? "nil",
+            "pdfScrollViewContentOffset": pdfDocumentScrollView().map { [Double($0.contentOffset.x), Double($0.contentOffset.y)] } ?? [],
+            "pdfScrollViewContentSize": pdfDocumentScrollView().map { [Double($0.contentSize.width), Double($0.contentSize.height)] } ?? [],
+            "pdfScrollViewBounds": pdfDocumentScrollView().map { Self.rectComponents($0.bounds) } ?? [],
+            "pdfScrollViewAdjustedContentInset": pdfDocumentScrollView().map {
+                let inset = $0.adjustedContentInset
+                return [Double(inset.top), Double(inset.left), Double(inset.bottom), Double(inset.right)]
+            } ?? [],
             "strokeCount": drawing.strokes.count,
             "pointCount": pointCount,
             "drawingBounds": [drawing.bounds.minX, drawing.bounds.minY,
                               drawing.bounds.width, drawing.bounds.height],
             "strokeStructureFingerprint": strokeStructureFingerprint,
+            "drawingContentIdentity": strokeStructureFingerprint,
+            "drawingContentIdentityCoverage": "stroke seeds, path counts, transforms, render bounds, first and last path points; not a full byte-for-byte drawing hash",
             "firstStrokeSeed": drawing.strokes.first?.randomSeed as Any? ?? NSNull(),
             "lastStrokeSeed": drawing.strokes.last?.randomSeed as Any? ?? NSNull(),
             "undoManagerIdentity": canvas.undoManager.map { String(describing: ObjectIdentifier($0)) } ?? "nil",
@@ -567,6 +858,211 @@ final class JotPDFPageCanvasOverlay: UIView {
         keys.filter { key in
             String(reflecting: before[key]) != String(reflecting: after[key])
         }
+    }
+
+    private func geometryDiagnosticSnapshot(includeCoordinateProbes: Bool) -> [String: Any] {
+        let drawing = canvas.drawing
+        let pdfScrollView = pdfDocumentScrollView()
+        let canvasLayerTransform = canvas.layer.affineTransform()
+        var details: [String: Any] = [
+            "pageIndex": diagnosticsPageIndex as Any? ?? NSNull(),
+            "pageRotation": diagnosticsPageRotation,
+            "pdfCropBox": Self.rectComponents(diagnosticsCropBox),
+            "pdfViewScaleFactor": pdfViewScaleFactor,
+            "pdfScaleFactor": (scaleReferenceView as? PDFView)?.scaleFactor ?? pdfViewScaleFactor,
+            "fitScaleFactor": fitScaleFactor,
+            "pdfViewBounds": scaleReferenceView.map { Self.rectComponents($0.bounds) } ?? [],
+            "pdfScrollViewIdentity": pdfScrollView.map { String(describing: ObjectIdentifier($0)) } ?? "nil",
+            "pdfScrollViewContentOffset": pdfScrollView.map { [Double($0.contentOffset.x), Double($0.contentOffset.y)] } ?? [],
+            "pdfScrollViewContentSize": pdfScrollView.map { [Double($0.contentSize.width), Double($0.contentSize.height)] } ?? [],
+            "pdfScrollViewBounds": pdfScrollView.map { Self.rectComponents($0.bounds) } ?? [],
+            "pdfScrollViewAdjustedContentInset": pdfScrollView.map {
+                let inset = $0.adjustedContentInset
+                return [Double(inset.top), Double(inset.left), Double(inset.bottom), Double(inset.right)]
+            } ?? [],
+            "canvasFrame": Self.rectComponents(canvas.frame),
+            "canvasBounds": Self.rectComponents(canvas.bounds),
+            "canvasViewTransform": Self.transformComponents(canvas.transform),
+            "canvasZoomScale": canvas.zoomScale,
+            "canvasMinimumZoomScale": canvas.minimumZoomScale,
+            "canvasMaximumZoomScale": canvas.maximumZoomScale,
+            "canvasContentOffset": [Double(canvas.contentOffset.x), Double(canvas.contentOffset.y)],
+            "canvasContentSize": [Double(canvas.contentSize.width), Double(canvas.contentSize.height)],
+            "canvasAdjustedContentInset": {
+                let inset = canvas.adjustedContentInset
+                return [Double(inset.top), Double(inset.left), Double(inset.bottom), Double(inset.right)]
+            }(),
+            "canvasContentInset": {
+                let inset = canvas.contentInset
+                return [Double(inset.top), Double(inset.left), Double(inset.bottom), Double(inset.right)]
+            }(),
+            "canvasContentScaleFactor": canvas.contentScaleFactor,
+            "canvasLayerContentsScale": canvas.layer.contentsScale,
+            "canvasLayerAffineTransform": Self.transformComponents(canvasLayerTransform),
+            "viewportHostFrame": Self.rectComponents(viewportHost.frame),
+            "viewportHostBounds": Self.rectComponents(viewportHost.bounds),
+            "viewportHostTransform": Self.transformComponents(viewportHost.transform),
+            "overlayFrame": Self.rectComponents(frame),
+            "overlayBounds": Self.rectComponents(bounds),
+            "overlayTransform": Self.transformComponents(transform),
+            "canvasDrawingBounds": Self.rectComponents(drawing.bounds),
+            "drawingStrokeCount": drawing.strokes.count,
+            "overlayIdentity": String(describing: ObjectIdentifier(self)),
+            "canvasIdentity": String(describing: ObjectIdentifier(canvas)),
+            "viewportHostIdentity": String(describing: ObjectIdentifier(viewportHost)),
+            "pageIdentity": pageIdentity
+        ]
+        if isPencilHoverActive, let lastHoverPoint {
+            details["hoverPointOverlay"] = [Double(lastHoverPoint.x), Double(lastHoverPoint.y)]
+            if let pdfView = scaleReferenceView {
+                let pdfPoint = convert(lastHoverPoint, to: pdfView)
+                details["hoverPointPDFView"] = [Double(pdfPoint.x), Double(pdfPoint.y)]
+            }
+        }
+        if includeCoordinateProbes {
+            details["coordinateProbes"] = coordinateAlignmentProbes()
+            details["coordinateProbeRenderingNote"] = "coordinate model only; does not measure PencilKit rendered pixels"
+        }
+        return details
+    }
+
+    private var pageIdentity: String {
+        guard let pdfView = scaleReferenceView as? PDFView,
+              let pageIndex = diagnosticsPageIndex,
+              let page = pdfView.document?.page(at: pageIndex) else { return "nil" }
+        return String(describing: ObjectIdentifier(page))
+    }
+
+    private func pdfDocumentScrollView() -> UIScrollView? {
+        guard let pdfView = scaleReferenceView as? PDFView,
+              let documentView = pdfView.documentView else { return nil }
+        var ancestor = documentView.superview
+        while let view = ancestor {
+            if let scrollView = view as? UIScrollView { return scrollView }
+            ancestor = view.superview
+        }
+        return nil
+    }
+
+    private func coordinateAlignmentProbes() -> [[String: Any]] {
+        guard let pdfView = scaleReferenceView as? PDFView,
+              let pageIndex = diagnosticsPageIndex,
+              let page = pdfView.document?.page(at: pageIndex),
+              bounds.width.isFinite, bounds.height.isFinite,
+              bounds.width > 0, bounds.height > 0,
+              drawingSize.width.isFinite, drawingSize.height.isFinite,
+              drawingSize.width > 0, drawingSize.height > 0,
+              canvas.zoomScale.isFinite, canvas.zoomScale > 0 else { return [] }
+        let visible = visibleOverlayRect()
+        guard !visible.isNull, !visible.isEmpty else { return [] }
+        let points: [(String, CGPoint, CGPoint?)] = [
+            ("visibleCenter", CGPoint(x: visible.midX, y: visible.midY), nil),
+            ("visibleTopLeft", CGPoint(x: visible.minX, y: visible.minY), nil),
+            ("visibleTopRight", CGPoint(x: visible.maxX, y: visible.minY), nil),
+            ("visibleBottomLeft", CGPoint(x: visible.minX, y: visible.maxY), nil),
+            ("visibleBottomRight", CGPoint(x: visible.maxX, y: visible.maxY), nil)
+        ]
+        var probes = points.compactMap { name, point, drawingPoint in
+            coordinateAlignmentProbe(name: name, overlayPoint: point, drawingPoint: drawingPoint, page: page, pdfView: pdfView)
+        }
+        let drawingVisibleRect = CGRect(
+            x: visible.minX * drawingSize.width / bounds.width,
+            y: visible.minY * drawingSize.height / bounds.height,
+            width: visible.width * drawingSize.width / bounds.width,
+            height: visible.height * drawingSize.height / bounds.height
+        )
+        if let strokePoint = firstVisibleStrokePoint(in: canvas.drawing, visibleDrawingRect: drawingVisibleRect) {
+            let overlayPoint = CGPoint(
+                x: strokePoint.x * bounds.width / drawingSize.width,
+                y: strokePoint.y * bounds.height / drawingSize.height
+            )
+            if let probe = coordinateAlignmentProbe(
+                name: "existingStrokePoint",
+                overlayPoint: overlayPoint,
+                drawingPoint: strokePoint,
+                page: page,
+                pdfView: pdfView
+            ) {
+                probes.append(probe)
+            }
+        }
+        return probes
+    }
+
+    private func coordinateAlignmentProbe(
+        name: String,
+        overlayPoint: CGPoint,
+        drawingPoint suppliedDrawingPoint: CGPoint?,
+        page: PDFPage,
+        pdfView: PDFView
+    ) -> [String: Any]? {
+        let drawingPoint = suppliedDrawingPoint ?? CGPoint(
+            x: overlayPoint.x * drawingSize.width / bounds.width,
+            y: overlayPoint.y * drawingSize.height / bounds.height
+        )
+        guard [overlayPoint.x, overlayPoint.y, drawingPoint.x, drawingPoint.y].allSatisfy(\.isFinite) else { return nil }
+        let expectedPDFViewPoint = convert(overlayPoint, to: pdfView)
+        let pdfPagePoint = pdfView.convert(expectedPDFViewPoint, to: page)
+        let roundTrippedExpectedPoint = pdfView.convert(pdfPagePoint, from: page)
+        let canvasViewportPoint = CGPoint(
+            x: drawingPoint.x * canvas.zoomScale - canvas.contentOffset.x,
+            y: drawingPoint.y * canvas.zoomScale - canvas.contentOffset.y
+        )
+        let canvasMappedPDFViewPoint = canvas.convert(canvasViewportPoint, to: pdfView)
+        let dx = canvasMappedPDFViewPoint.x - roundTrippedExpectedPoint.x
+        let dy = canvasMappedPDFViewPoint.y - roundTrippedExpectedPoint.y
+        return [
+            "name": name,
+            "pdfPagePoint": [pdfPagePoint.x, pdfPagePoint.y],
+            "pdfViewExpectedPoint": [roundTrippedExpectedPoint.x, roundTrippedExpectedPoint.y],
+            "drawingPoint": [drawingPoint.x, drawingPoint.y],
+            "canvasViewportPoint": [canvasViewportPoint.x, canvasViewportPoint.y],
+            "canvasPointConvertedToPDFView": [canvasMappedPDFViewPoint.x, canvasMappedPDFViewPoint.y],
+            "deltaX": dx,
+            "deltaY": dy,
+            "errorDistance": hypot(dx, dy)
+        ]
+    }
+
+    private func firstVisibleStrokePoint(in drawing: PKDrawing, visibleDrawingRect: CGRect) -> CGPoint? {
+        for stroke in drawing.strokes {
+            for point in [stroke.path.first, stroke.path.last].compactMap({ $0 }) {
+                let location = point.location.applying(stroke.transform)
+                if visibleDrawingRect.contains(location) { return location }
+            }
+        }
+        return nil
+    }
+
+    private func maximumCoordinateError(_ value: Any?) -> Double? {
+        guard let probes = value as? [[String: Any]] else { return nil }
+        return probes.compactMap { $0["errorDistance"] as? Double }
+            .filter(\.isFinite).max()
+    }
+
+    private func candidateFailureClass(geometryKeys: [String], inkKeys: [String]) -> String {
+        if geometryKeys.contains(where: { ["overlayIdentity", "canvasIdentity", "viewportHostIdentity", "pageIdentity"].contains($0) }) {
+            return "C_candidate_page_or_render_view_replaced"
+        }
+        if geometryKeys.contains(where: { $0 == "canvasContentOffset" || $0 == "canvasContentSize" }) {
+            return "A_candidate_canvas_scroll_state_changed"
+        }
+        if geometryKeys.contains("canvasZoomScale") {
+            return "B_candidate_native_zoom_changed"
+        }
+        if geometryKeys.contains(where: {
+            $0.hasPrefix("viewportHost") || $0 == "overlayFrame" || $0 == "pdfScaleFactor"
+                || $0.hasPrefix("pdfScrollView")
+        }) {
+            return "C_candidate_pdf_or_parent_geometry_changed"
+        }
+        if geometryKeys.isEmpty && inkKeys.isEmpty {
+            return "D_candidate_geometry_and_sampled_drawing_unchanged_rendered_pixels_not_measured"
+        }
+        if geometryKeys.isEmpty && !inkKeys.isEmpty {
+            return "E_candidate_drawing_state_changed"
+        }
+        return "unclassified_geometry_change"
     }
 #endif
 

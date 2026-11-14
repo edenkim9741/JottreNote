@@ -17,6 +17,9 @@ final class JotCanvasZoomCoordinator: NSObject, UIGestureRecognizerDelegate {
     }
 
     private let refresh: @MainActor () -> Void
+#if DEBUG
+    private let debugEventHandler: @MainActor (String) -> Void
+#endif
     private var settleTask: Task<Void, Never>?
     private let pinches = NSHashTable<UIPinchGestureRecognizer>.weakObjects()
     private let pans = NSHashTable<UIPanGestureRecognizer>.weakObjects()
@@ -31,7 +34,17 @@ final class JotCanvasZoomCoordinator: NSObject, UIGestureRecognizerDelegate {
     private static let preferredPinchMaximumScale: CGFloat = 64
     private static let fitScaleTolerance: CGFloat = 0.005
 
+#if DEBUG
+    init(
+        refresh: @escaping @MainActor () -> Void,
+        debugEventHandler: @escaping @MainActor (String) -> Void = { _ in }
+    ) {
+        self.refresh = refresh
+        self.debugEventHandler = debugEventHandler
+    }
+#else
     init(refresh: @escaping @MainActor () -> Void) { self.refresh = refresh }
+#endif
     deinit {
         settleTask?.cancel()
     }
@@ -213,6 +226,9 @@ final class JotCanvasZoomCoordinator: NSObject, UIGestureRecognizerDelegate {
                     fitScaleFactor: pdfView.scaleFactorForSizeToFit
                 )
                 recordZoom("started", in: pdfView)
+#if DEBUG
+                debugEventHandler("pdf.zoom.started")
+#endif
             } else {
                 recordZoomChangeIfNeeded(in: pdfView)
             }
@@ -279,6 +295,9 @@ final class JotCanvasZoomCoordinator: NSObject, UIGestureRecognizerDelegate {
             fitScaleFactor: pdfView.scaleFactorForSizeToFit
         )
         recordZoom("started", in: pdfView)
+#if DEBUG
+        debugEventHandler("pdf.zoom.started")
+#endif
         UIView.animate(withDuration: 0.25, delay: 0, options: [.beginFromCurrentState, .curveEaseInOut]) {
             pdfView.autoScales = false
             pdfView.scaleFactor = target
@@ -303,6 +322,9 @@ final class JotCanvasZoomCoordinator: NSObject, UIGestureRecognizerDelegate {
                 )
             }
             self?.recordZoom("completed", in: pdfView, sampleMemory: true)
+#if DEBUG
+            self?.debugEventHandler("pdf.zoom.completed")
+#endif
             self?.lastZoomScaleBucket = nil
             self?.schedule(delay: .milliseconds(40))
         }
@@ -316,11 +338,17 @@ final class JotCanvasZoomCoordinator: NSObject, UIGestureRecognizerDelegate {
         guard bucket != lastZoomScaleBucket else { return }
         lastZoomScaleBucket = bucket
         recordZoom("changed", in: pdfView, sampleMemory: true)
+#if DEBUG
+        debugEventHandler("pdf.zoom.changed")
+#endif
     }
 
     private func finishPinchZoom(in pdfView: PDFView) {
         guard isPinchZoomInProgress else { return }
         recordZoom("completed", in: pdfView, sampleMemory: true)
+#if DEBUG
+        debugEventHandler("pdf.zoom.completed")
+#endif
         isPinchZoomInProgress = false
         lastZoomScaleBucket = nil
     }
@@ -430,6 +458,9 @@ final class JotCanvasZoomCoordinator: NSObject, UIGestureRecognizerDelegate {
             await Task.yield()
             guard !Task.isCancelled, let self else { return }
             refresh()
+#if DEBUG
+            debugEventHandler("pdf.geometry.stable")
+#endif
             settleTask = nil
         }
     }

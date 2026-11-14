@@ -284,17 +284,23 @@ final class JotCanvasView: PKCanvasView {
 #if DEBUG
     private(set) var diagnosticTouchStartInWindow: CGPoint?
     private(set) var diagnosticTouchEndInWindow: CGPoint?
+    private(set) var diagnosticTouchStartType: String?
+    private(set) var diagnosticTouchEndType: String?
     private(set) var diagnosticStrokeCountAtTouchStart = 0
 
     func resetDiagnosticTouches() {
         diagnosticTouchStartInWindow = nil
         diagnosticTouchEndInWindow = nil
+        diagnosticTouchStartType = nil
+        diagnosticTouchEndType = nil
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         if let touch = touches.first, let window {
             diagnosticTouchStartInWindow = touch.location(in: window)
             diagnosticTouchEndInWindow = diagnosticTouchStartInWindow
+            diagnosticTouchStartType = String(describing: touch.type)
+            diagnosticTouchEndType = diagnosticTouchStartType
             diagnosticStrokeCountAtTouchStart = drawing.strokes.count
         }
         super.touchesBegan(touches, with: event)
@@ -303,6 +309,7 @@ final class JotCanvasView: PKCanvasView {
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         if let touch = touches.first, let window {
             diagnosticTouchEndInWindow = touch.location(in: window)
+            diagnosticTouchEndType = String(describing: touch.type)
         }
         super.touchesMoved(touches, with: event)
     }
@@ -310,6 +317,7 @@ final class JotCanvasView: PKCanvasView {
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         if let touch = touches.first, let window {
             diagnosticTouchEndInWindow = touch.location(in: window)
+            diagnosticTouchEndType = String(describing: touch.type)
         }
         super.touchesEnded(touches, with: event)
     }
