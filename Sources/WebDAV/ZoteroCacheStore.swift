@@ -277,6 +277,7 @@ struct ZoteroCacheSnapshot: Codable, Sendable {
     var lastSyncedAt: Date?
     var keyAliases: [String: String]
     var pendingRemoteDownloads: [String]
+    var pendingItemActions: [String: ZoteroPendingItemAction]
 
     static func empty(userID: String) -> ZoteroCacheSnapshot {
         ZoteroCacheSnapshot(
@@ -287,19 +288,21 @@ struct ZoteroCacheSnapshot: Codable, Sendable {
             attachments: [:],
             lastSyncedAt: nil,
             keyAliases: [:],
-            pendingRemoteDownloads: []
+            pendingRemoteDownloads: [],
+            pendingItemActions: [:]
         )
     }
 
     private enum CodingKeys: String, CodingKey {
         case userID, lastLibraryVersion, collections, items, attachments, lastSyncedAt
-        case keyAliases, pendingRemoteDownloads
+        case keyAliases, pendingRemoteDownloads, pendingItemActions
     }
 
     init(
         userID: String, lastLibraryVersion: Int, collections: [String: ZoteroCollection],
         items: [String: ZoteroItem], attachments: [String: ZoteroAttachment], lastSyncedAt: Date?,
-        keyAliases: [String: String] = [:], pendingRemoteDownloads: [String] = []
+        keyAliases: [String: String] = [:], pendingRemoteDownloads: [String] = [],
+        pendingItemActions: [String: ZoteroPendingItemAction] = [:]
     ) {
         self.userID = userID
         self.lastLibraryVersion = lastLibraryVersion
@@ -309,6 +312,7 @@ struct ZoteroCacheSnapshot: Codable, Sendable {
         self.lastSyncedAt = lastSyncedAt
         self.keyAliases = keyAliases
         self.pendingRemoteDownloads = pendingRemoteDownloads
+        self.pendingItemActions = pendingItemActions
     }
 
     init(from decoder: Decoder) throws {
@@ -321,9 +325,19 @@ struct ZoteroCacheSnapshot: Codable, Sendable {
             attachments: try values.decode([String: ZoteroAttachment].self, forKey: .attachments),
             lastSyncedAt: try values.decodeIfPresent(Date.self, forKey: .lastSyncedAt),
             keyAliases: try values.decodeIfPresent([String: String].self, forKey: .keyAliases) ?? [:],
-            pendingRemoteDownloads: try values.decodeIfPresent([String].self, forKey: .pendingRemoteDownloads) ?? []
+            pendingRemoteDownloads: try values.decodeIfPresent([String].self, forKey: .pendingRemoteDownloads) ?? [],
+            pendingItemActions: try values.decodeIfPresent(
+                [String: ZoteroPendingItemAction].self,
+                forKey: .pendingItemActions
+            ) ?? [:]
         )
     }
+}
+
+enum ZoteroPendingItemAction: String, Codable, Sendable, Equatable {
+    case trash
+    case restore
+    case permanentlyDelete
 }
 
 struct ZoteroRemoteRestoreBackupReceipt: Sendable {
@@ -737,13 +751,19 @@ final class ZoteroCacheStore: @unchecked Sendable {
         }
     }
 
-    private static func copy(_ item: ZoteroItem, collectionKeys: [String]) -> ZoteroItem {
+    private static func copy(
+        _ item: ZoteroItem,
+        collectionKeys: [String]? = nil,
+        syncError: String? = nil,
+        clearSyncError: Bool = false
+    ) -> ZoteroItem {
         ZoteroItem(
             key: item.key, title: item.title, creators: item.creators, year: item.year,
-            parentItemKey: item.parentItemKey, collectionKeys: collectionKeys,
+            parentItemKey: item.parentItemKey, collectionKeys: collectionKeys ?? item.collectionKeys,
             itemType: item.itemType, dateAdded: item.dateAdded, dateModified: item.dateModified,
             version: item.version, isTrashed: item.isTrashed, isPendingSync: item.isPendingSync,
-            syncError: item.syncError, isConflict: item.isConflict
+            syncError: clearSyncError ? nil : (syncError ?? item.syncError), isConflict: item.isConflict,
+            metadataFields: item.metadataFields, creatorEntries: item.creatorEntries
         )
     }
 
@@ -829,6 +849,7 @@ final class ZoteroCacheStore: @unchecked Sendable {
                     syncError: nil,
                     isConflict: item.isConflict
                 )
+                snapshot.pendingItemActions[key] = .trash
             }
             try saveUnlocked(snapshot)
             return snapshot
@@ -856,9 +877,49 @@ final class ZoteroCacheStore: @unchecked Sendable {
                     syncError: nil,
                     isConflict: item.isConflict
                 )
+                snapshot.pendingItemActions[key] = .restore
             }
             try saveUnlocked(snapshot)
             return snapshot
+        }
+    }
+
+    func queuePermanentDeletion(keys: Set<String>, userID: String) throws -> ZoteroCacheSnapshot {
+        try withCacheAccess {
+            var snapshot = loadUnlocked(userID: userID)
+            for key in keys {
+                guard let item = snapshot.items[key], item.isTrashed else { continue }
+                snapshot.pendingItemActions[key] = .permanentlyDelete
+            }
+            try saveUnlocked(snapshot)
+            return snapshot
+        }
+    }
+
+    func completePendingItemAction(
+        key: String,
+        action: ZoteroPendingItemAction,
+        userID: String
+    ) throws -> ZoteroCacheSnapshot {
+        try withCacheAccess {
+            var snapshot = loadUnlocked(userID: userID)
+            guard snapshot.pendingItemActions[key] == action else { return snapshot }
+            snapshot.pendingItemActions.removeValue(forKey: key)
+            if var item = snapshot.items[key] {
+                item = Self.copy(item, clearSyncError: true)
+                snapshot.items[key] = item
+            }
+            try saveUnlocked(snapshot)
+            return snapshot
+        }
+    }
+
+    func recordPendingItemActionError(key: String, message: String, userID: String) throws {
+        try withCacheAccess {
+            var snapshot = loadUnlocked(userID: userID)
+            guard let item = snapshot.items[key] else { return }
+            snapshot.items[key] = Self.copy(item, syncError: message)
+            try saveUnlocked(snapshot)
         }
     }
 
@@ -867,6 +928,7 @@ final class ZoteroCacheStore: @unchecked Sendable {
     func permanentlyDeleteItems(keys: Set<String>, userID: String) throws -> ZoteroCacheSnapshot {
         try withCacheAccess {
             var snapshot = loadUnlocked(userID: userID)
+            var pathsToRemove = Set<String>()
             let attachmentKeys = Set(snapshot.attachments.values.compactMap { attachment -> String? in
                 if keys.contains(attachment.key) { return attachment.key }
                 if let parent = attachment.parentItemKey, keys.contains(parent) { return attachment.key }
@@ -874,23 +936,27 @@ final class ZoteroCacheStore: @unchecked Sendable {
             })
             for key in attachmentKeys {
                 if let attachment = snapshot.attachments.removeValue(forKey: key) {
-                    for path in [attachment.localCachePath, attachment.conflictLocalPath].compactMap({ $0 }) {
-                        try? FileManager.default.removeItem(atPath: path)
-                    }
+                    pathsToRemove.formUnion([attachment.localCachePath, attachment.conflictLocalPath].compactMap { $0 })
+                    pathsToRemove.insert(defaultPDFCacheURL(for: attachment.localDocumentID).path)
+                    pathsToRemove.insert(defaultPDFCacheURL(for: key).path)
+                    let jotFolder = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                        .appendingPathComponent("ZoteroJots", isDirectory: true)
+                    pathsToRemove.insert(jotFolder.appendingPathComponent("\(attachment.localDocumentID).jot").path)
+                    pathsToRemove.insert(jotFolder.appendingPathComponent("\(key).jot").path)
                 }
                 snapshot.pendingRemoteDownloads.removeAll { $0 == key }
                 snapshot.keyAliases = snapshot.keyAliases.filter { $0.key != key && $0.value != key }
-                try? FileManager.default.removeItem(at: defaultPDFCacheURL(for: key))
-                let jotURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-                    .appendingPathComponent("ZoteroJots", isDirectory: true)
-                    .appendingPathComponent("\(key).jot")
-                try? FileManager.default.removeItem(at: jotURL)
+                snapshot.pendingItemActions.removeValue(forKey: key)
             }
             for key in keys {
                 snapshot.items.removeValue(forKey: key)
                 snapshot.attachments.removeValue(forKey: key)
+                snapshot.pendingItemActions.removeValue(forKey: key)
             }
             try saveUnlocked(snapshot)
+            for path in pathsToRemove where FileManager.default.fileExists(atPath: path) {
+                try? FileManager.default.removeItem(atPath: path)
+            }
             return snapshot
         }
     }
@@ -1345,6 +1411,9 @@ final class ZoteroCacheStore: @unchecked Sendable {
             if temporaryAttachmentKey != created.attachmentKey {
                 snapshot.keyAliases[temporaryAttachmentKey] = created.attachmentKey
             }
+            if let pendingAction = snapshot.pendingItemActions.removeValue(forKey: temporaryParentKey) {
+                snapshot.pendingItemActions[created.parentItemKey] = pendingAction
+            }
             let promotedItem = ZoteroItem(
                 key: created.parentItemKey,
                 title: oldItem.title,
@@ -1427,6 +1496,9 @@ final class ZoteroCacheStore: @unchecked Sendable {
             snapshot.attachments.removeValue(forKey: temporaryAttachmentKey)
             if temporaryAttachmentKey != createdAttachmentKey {
                 snapshot.keyAliases[temporaryAttachmentKey] = createdAttachmentKey
+            }
+            if let pendingAction = snapshot.pendingItemActions.removeValue(forKey: temporaryAttachmentKey) {
+                snapshot.pendingItemActions[createdAttachmentKey] = pendingAction
             }
             attachment.key = createdAttachmentKey
             attachment.parentItemKey = parentKey

@@ -106,6 +106,9 @@ enum ZoteroLibraryAttachmentProjection {
         location: ZoteroLibraryLocation
     ) -> [ZoteroAttachment] {
         snapshot.attachments.values.filter { attachment in
+            let owningKey = attachment.parentItemKey ?? attachment.key
+            if snapshot.pendingItemActions[owningKey] == .permanentlyDelete
+                || snapshot.pendingItemActions[attachment.key] == .permanentlyDelete { return false }
             let attachmentItem = snapshot.items[attachment.key]
             let attachmentIsTrashed = attachmentItem?.isTrashed ?? false
             let owner = attachment.parentItemKey.flatMap { snapshot.items[$0] } ?? attachmentItem
@@ -226,7 +229,9 @@ private final class ZoteroLibraryViewModel: ObservableObject {
             return
         }
         guard !isSyncing else {
-            if trigger == .editorFinished || trigger == .accountChanged { synchronizationRequestedWhileSyncing = true }
+            if trigger == .editorFinished || trigger == .accountChanged || trigger == .requiredWork {
+                synchronizationRequestedWhileSyncing = true
+            }
             JottreDiagnostics.shared.record("zotero.sync.joined", details: ["trigger": trigger.rawValue, "followUpRequired": synchronizationRequestedWhileSyncing])
             return
         }
@@ -274,6 +279,9 @@ private final class ZoteroLibraryViewModel: ObservableObject {
                         context: context,
                         expectedRemoteMD5: expectedRemoteMD5
                     )
+                },
+                deleteRemoteAttachment: { key in
+                    try await syncService.deleteRemoteAttachment(documentID: key)
                 }
             )
             guard syncUserID == userID else {
@@ -361,73 +369,31 @@ private final class ZoteroLibraryViewModel: ObservableObject {
     }
 
     func trashItems(_ keys: Set<String>) async {
-        var latestSnapshot = snapshot
         do {
-            let api = ZoteroAPIClient(apiKey: apiKey, userID: userID)
-            for key in keys.sorted() {
-                try await api.setItemTrashed(key: key, isTrashed: true)
-                latestSnapshot = try cacheStore.markItemsTrashed(keys: [key], userID: userID)
-                snapshot = latestSnapshot
-            }
+            snapshot = try cacheStore.markItemsTrashed(keys: keys, userID: userID)
             selectedItemKeys.subtract(keys)
+            Task { await synchronize(trigger: .requiredWork) }
         } catch {
-            snapshot = latestSnapshot
             errorMessage = error.localizedDescription
         }
     }
 
     func restoreItems(_ keys: Set<String>) async {
-        var latestSnapshot = snapshot
         do {
-            let api = ZoteroAPIClient(apiKey: apiKey, userID: userID)
-            for key in keys.sorted() {
-                try await api.setItemTrashed(key: key, isTrashed: false)
-                latestSnapshot = try cacheStore.restoreItems(keys: [key], userID: userID)
-                snapshot = latestSnapshot
-            }
+            snapshot = try cacheStore.restoreItems(keys: keys, userID: userID)
             selectedItemKeys.subtract(keys)
+            Task { await synchronize(trigger: .requiredWork) }
         } catch {
-            snapshot = latestSnapshot
             errorMessage = error.localizedDescription
         }
     }
 
     func permanentlyDeleteItems(_ keys: Set<String>) async {
-        var latestSnapshot = snapshot
         do {
-            let api = ZoteroAPIClient(apiKey: apiKey, userID: userID)
-            let syncService = makeSyncService()
-            for key in keys.sorted() {
-                guard snapshot.items[key]?.isTrashed == true else { continue }
-                let childAttachmentKeys = snapshot.attachments.values
-                    .filter { $0.parentItemKey == key }
-                    .map(\.key)
-                    .filter(ZoteroSyncService.isValidKey)
-                    .sorted()
-                // Zotero's API deletes individual objects; remove PDF children
-                // before their parent so no orphaned attachments remain.
-                for attachmentKey in childAttachmentKeys {
-                    try await api.permanentlyDeleteItem(key: attachmentKey)
-                }
-                try await api.permanentlyDeleteItem(key: key)
-
-                var cleanupErrors: [String] = []
-                let remoteAttachmentKeys = Set(childAttachmentKeys).union(
-                    snapshot.attachments[key] == nil ? [] : [key]
-                )
-                for attachmentKey in remoteAttachmentKeys.sorted() {
-                    do { try await syncService.deleteRemoteAttachment(documentID: attachmentKey) }
-                    catch { cleanupErrors.append(error.localizedDescription) }
-                }
-                latestSnapshot = try cacheStore.permanentlyDeleteItems(keys: [key], userID: userID)
-                snapshot = latestSnapshot
-                if !cleanupErrors.isEmpty {
-                    errorMessage = String(localized: "zotero.document.delete.cleanupFailed")
-                }
-            }
+            snapshot = try cacheStore.queuePermanentDeletion(keys: keys, userID: userID)
             selectedItemKeys.subtract(keys)
+            Task { await synchronize(trigger: .requiredWork) }
         } catch {
-            snapshot = latestSnapshot
             errorMessage = error.localizedDescription
         }
     }
@@ -1396,6 +1362,9 @@ private final class ZoteroLibraryViewModel: ObservableObject {
                 if let data = jot.pdfData, isValidEditorPDFData(data) { return data }
                 return try? JotHybridPDFBuilder.buildHybridPDF(jot: jot)
             }
+            let localCacheDataIsValid = currentAttachment.localCachePath
+                .flatMap { try? Data(contentsOf: URL(fileURLWithPath: $0)) }
+                .map { isValidEditorPDFData($0) } ?? false
             let hasConflictCopy = cacheStore.hasUsableConflictCopy(forOriginalKey: attachment.key, userID: userID)
             let currentCachePathExists = currentAttachment.localCachePath.map {
                 FileManager.default.fileExists(atPath: $0)
@@ -1429,7 +1398,7 @@ private final class ZoteroLibraryViewModel: ObservableObject {
                 ])
                 throw ZoteroCacheStore.Failure.invalidLocalAttachmentFile
             }
-            if !hasLocalFile, let recoveredPDF = recoverableJotPDF {
+            if (!hasLocalFile || !localCacheDataIsValid), let recoveredPDF = recoverableJotPDF {
                 // The local .jot is authoritative when its derived PDF cache
                 // is missing. Reopen it without contacting Zotero and rebuild
                 // the derived cache locally when storage is available.

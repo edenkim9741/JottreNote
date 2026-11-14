@@ -54,7 +54,8 @@ actor ZoteroSyncEngine {
         apiClient: ZoteroAPIClient,
         userID: String,
         uploadAttachment: (@Sendable (String) async -> String?)? = nil,
-        downloadAttachment: (@Sendable (String, ZoteroDownloadContext) async throws -> Data)? = nil
+        downloadAttachment: (@Sendable (String, ZoteroDownloadContext) async throws -> Data)? = nil,
+        deleteRemoteAttachment: (@Sendable (String) async throws -> Void)? = nil
     ) async throws -> ZoteroCacheSnapshot {
         await progress?.begin()
         do {
@@ -270,6 +271,53 @@ actor ZoteroSyncEngine {
                     }
                 }
 
+                // Local trash/restore/permanent-delete intent is committed to
+                // the cache before any request. Apply it after pending drafts
+                // are promoted so a create-then-delete sequence resolves to
+                // one stable remote identity before deletion is attempted.
+                let itemActions = cacheStore.load(userID: userID).pendingItemActions
+                    .sorted { $0.key < $1.key }
+                for (key, action) in itemActions {
+                    do {
+                        switch action {
+                        case .trash:
+                            try await apiClient.setItemTrashed(key: key, isTrashed: true)
+                            _ = try cacheStore.completePendingItemAction(
+                                key: key,
+                                action: action,
+                                userID: userID
+                            )
+                        case .restore:
+                            try await apiClient.setItemTrashed(key: key, isTrashed: false)
+                            _ = try cacheStore.completePendingItemAction(
+                                key: key,
+                                action: action,
+                                userID: userID
+                            )
+                        case .permanentlyDelete:
+                            let deleteSnapshot = cacheStore.load(userID: userID)
+                            let remoteAttachmentKeys = Set(deleteSnapshot.attachments.values.compactMap { attachment -> String? in
+                                attachment.key == key || attachment.parentItemKey == key ? attachment.key : nil
+                            }.filter(ZoteroSyncService.isValidKey))
+                            for attachmentKey in remoteAttachmentKeys.sorted() {
+                                try await apiClient.permanentlyDeleteItem(key: attachmentKey)
+                                guard let deleteRemoteAttachment else {
+                                    throw Failure.remoteAttachmentCleanupUnavailable
+                                }
+                                try await deleteRemoteAttachment(attachmentKey)
+                            }
+                            try await apiClient.permanentlyDeleteItem(key: key)
+                            _ = try cacheStore.permanentlyDeleteItems(keys: [key], userID: userID)
+                        }
+                    } catch {
+                        try? cacheStore.recordPendingItemActionError(
+                            key: key,
+                            message: error.localizedDescription,
+                            userID: userID
+                        )
+                    }
+                }
+
                 if let uploadAttachment {
                     let uploadSnapshot = cacheStore.load(userID: userID)
                     let pendingRemoteDownloadKeys = Set(uploadSnapshot.pendingRemoteDownloads)
@@ -331,5 +379,8 @@ actor ZoteroSyncEngine {
         Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled
     }
 
-    enum Failure: Error { case libraryContinuouslyChanging }
+    enum Failure: Error {
+        case libraryContinuouslyChanging
+        case remoteAttachmentCleanupUnavailable
+    }
 }
