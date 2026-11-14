@@ -26,6 +26,10 @@ enum JotCanvasGeometryDiagnosticSequence {
 /// viewport. PencilKit's native zoom keeps that viewport sharp at display scale.
 @MainActor
 final class JotPDFPageCanvasOverlay: UIView {
+    // The native zoom is bounded independently from PDFKit's scale. The
+    // canvas frame below covers only the visible page viewport, never the full
+    // page multiplied by this value.
+    private static let maximumNativeCanvasZoom: CGFloat = 64
     let canvas: PKCanvasView
     private let viewportHost = UIView()
     private(set) var drawingSize: CGSize
@@ -82,7 +86,7 @@ final class JotPDFPageCanvasOverlay: UIView {
         canvas.bounces = false
         canvas.bouncesZoom = false
         canvas.minimumZoomScale = 0.01
-        canvas.maximumZoomScale = 64
+        canvas.maximumZoomScale = Self.maximumNativeCanvasZoom
         canvas.contentInset = .zero
         canvas.contentInsetAdjustmentBehavior = .never
         canvas.automaticallyAdjustsScrollIndicatorInsets = false
@@ -385,25 +389,14 @@ final class JotPDFPageCanvasOverlay: UIView {
         // the device viewport instead of scaling the whole page into a huge
         // layer at high PDF zoom.
         let requestedZoom = geometry.canvasZoom
-        let nativeZoom = requestedZoom
+        guard let nativeZoom = geometry.effectiveCanvasZoom(maximumZoomScale: canvas.maximumZoomScale) else { return }
         let visiblePageRect = visibleOverlayRect()
         guard !visiblePageRect.isNull, !visiblePageRect.isEmpty else { return }
-        let drawingToPageX = drawingSize.width / max(bounds.width, 1)
-        let drawingToPageY = drawingSize.height / max(bounds.height, 1)
-        let viewportSize = CGSize(
-            width: visiblePageRect.width * drawingToPageX * nativeZoom,
-            height: visiblePageRect.height * drawingToPageY * nativeZoom
-        )
+        let viewportSize = geometry.viewportSize(for: visiblePageRect, nativeZoom: nativeZoom)
         guard viewportSize.width.isFinite, viewportSize.height.isFinite,
               viewportSize.width > 0, viewportSize.height > 0 else { return }
-        let contentOffset = CGPoint(
-            x: visiblePageRect.minX * drawingToPageX * nativeZoom,
-            y: visiblePageRect.minY * drawingToPageY * nativeZoom
-        )
-        let pageToViewport = CGAffineTransform(
-            scaleX: bounds.width / max(drawingSize.width * nativeZoom, 1),
-            y: bounds.height / max(drawingSize.height * nativeZoom, 1)
-        )
+        let contentOffset = geometry.contentOffset(for: visiblePageRect, nativeZoom: nativeZoom)
+        let pageToViewport = geometry.viewportHostTransform(nativeZoom: nativeZoom)
         let hostCenter = CGPoint(x: visiblePageRect.midX, y: visiblePageRect.midY)
         let geometryAlreadyApplied = appliedGeometry != nil
             && appliedDrawingContentSize == drawingSize
@@ -462,7 +455,6 @@ final class JotPDFPageCanvasOverlay: UIView {
         if canvas.frame != nextBounds { canvas.frame = nextBounds }
         let minimumZoom = min(0.01, nativeZoom)
         if canvas.minimumZoomScale != minimumZoom { canvas.minimumZoomScale = minimumZoom }
-        if nativeZoom > canvas.maximumZoomScale { canvas.maximumZoomScale = nativeZoom }
         if abs(canvas.zoomScale - nativeZoom) > 0.0001 {
 #if DEBUG
             let oldZoom = canvas.zoomScale
@@ -785,7 +777,8 @@ final class JotPDFPageCanvasOverlay: UIView {
             "pageRotation": diagnosticsPageRotation,
             "cropBox": [diagnosticsCropBox.minX, diagnosticsCropBox.minY,
                         diagnosticsCropBox.width, diagnosticsCropBox.height],
-            "pdfScaleFactor": pdfViewScaleFactor,
+            "pdfScaleFactor": (scaleReferenceView as? PDFView)?.scaleFactor ?? pdfViewScaleFactor,
+            "configuredPDFScaleFactor": pdfViewScaleFactor,
             "fitScaleFactor": fitScaleFactor,
             "relativeZoom": pdfViewScaleFactor / max(fitScaleFactor, 0.01),
             "measuredDisplayScale": displayScale,
@@ -1003,21 +996,32 @@ final class JotPDFPageCanvasOverlay: UIView {
         guard [overlayPoint.x, overlayPoint.y, drawingPoint.x, drawingPoint.y].allSatisfy(\.isFinite) else { return nil }
         let expectedPDFViewPoint = convert(overlayPoint, to: pdfView)
         let pdfPagePoint = pdfView.convert(expectedPDFViewPoint, to: page)
-        let roundTrippedExpectedPoint = pdfView.convert(pdfPagePoint, from: page)
-        let canvasViewportPoint = CGPoint(
-            x: drawingPoint.x * canvas.zoomScale - canvas.contentOffset.x,
-            y: drawingPoint.y * canvas.zoomScale - canvas.contentOffset.y
+        // UIScrollView's bounds origin already contains its content offset.
+        // Pass the zoomed content point to UIView.convert so UIKit applies that
+        // origin once; passing a pre-offset viewport point here subtracts it twice.
+        let canvasContentPoint = CGPoint(
+            x: drawingPoint.x * canvas.zoomScale,
+            y: drawingPoint.y * canvas.zoomScale
         )
-        let canvasMappedPDFViewPoint = canvas.convert(canvasViewportPoint, to: pdfView)
-        let dx = canvasMappedPDFViewPoint.x - roundTrippedExpectedPoint.x
-        let dy = canvasMappedPDFViewPoint.y - roundTrippedExpectedPoint.y
+        let canvasViewportPoint = canvas.convert(canvasContentPoint, to: viewportHost)
+        let canvasViewportPointFromOffset = CGPoint(
+            x: canvasContentPoint.x - canvas.contentOffset.x,
+            y: canvasContentPoint.y - canvas.contentOffset.y
+        )
+        let actualPointInPDFView = canvas.convert(canvasContentPoint, to: pdfView)
+        let dx = actualPointInPDFView.x - expectedPDFViewPoint.x
+        let dy = actualPointInPDFView.y - expectedPDFViewPoint.y
         return [
             "name": name,
             "pdfPagePoint": [pdfPagePoint.x, pdfPagePoint.y],
-            "pdfViewExpectedPoint": [roundTrippedExpectedPoint.x, roundTrippedExpectedPoint.y],
+            "pdfViewExpectedPoint": [expectedPDFViewPoint.x, expectedPDFViewPoint.y],
             "drawingPoint": [drawingPoint.x, drawingPoint.y],
+            "canvasContentPoint": [canvasContentPoint.x, canvasContentPoint.y],
+            "canvasContentOffset": [canvas.contentOffset.x, canvas.contentOffset.y],
             "canvasViewportPoint": [canvasViewportPoint.x, canvasViewportPoint.y],
-            "canvasPointConvertedToPDFView": [canvasMappedPDFViewPoint.x, canvasMappedPDFViewPoint.y],
+            "canvasViewportPointFromOffset": [canvasViewportPointFromOffset.x, canvasViewportPointFromOffset.y],
+            "actualPointInPDFView": [actualPointInPDFView.x, actualPointInPDFView.y],
+            "canvasPointConvertedToPDFView": [actualPointInPDFView.x, actualPointInPDFView.y],
             "deltaX": dx,
             "deltaY": dy,
             "errorDistance": hypot(dx, dy)

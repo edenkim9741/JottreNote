@@ -1,13 +1,15 @@
 import UIKit
 
-/// Display measurements are derived from page-local points. PDFKit owns
-/// document zoom; the overlay maps the normalized PKDrawing coordinate space
-/// into page coordinates while keeping the PencilKit viewport fixed in size.
+/// PDFKit owns document zoom. This geometry separates requested native
+/// PencilKit zoom from the normalized Drawing-to-page mapping and sizes only
+/// the visible PencilKit viewport.
 struct JotCanvasRenderGeometry: Equatable {
     let viewportSize: CGSize
     let canvasZoom: CGFloat
     let inversePageScale: CGAffineTransform
     let screenScale: CGFloat
+    let drawingToPageScaleX: CGFloat
+    let drawingToPageScaleY: CGFloat
 
     @MainActor
     static func displayRatio(
@@ -37,6 +39,34 @@ struct JotCanvasRenderGeometry: Equatable {
         guard viewportSize.width.isFinite, viewportSize.height.isFinite, canvasZoom.isFinite else { return nil }
         inversePageScale = CGAffineTransform(scaleX: 1 / displayScale, y: 1 / displayScale)
         self.screenScale = screenScale
+        drawingToPageScaleX = drawingSize.width / pageSize.width
+        drawingToPageScaleY = drawingSize.height / pageSize.height
+    }
+
+    func effectiveCanvasZoom(maximumZoomScale: CGFloat) -> CGFloat? {
+        guard maximumZoomScale.isFinite, maximumZoomScale > 0 else { return nil }
+        return min(canvasZoom, maximumZoomScale)
+    }
+
+    func viewportSize(for visiblePageRect: CGRect, nativeZoom: CGFloat) -> CGSize {
+        CGSize(
+            width: visiblePageRect.width * drawingToPageScaleX * nativeZoom,
+            height: visiblePageRect.height * drawingToPageScaleY * nativeZoom
+        )
+    }
+
+    func contentOffset(for visiblePageRect: CGRect, nativeZoom: CGFloat) -> CGPoint {
+        CGPoint(
+            x: visiblePageRect.minX * drawingToPageScaleX * nativeZoom,
+            y: visiblePageRect.minY * drawingToPageScaleY * nativeZoom
+        )
+    }
+
+    func viewportHostTransform(nativeZoom: CGFloat) -> CGAffineTransform {
+        CGAffineTransform(
+            scaleX: 1 / (drawingToPageScaleX * nativeZoom),
+            y: 1 / (drawingToPageScaleY * nativeZoom)
+        )
     }
 }
 
