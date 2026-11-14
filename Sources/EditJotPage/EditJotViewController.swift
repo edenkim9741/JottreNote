@@ -80,10 +80,14 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
 #if DEBUG
     private lazy var zoomCoordinator = JotCanvasZoomCoordinator(
         refresh: { [weak self] in self?.updatePageOverlayRendererZoom() },
+        updateVisibleRegion: { [weak self] in self?.updatePageOverlayVisibleRegions() },
         debugEventHandler: { [weak self] eventName in self?.recordPageOverlayGeometryDiagnostic(eventName) }
     )
 #else
-    private lazy var zoomCoordinator = JotCanvasZoomCoordinator { [weak self] in self?.updatePageOverlayRendererZoom() }
+    private lazy var zoomCoordinator = JotCanvasZoomCoordinator(
+        refresh: { [weak self] in self?.updatePageOverlayRendererZoom() },
+        updateVisibleRegion: { [weak self] in self?.updatePageOverlayVisibleRegions() }
+    )
 #endif
     private lazy var gestureCoordinator: JotEditorGestureCoordinator = {
         let coordinator = JotEditorGestureCoordinator(pdfView: pdfView)
@@ -471,6 +475,7 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
         super.viewDidLayoutSubviews()
         zoomCoordinator.updateScaleRange(in: pdfView)
         gestureCoordinator.refreshPDFScrollRoutingIfNavigationViewChanged()
+        zoomCoordinator.observe(gestureCoordinator.pdfNavigationScrollViews())
     }
 
     private func setUpViews() {
@@ -850,6 +855,12 @@ final class EditJotViewController: UIViewController, @preconcurrency PDFPageOver
         for canvas in pageCanvases.values {
             updatePageCanvasRenderer(for: canvas)
 
+        }
+    }
+
+    private func updatePageOverlayVisibleRegions() {
+        for overlay in pageOverlays.values {
+            overlay.updateCanvasVisibleRegion(recordDiagnostics: false)
         }
     }
 
@@ -1278,8 +1289,11 @@ extension EditJotViewController {
         // PKCanvasView handles picker attribute changes (including recoloring
         // its active lasso selection) only while it observes this picker.
         toolPicker.addObserver(canvas)
-        if canvas.becomeFirstResponder() {
-            toolPicker.setVisible(true, forFirstResponder: canvas)
+        if canvas.firstResponderInHierarchy == nil {
+            _ = canvas.becomeFirstResponder()
+        }
+        if let responder = canvas.firstResponderInHierarchy {
+            toolPicker.setVisible(true, forFirstResponder: responder)
         }
         #if DEBUG
         if let index = pageIndexByCanvas[ObjectIdentifier(canvas)] {

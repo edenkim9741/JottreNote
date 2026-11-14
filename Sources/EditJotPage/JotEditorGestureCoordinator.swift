@@ -61,6 +61,7 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
         activePageIndex: Int?,
         overlays: [Int: JotPDFPageCanvasOverlay]
     ) {
+        let editingStateChanged = isEditingEnabled != isEditing
         isEditingEnabled = isEditing
         selectedTool = tool
         if isEditing {
@@ -71,7 +72,9 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
             self.activePageIndex = nil
         }
         updateUndoDoubleTapAvailability()
-        pdfView.isInMarkupMode = isEditing
+        if pdfView.isInMarkupMode != isEditing {
+            pdfView.isInMarkupMode = isEditing
+        }
         let suppressesEditActions = CanvasTouchRouting.suppressesStandardEditActions(
             isEditing: isEditing,
             tool: tool
@@ -88,7 +91,11 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
             configure(canvas, overlay: overlay, pageIndex: index)
         }
         activeCanvas = activePageIndex.flatMap { overlays[$0]?.canvas as? JotCanvasView }
-        applyPDFScrollRouting()
+        if editingStateChanged {
+            applyPDFScrollRouting()
+        } else {
+            refreshPDFScrollRoutingIfNavigationViewChanged()
+        }
     }
 
     private func applyPDFScrollRouting() {
@@ -264,6 +271,13 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
         extra: [String: Any] = [:]
     ) {
         let scrollView = pan.view as? UIScrollView
+        let canvasHost = activeCanvas?.superview
+        let inset = scrollView?.adjustedContentInset ?? .zero
+        let minimumPDFOffset = CGPoint(x: -inset.left, y: -inset.top)
+        let maximumPDFOffset = CGPoint(
+            x: max(minimumPDFOffset.x, (scrollView?.contentSize.width ?? 0) - (scrollView?.bounds.width ?? 0) + inset.right),
+            y: max(minimumPDFOffset.y, (scrollView?.contentSize.height ?? 0) - (scrollView?.bounds.height ?? 0) + inset.bottom)
+        )
         var details: [String: Any] = [
             "eventSequence": JotCanvasGeometryDiagnosticSequence.next(),
             "eventTimestamp": Date().timeIntervalSince1970,
@@ -276,17 +290,27 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
             "pdfPanIdentity": String(describing: ObjectIdentifier(pan)),
             "pdfPanEnabled": pan.isEnabled,
             "pdfPanState": pan.state.rawValue,
+            "pdfPanStateName": Self.stateName(pan.state.rawValue),
             "numberOfTouches": pan.numberOfTouches,
             "minimumTouches": pan.minimumNumberOfTouches,
             "maximumTouches": pan.maximumNumberOfTouches,
             "allowedTouchTypes": pan.allowedTouchTypes.map(\.intValue),
             "pdfContentOffset": scrollView.map { [Double($0.contentOffset.x), Double($0.contentOffset.y)] } ?? [],
+            "pdfMinimumContentOffset": [Double(minimumPDFOffset.x), Double(minimumPDFOffset.y)],
+            "pdfMaximumContentOffset": [Double(maximumPDFOffset.x), Double(maximumPDFOffset.y)],
             "canvasInteractionEnabled": activeCanvas?.isUserInteractionEnabled ?? false,
             "canvasScrollEnabled": activeCanvas?.isScrollEnabled ?? false,
             "canvasPanEnabled": activeCanvas?.panGestureRecognizer.isEnabled ?? false,
             "canvasPanState": activeCanvas?.panGestureRecognizer.state.rawValue ?? -1,
+            "canvasPanStateName": activeCanvas.map { Self.stateName($0.panGestureRecognizer.state.rawValue) } ?? "unknown",
             "canvasPanIdentity": activeCanvas.map { String(describing: ObjectIdentifier($0.panGestureRecognizer)) } ?? "nil",
+            "canvasZoomScale": activeCanvas?.zoomScale ?? 0,
+            "canvasBounds": activeCanvas.map { [Double($0.bounds.width), Double($0.bounds.height)] } ?? [],
+            "canvasContentSize": activeCanvas.map { [Double($0.contentSize.width), Double($0.contentSize.height)] } ?? [],
             "canvasContentOffset": activeCanvas.map { [Double($0.contentOffset.x), Double($0.contentOffset.y)] } ?? [],
+            "viewportHostIdentity": canvasHost.map { String(describing: ObjectIdentifier($0)) } ?? "nil",
+            "viewportHostBounds": canvasHost.map { [Double($0.bounds.width), Double($0.bounds.height)] } ?? [],
+            "viewportHostTransform": canvasHost.map { [Double($0.transform.a), Double($0.transform.b), Double($0.transform.c), Double($0.transform.d)] } ?? [],
             "canvasTool": activeCanvas.map { $0.tool is PKLassoTool ? "lasso" : $0.tool is PKEraserTool ? "eraser" : "ink" } ?? "none"
         ]
         details.merge(extra) { _, new in new }

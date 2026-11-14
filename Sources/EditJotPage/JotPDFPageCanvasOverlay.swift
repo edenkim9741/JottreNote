@@ -43,6 +43,7 @@ final class JotPDFPageCanvasOverlay: UIView {
 #endif
     private var appliedGeometry: JotCanvasRenderGeometry?
     private var appliedDrawingContentSize: CGSize?
+    private var appliedNativeCanvasZoom: CGFloat?
     private var lastMemorySampleZoomBucket: Int?
 #if DEBUG
     private weak var lastHitTestTouchEvent: UIEvent?
@@ -105,7 +106,7 @@ final class JotPDFPageCanvasOverlay: UIView {
         hoverRecognizer.delaysTouchesEnded = false
         addGestureRecognizer(hoverRecognizer)
 #endif
-        updateCanvasGeometry()
+        updateCanvasZoomGeometry()
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -121,7 +122,7 @@ final class JotPDFPageCanvasOverlay: UIView {
     func prepareForPage(size: CGSize, drawingWidth: CGFloat) {
         guard size.width > 0, size.height > 0, drawingWidth > 0 else { return }
         drawingSize = CGSize(width: drawingWidth, height: drawingWidth * size.height / size.width)
-        updateCanvasGeometry()
+        updateCanvasZoomGeometry()
     }
 
     func setDiagnosticsPage(_ page: PDFPage, index: Int) {
@@ -385,6 +386,9 @@ final class JotPDFPageCanvasOverlay: UIView {
             "canvasPanMinimumTouches": canvasPan.minimumNumberOfTouches,
             "canvasPanMaximumTouches": canvasPan.maximumNumberOfTouches,
             "canvasScrollEnabled": canvas.isScrollEnabled,
+            "canvasZoomScale": canvas.zoomScale,
+            "canvasBounds": [Double(canvas.bounds.width), Double(canvas.bounds.height)],
+            "canvasContentSize": [Double(canvas.contentSize.width), Double(canvas.contentSize.height)],
             "pdfPanIdentity": pdfPan.map { String(describing: ObjectIdentifier($0)) } ?? "nil",
             "pdfPanState": pdfPan?.state.rawValue ?? -1,
             "pdfPanEnabled": pdfPan?.isEnabled ?? false,
@@ -392,7 +396,12 @@ final class JotPDFPageCanvasOverlay: UIView {
             "pdfPanMinimumTouches": pdfPan?.minimumNumberOfTouches ?? 0,
             "pdfPanMaximumTouches": pdfPan?.maximumNumberOfTouches ?? 0,
             "pdfScrollEnabled": pdfScrollView?.isScrollEnabled ?? false,
-            "pdfContentOffset": pdfScrollView.map { [Double($0.contentOffset.x), Double($0.contentOffset.y)] } ?? []
+            "pdfContentOffset": pdfScrollView.map { [Double($0.contentOffset.x), Double($0.contentOffset.y)] } ?? [],
+            "pdfContentSize": pdfScrollView.map { [Double($0.contentSize.width), Double($0.contentSize.height)] } ?? [],
+            "viewportHostIdentity": String(describing: ObjectIdentifier(viewportHost)),
+            "viewportHostBounds": [Double(viewportHost.bounds.width), Double(viewportHost.bounds.height)],
+            "viewportHostTransform": [Double(viewportHost.transform.a), Double(viewportHost.transform.b),
+                                      Double(viewportHost.transform.c), Double(viewportHost.transform.d)]
         ])
     }
 
@@ -412,7 +421,7 @@ final class JotPDFPageCanvasOverlay: UIView {
         scaleReferenceView = nil
         guard abs(self.displayScale - displayScale) > 0.001 else { return }
         self.displayScale = displayScale
-        updateCanvasGeometry()
+        updateCanvasGeometryIfNeeded()
     }
 
     func configure(in coordinateView: UIView, pdfScaleFactor: CGFloat) {
@@ -425,7 +434,7 @@ final class JotPDFPageCanvasOverlay: UIView {
         }
         let measured = measuredDisplayScale()
         if measured.isFinite, measured > 0 { displayScale = measured }
-        updateCanvasGeometry()
+        updateCanvasGeometryIfNeeded()
     }
 
     private func measuredDisplayScale() -> CGFloat {
@@ -465,59 +474,79 @@ final class JotPDFPageCanvasOverlay: UIView {
 #if DEBUG
         if isPencilHoverActive { hoverLayoutCount += 1 }
 #endif
-        updateCanvasGeometry()
+        updateCanvasGeometryIfNeeded()
     }
 
-    private func updateCanvasGeometry() {
-#if DEBUG
-        if isPencilHoverActive { hoverGeometryUpdateCount += 1 }
-#endif
+    private func currentRenderGeometry() -> (geometry: JotCanvasRenderGeometry, nativeZoom: CGFloat)? {
         guard let geometry = JotCanvasRenderGeometry(
             pageSize: bounds.size,
             drawingSize: drawingSize,
             displayScale: measuredDisplayScale(),
             screenScale: window?.screen.nativeScale ?? traitCollection.displayScale
-        ) else { return }
+        ), let nativeZoom = geometry.effectiveCanvasZoom(maximumZoomScale: canvas.maximumZoomScale) else {
+            return nil
+        }
+        return (geometry, nativeZoom)
+    }
+
+    private func updateCanvasGeometryIfNeeded() {
+        guard let current = currentRenderGeometry() else { return }
+        let minimumZoom = min(0.01, current.nativeZoom)
+        let zoomGeometryChanged = hasMeaningfulZoomGeometryChange(
+            to: current.geometry,
+            nativeZoom: current.nativeZoom
+        )
+            || appliedDrawingContentSize != drawingSize
+            || abs(canvas.zoomScale - current.nativeZoom) > 0.0001
+            || abs(canvas.minimumZoomScale - minimumZoom) > 0.0001
+        if isPDFNavigationPanActive {
+            updateCanvasVisibleRegion(recordDiagnostics: false)
+            return
+        }
+        if zoomGeometryChanged {
+            updateCanvasZoomGeometry(current.geometry, nativeZoom: current.nativeZoom)
+        } else {
+            updateCanvasVisibleRegion()
+        }
+    }
+
+    private func hasMeaningfulZoomGeometryChange(
+        to geometry: JotCanvasRenderGeometry,
+        nativeZoom: CGFloat
+    ) -> Bool {
+        guard let appliedGeometry, let appliedNativeCanvasZoom else { return true }
+        return abs(appliedNativeCanvasZoom - nativeZoom) > 0.0001
+            || abs(appliedGeometry.viewportSize.width - geometry.viewportSize.width) > 0.25
+            || abs(appliedGeometry.viewportSize.height - geometry.viewportSize.height) > 0.25
+            || abs(appliedGeometry.drawingToPageScaleX - geometry.drawingToPageScaleX) > 0.00001
+            || abs(appliedGeometry.drawingToPageScaleY - geometry.drawingToPageScaleY) > 0.00001
+            || abs(appliedGeometry.screenScale - geometry.screenScale) > 0.01
+    }
+
+    private var isPDFNavigationPanActive: Bool {
+        guard let pan = pdfDocumentScrollView()?.panGestureRecognizer else { return false }
+        return pan.state == .began || pan.state == .changed
+    }
+
+    private func updateCanvasZoomGeometry() {
+        guard let current = currentRenderGeometry() else { return }
+        updateCanvasZoomGeometry(current.geometry, nativeZoom: current.nativeZoom)
+    }
+
+    private func updateCanvasZoomGeometry(_ geometry: JotCanvasRenderGeometry, nativeZoom: CGFloat) {
+#if DEBUG
+        if isPencilHoverActive { hoverGeometryUpdateCount += 1 }
+#endif
         // Keep the full PKDrawing in logical page coordinates. Size the actual
         // canvas to the visible portion of the page, expressed in PencilKit's
         // zoomed content coordinates. This keeps its drawable viewport near
         // the device viewport instead of scaling the whole page into a huge
         // layer at high PDF zoom.
         let requestedZoom = geometry.canvasZoom
-        guard let nativeZoom = geometry.effectiveCanvasZoom(maximumZoomScale: canvas.maximumZoomScale) else { return }
-        let visiblePageRect = visibleOverlayRect()
-        guard !visiblePageRect.isNull, !visiblePageRect.isEmpty else { return }
-        let viewportSize = geometry.viewportSize(for: visiblePageRect, nativeZoom: nativeZoom)
-        guard viewportSize.width.isFinite, viewportSize.height.isFinite,
-              viewportSize.width > 0, viewportSize.height > 0 else { return }
-        let contentOffset = geometry.contentOffset(for: visiblePageRect, nativeZoom: nativeZoom)
-        let pageToViewport = geometry.viewportHostTransform(nativeZoom: nativeZoom)
-        let hostCenter = CGPoint(x: visiblePageRect.midX, y: visiblePageRect.midY)
-        let geometryAlreadyApplied = appliedGeometry != nil
-            && appliedDrawingContentSize == drawingSize
-            && canvas.bounds.size == viewportSize
-            && canvas.frame == CGRect(origin: .zero, size: viewportSize)
-            && abs(canvas.zoomScale - nativeZoom) <= 0.0001
-            && abs(canvas.contentOffset.x - contentOffset.x) <= 0.05
-            && abs(canvas.contentOffset.y - contentOffset.y) <= 0.05
-            && viewportHost.bounds.size == viewportSize
-            && viewportHost.center == hostCenter
-            && viewportHost.transform == pageToViewport
-        if geometryAlreadyApplied {
-#if DEBUG
-            if isPencilHoverActive, !didLogUnchangedGeometryDuringHover {
-                didLogUnchangedGeometryDuringHover = true
-                recordGeometryDiagnostic("geometry.skippedUnchanged")
-            }
-#endif
-            return
-        }
-#if DEBUG
-        if isPencilHoverActive { hoverGeometryReapplyCount += 1 }
-        recordGeometryDiagnostic("geometry.beforeApply")
-#endif
+        guard nativeZoom.isFinite, nativeZoom > 0 else { return }
         appliedGeometry = geometry
-        if appliedDrawingContentSize != drawingSize {
+        appliedNativeCanvasZoom = nativeZoom
+        if appliedDrawingContentSize != drawingSize || canvas.contentSize != drawingSize {
 #if DEBUG
             let oldContentSize = canvas.contentSize
 #endif
@@ -525,29 +554,12 @@ final class JotPDFPageCanvasOverlay: UIView {
             appliedDrawingContentSize = drawingSize
 #if DEBUG
             recordGeometryDiagnostic("canvas.contentSizeChanged", extra: [
-                "source": "updateCanvasGeometry",
+                "source": "updateCanvasZoomGeometry",
                 "oldValue": [Double(oldContentSize.width), Double(oldContentSize.height)],
                 "newValue": [Double(canvas.contentSize.width), Double(canvas.contentSize.height)]
             ])
 #endif
         }
-        let nextBounds = CGRect(origin: .zero, size: viewportSize)
-        if viewportHost.bounds != nextBounds { viewportHost.bounds = nextBounds }
-        if viewportHost.center != hostCenter { viewportHost.center = hostCenter }
-        if viewportHost.transform != pageToViewport {
-#if DEBUG
-            let oldTransform = viewportHost.transform
-#endif
-            viewportHost.transform = pageToViewport
-#if DEBUG
-            recordGeometryDiagnostic("viewport.transformChanged", extra: [
-                "source": "updateCanvasGeometry",
-                "oldValue": Self.transformComponents(oldTransform),
-                "newValue": Self.transformComponents(viewportHost.transform)
-            ])
-#endif
-        }
-        if canvas.frame != nextBounds { canvas.frame = nextBounds }
         let minimumZoom = min(0.01, nativeZoom)
         if canvas.minimumZoomScale != minimumZoom { canvas.minimumZoomScale = minimumZoom }
         if abs(canvas.zoomScale - nativeZoom) > 0.0001 {
@@ -558,10 +570,82 @@ final class JotPDFPageCanvasOverlay: UIView {
             canvas.setZoomScale(nativeZoom, animated: false)
 #if DEBUG
             recordGeometryDiagnostic("canvas.zoomChanged", extra: [
-                "source": "updateCanvasGeometry", "oldValue": oldZoom, "newValue": canvas.zoomScale
+                "source": "updateCanvasZoomGeometry", "oldValue": oldZoom, "newValue": canvas.zoomScale
             ])
 #endif
         }
+        let pageToViewport = geometry.viewportHostTransform(nativeZoom: nativeZoom)
+        if viewportHost.transform != pageToViewport {
+#if DEBUG
+            let oldTransform = viewportHost.transform
+#endif
+            viewportHost.transform = pageToViewport
+#if DEBUG
+            recordGeometryDiagnostic("viewport.transformChanged", extra: [
+                "source": "updateCanvasZoomGeometry",
+                "oldValue": Self.transformComponents(oldTransform),
+                "newValue": Self.transformComponents(viewportHost.transform)
+            ])
+#endif
+        }
+        updateCanvasVisibleRegion()
+        recordGeometryMilestoneIfNeeded(
+            requestedZoom: requestedZoom,
+            nativeZoom: nativeZoom,
+            renderScale: geometry.screenScale,
+            viewportTransform: geometry.viewportHostTransform(nativeZoom: nativeZoom)
+        )
+#if DEBUG
+        recordGeometryDiagnostic("geometry.afterApply", includeCoordinateProbes: true)
+#endif
+    }
+
+    /// Move and resize only the visible viewport as PDFKit scrolls the page.
+    /// The logical drawing content and PencilKit zoom are intentionally fixed.
+    func updateCanvasVisibleRegion(recordDiagnostics: Bool = true) {
+        guard let geometry = appliedGeometry,
+              let nativeZoom = appliedNativeCanvasZoom else { return }
+#if DEBUG
+        if isPencilHoverActive { hoverGeometryUpdateCount += 1 }
+#endif
+        let visiblePageRect = visibleOverlayRect()
+        guard !visiblePageRect.isNull, !visiblePageRect.isEmpty else { return }
+        let viewportSize = geometry.viewportSize(for: visiblePageRect, nativeZoom: nativeZoom)
+        guard viewportSize.width.isFinite, viewportSize.height.isFinite,
+              viewportSize.width > 0, viewportSize.height > 0 else { return }
+        let viewportSizeChanged = abs(canvas.bounds.width - viewportSize.width) > 0.25
+            || abs(canvas.bounds.height - viewportSize.height) > 0.25
+            || abs(viewportHost.bounds.width - viewportSize.width) > 0.25
+            || abs(viewportHost.bounds.height - viewportSize.height) > 0.25
+        let contentOffset = geometry.contentOffset(for: visiblePageRect, nativeZoom: nativeZoom)
+        let hostCenter = CGPoint(x: visiblePageRect.midX, y: visiblePageRect.midY)
+        let geometryAlreadyApplied = appliedDrawingContentSize == drawingSize
+            && !viewportSizeChanged
+            && canvas.frame.origin == .zero
+            && abs(canvas.contentOffset.x - contentOffset.x) <= 0.05
+            && abs(canvas.contentOffset.y - contentOffset.y) <= 0.05
+            && abs(viewportHost.bounds.width - viewportSize.width) <= 0.25
+            && abs(viewportHost.bounds.height - viewportSize.height) <= 0.25
+            && viewportHost.center == hostCenter
+        if geometryAlreadyApplied {
+#if DEBUG
+            if isPencilHoverActive, !didLogUnchangedGeometryDuringHover {
+                didLogUnchangedGeometryDuringHover = true
+                recordGeometryDiagnostic("geometry.skippedUnchanged")
+            }
+#endif
+            return
+        }
+#if DEBUG
+        if isPencilHoverActive, recordDiagnostics { hoverGeometryReapplyCount += 1 }
+        if recordDiagnostics { recordGeometryDiagnostic("geometry.beforeApply") }
+#endif
+        if viewportSizeChanged || canvas.frame.origin != .zero {
+            let nextBounds = CGRect(origin: .zero, size: viewportSize)
+            if viewportHost.bounds != nextBounds { viewportHost.bounds = nextBounds }
+            if canvas.frame != nextBounds { canvas.frame = nextBounds }
+        }
+        if viewportHost.center != hostCenter { viewportHost.center = hostCenter }
         if abs(canvas.contentOffset.x - contentOffset.x) > 0.05
             || abs(canvas.contentOffset.y - contentOffset.y) > 0.05
         {
@@ -570,39 +654,15 @@ final class JotPDFPageCanvasOverlay: UIView {
 #endif
             canvas.setContentOffset(contentOffset, animated: false)
 #if DEBUG
-            recordGeometryDiagnostic("canvas.offsetChanged", extra: [
-                "source": "updateCanvasGeometry",
-                "oldValue": [Double(oldOffset.x), Double(oldOffset.y)],
-                "newValue": [Double(canvas.contentOffset.x), Double(canvas.contentOffset.y)]
-            ])
+            if recordDiagnostics {
+                recordGeometryDiagnostic("canvas.offsetChanged", extra: [
+                    "source": "updateCanvasVisibleRegion",
+                    "oldValue": [Double(oldOffset.x), Double(oldOffset.y)],
+                    "newValue": [Double(canvas.contentOffset.x), Double(canvas.contentOffset.y)]
+                ])
+            }
 #endif
         }
-        recordGeometryMilestoneIfNeeded(
-            requestedZoom: geometry.canvasZoom,
-            nativeZoom: nativeZoom,
-            renderScale: geometry.screenScale,
-            viewportTransform: pageToViewport
-        )
-        #if DEBUG
-        if appliedGeometry == geometry {
-            let details: [String: Any] = [
-                "requestedCanvasZoom": requestedZoom,
-                "nativeCanvasZoom": nativeZoom,
-                "nativeZoomMaximum": canvas.maximumZoomScale,
-                "pdfScaleFactor": pdfViewScaleFactor,
-                "measuredDisplayScale": measuredDisplayScale(),
-                "canvasBounds": [canvas.bounds.width, canvas.bounds.height],
-                "contentSize": [canvas.contentSize.width, canvas.contentSize.height],
-                "contentOffset": [canvas.contentOffset.x, canvas.contentOffset.y],
-                "viewportTransform": [pageToViewport.a, pageToViewport.d],
-                "overlayBounds": [bounds.width, bounds.height]
-            ]
-            JottreDiagnostics.shared.record("zoom.geometryUpdated", details: details)
-        }
-        recordGeometryDiagnostic("geometry.afterApply", includeCoordinateProbes: true)
-        #endif
-        // PDFView remains the only owner of the user's document pinch gesture.
-        disableCanvasPinchGestures(in: canvas)
     }
 
     private func visibleOverlayRect() -> CGRect {
@@ -612,6 +672,17 @@ final class JotPDFPageCanvasOverlay: UIView {
         guard !visibleInReference.isNull, !visibleInReference.isEmpty else { return .zero }
         let visible = convert(visibleInReference, from: scaleReferenceView).intersection(bounds)
         return visible.isNull || visible.isEmpty ? .zero : visible
+    }
+
+    private func pdfDocumentScrollView() -> UIScrollView? {
+        guard let pdfView = scaleReferenceView as? PDFView,
+              let documentView = pdfView.documentView else { return nil }
+        var ancestor = documentView.superview
+        while let view = ancestor {
+            if let scrollView = view as? UIScrollView { return scrollView }
+            ancestor = view.superview
+        }
+        return nil
     }
 
 #if DEBUG
@@ -1025,17 +1096,6 @@ final class JotPDFPageCanvasOverlay: UIView {
         return String(describing: ObjectIdentifier(page))
     }
 
-    private func pdfDocumentScrollView() -> UIScrollView? {
-        guard let pdfView = scaleReferenceView as? PDFView,
-              let documentView = pdfView.documentView else { return nil }
-        var ancestor = documentView.superview
-        while let view = ancestor {
-            if let scrollView = view as? UIScrollView { return scrollView }
-            ancestor = view.superview
-        }
-        return nil
-    }
-
     private func coordinateAlignmentProbes() -> [[String: Any]] {
         guard let pdfView = scaleReferenceView as? PDFView,
               let pageIndex = diagnosticsPageIndex,
@@ -1233,12 +1293,4 @@ final class JotPDFPageCanvasOverlay: UIView {
         JottreDiagnostics.shared.sampleMemoryNow(for: "canvas.memorySample", details: details)
     }
 
-    private func disableCanvasPinchGestures(in view: UIView) {
-        for recognizer in view.gestureRecognizers ?? [] where recognizer is UIPinchGestureRecognizer {
-            recognizer.isEnabled = false
-        }
-        for child in view.subviews {
-            disableCanvasPinchGestures(in: child)
-        }
-    }
 }

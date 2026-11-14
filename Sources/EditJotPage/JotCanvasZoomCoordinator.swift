@@ -17,6 +17,7 @@ final class JotCanvasZoomCoordinator: NSObject, UIGestureRecognizerDelegate {
     }
 
     private let refresh: @MainActor () -> Void
+    private let updateVisibleRegion: @MainActor () -> Void
 #if DEBUG
     private let debugEventHandler: @MainActor (String) -> Void
 #endif
@@ -37,13 +38,21 @@ final class JotCanvasZoomCoordinator: NSObject, UIGestureRecognizerDelegate {
 #if DEBUG
     init(
         refresh: @escaping @MainActor () -> Void,
+        updateVisibleRegion: @escaping @MainActor () -> Void = {},
         debugEventHandler: @escaping @MainActor (String) -> Void = { _ in }
     ) {
         self.refresh = refresh
+        self.updateVisibleRegion = updateVisibleRegion
         self.debugEventHandler = debugEventHandler
     }
 #else
-    init(refresh: @escaping @MainActor () -> Void) { self.refresh = refresh }
+    init(
+        refresh: @escaping @MainActor () -> Void,
+        updateVisibleRegion: @escaping @MainActor () -> Void = {}
+    ) {
+        self.refresh = refresh
+        self.updateVisibleRegion = updateVisibleRegion
+    }
 #endif
     deinit {
         settleTask?.cancel()
@@ -97,8 +106,12 @@ final class JotCanvasZoomCoordinator: NSObject, UIGestureRecognizerDelegate {
                 maximum: pdfView.scaleFactor,
                 toInclude: pageScales
               ) else { return }
-        pdfView.minScaleFactor = range.minimum
-        pdfView.maxScaleFactor = range.maximum
+        if abs(pdfView.minScaleFactor - range.minimum) > 0.0001 {
+            pdfView.minScaleFactor = range.minimum
+        }
+        if abs(pdfView.maxScaleFactor - range.maximum) > 0.0001 {
+            pdfView.maxScaleFactor = range.maximum
+        }
     }
 
     func stopObservingDoubleTapZoom() {
@@ -243,11 +256,18 @@ final class JotCanvasZoomCoordinator: NSObject, UIGestureRecognizerDelegate {
     }
 
     @objc private func pagePanChanged(_ pan: UIPanGestureRecognizer) {
-        guard pan.state == .began || pan.state == .changed || pan.state == .ended else { return }
-        // A bounded canvas follows the part of the PDF page currently visible
-        // in the PDFView. Recompute its viewport as the document scrolls while
-        // leaving PKDrawing and the PencilKit undo stack untouched.
-        refresh()
+        switch pan.state {
+        case .began, .changed:
+            // Scroll only moves the drawing viewport through the existing
+            // page-coordinate drawing. It must not recalculate PencilKit zoom.
+            updateVisibleRegion()
+        case .ended, .cancelled:
+            // Check whether a concurrent layout/scale change needs a zoom
+            // update. Unchanged geometry is a no-op for zoom/contentSize.
+            refresh()
+        default:
+            break
+        }
     }
 
     private func suppressNativeDoubleTapRecognizers(in view: UIView) {
