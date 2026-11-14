@@ -19,32 +19,31 @@ final class CanvasTouchRoutingTests: XCTestCase {
         XCTAssertFalse(CanvasTouchRouting.suppressesStandardEditActions(isEditing: true, tool: PKLassoTool()))
         XCTAssertFalse(CanvasTouchRouting.suppressesStandardEditActions(isEditing: false, tool: PKInkingTool(.pen)))
 
+        XCTAssertTrue(CanvasTouchRouting.shouldSuppressNativeEditMenuInteractions(isEditing: true, tool: PKInkingTool(.pen)))
+        XCTAssertTrue(CanvasTouchRouting.shouldSuppressNativeEditMenuInteractions(isEditing: true, tool: PKEraserTool(.bitmap)))
         XCTAssertFalse(CanvasTouchRouting.shouldSuppressNativeEditMenuInteractions(isEditing: true, tool: PKLassoTool()))
-        XCTAssertFalse(CanvasTouchRouting.shouldSuppressNativeEditMenuInteractions(isEditing: true, tool: PKInkingTool(.pen)))
-        XCTAssertFalse(CanvasTouchRouting.shouldSuppressNativeEditMenuInteractions(isEditing: true, tool: PKEraserTool(.bitmap)))
         XCTAssertFalse(CanvasTouchRouting.shouldSuppressNativeEditMenuInteractions(isEditing: false, tool: PKInkingTool(.pen)))
     }
 
     @MainActor
-    func testNativeEditMenuInteractionsAreNeverDetachedByRoutingUpdates() {
-        let pdfView = JotPDFView()
+    func testNativeEditMenuInteractionIsRemovedOnlyForInkToolsAndRestoredForLasso() {
         let canvas = JotCanvasView()
-        let overlay = JotPDFPageCanvasOverlay(canvas: canvas, pageSize: CGSize(width: 100, height: 140))
         let editMenu = UIEditMenuInteraction(delegate: nil)
         canvas.addInteraction(editMenu)
-        let coordinator = JotEditorGestureCoordinator(pdfView: pdfView)
+        let controller = JotEditMenuInteractionController()
 
-        let tools: [any PKTool] = [PKInkingTool(.pen), PKEraserTool(.bitmap), PKLassoTool()]
-        for tool in tools {
-            coordinator.update(
-                isEditing: true,
-                tool: tool,
-                rulerActive: false,
-                activePageIndex: 0,
-                overlays: [0: overlay]
-            )
-            XCTAssertTrue(canvas.interactions.contains { $0 === editMenu })
-        }
+        controller.apply(suppressed: true, in: canvas)
+
+        XCTAssertFalse(canvas.interactions.contains { $0 === editMenu })
+        XCTAssertGreaterThanOrEqual(controller.detachedCount, 1)
+        XCTAssertTrue(canvas.isUserInteractionEnabled)
+        XCTAssertTrue(canvas.drawingGestureRecognizer.isEnabled)
+
+        controller.apply(suppressed: false, in: canvas)
+
+        XCTAssertTrue(canvas.interactions.contains { $0 === editMenu })
+        XCTAssertEqual(controller.detachedCount, 0)
+        XCTAssertTrue(canvas.isUserInteractionEnabled)
         XCTAssertTrue(canvas.drawingGestureRecognizer.isEnabled)
     }
 

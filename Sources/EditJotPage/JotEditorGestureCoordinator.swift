@@ -7,6 +7,8 @@ import UIKit
 @MainActor
 final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
     private unowned let pdfView: JotPDFView
+    private weak var fingerNavigationGestureHost: UIView?
+    private let updateVisibleRegionAfterFallbackPan: @MainActor () -> Void
     private var isEditingEnabled = false
     private var selectedTool: any PKTool = PKInkingTool(.pen)
     private var isRulerActive = false
@@ -19,16 +21,23 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
 #endif
     private let routedPDFPans = NSHashTable<UIPanGestureRecognizer>.weakObjects()
     private var isPDFScrollRoutingPending = false
+    private(set) var fingerNavigationFallbackPan: UIPanGestureRecognizer?
+    private var fallbackPanStartOffset: CGPoint?
 #if DEBUG
     private var pdfPanStartOffsets: [ObjectIdentifier: CGPoint] = [:]
-    private var pdfPanStartCanvasOffsets: [ObjectIdentifier: CGPoint] = [:]
     private var pdfPanSuccessLogged = Set<ObjectIdentifier>()
     private var lastLoggedPDFPanStates: [ObjectIdentifier: Int] = [:]
     private var lastLoggedCanvasPanStates: [ObjectIdentifier: Int] = [:]
 #endif
 
-    init(pdfView: JotPDFView) {
+    init(
+        pdfView: JotPDFView,
+        fingerNavigationGestureHost: UIView? = nil,
+        updateVisibleRegionAfterFallbackPan: @escaping @MainActor () -> Void = {}
+    ) {
         self.pdfView = pdfView
+        self.fingerNavigationGestureHost = fingerNavigationGestureHost
+        self.updateVisibleRegionAfterFallbackPan = updateVisibleRegionAfterFallbackPan
         super.init()
     }
 
@@ -54,6 +63,98 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
         undoDoubleTapRecognizer = nil
     }
 
+    private func updateFingerNavigationFallback(isEnabled: Bool) {
+        let gestureHost = pdfView.window ?? fingerNavigationGestureHost ?? pdfView
+        if isEnabled, fingerNavigationFallbackPan == nil {
+            let pan = UIPanGestureRecognizer(target: self, action: #selector(fingerNavigationFallbackChanged(_:)))
+            pan.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+            pan.minimumNumberOfTouches = 1
+            pan.maximumNumberOfTouches = 1
+            pan.cancelsTouchesInView = true
+            pan.delaysTouchesBegan = false
+            pan.delaysTouchesEnded = false
+            pan.delegate = self
+            gestureHost.addGestureRecognizer(pan)
+            fingerNavigationFallbackPan = pan
+        } else if isEnabled,
+                  let pan = fingerNavigationFallbackPan,
+                  pan.view !== gestureHost,
+                  pan.state != .began, pan.state != .changed, pan.numberOfTouches == 0 {
+            pan.view?.removeGestureRecognizer(pan)
+            gestureHost.addGestureRecognizer(pan)
+        } else if !isEnabled,
+                  let pan = fingerNavigationFallbackPan,
+                  pan.state != .began, pan.state != .changed, pan.numberOfTouches == 0 {
+            pdfView.removeGestureRecognizer(pan)
+            fingerNavigationFallbackPan = nil
+            fallbackPanStartOffset = nil
+        }
+    }
+
+    @objc private func fingerNavigationFallbackChanged(_ pan: UIPanGestureRecognizer) {
+        guard isEditingEnabled,
+              let scrollView = pdfNavigationScrollViews().first else { return }
+        let pdfPan = scrollView.panGestureRecognizer
+
+        switch pan.state {
+        case .began:
+            fallbackPanStartOffset = scrollView.contentOffset
+#if DEBUG
+            pdfView.recordFingerNavigationFallbackDiagnostic(state: pan.state, scrollView: scrollView, fallbackPan: pan)
+#endif
+        case .changed, .ended:
+            // PDFKit remains the only scroll owner whenever its public pan
+            // tracks and recognizes this touch. A PDF pan that remains
+            // possible with no active touches never received the gesture; this
+            // handles the diagnosed PencilKit hit-test conflict without
+            // competing with an active PDFKit pan.
+            let fallbackReason: String?
+            if pdfPan.state == .failed {
+                fallbackReason = "nativePDFPanFailed"
+            } else if pdfPan.state == .possible && pdfPan.numberOfTouches == 0 {
+                fallbackReason = "nativePDFPanDidNotTrackTouch"
+            } else {
+                fallbackReason = nil
+            }
+            guard let fallbackReason,
+                  let startOffset = fallbackPanStartOffset else { return }
+#if DEBUG
+            pdfView.recordFingerNavigationFallbackDiagnostic(
+                state: pan.state,
+                scrollView: scrollView,
+                fallbackPan: pan,
+                fallbackReason: fallbackReason
+            )
+#endif
+            let translation = pan.translation(in: scrollView)
+            let inset = scrollView.adjustedContentInset
+            let minimumOffset = CGPoint(x: -inset.left, y: -inset.top)
+            let maximumOffset = CGPoint(
+                x: max(minimumOffset.x, scrollView.contentSize.width - scrollView.bounds.width + inset.right),
+                y: max(minimumOffset.y, scrollView.contentSize.height - scrollView.bounds.height + inset.bottom)
+            )
+            let desiredOffset = CGPoint(
+                x: min(max(startOffset.x - translation.x, minimumOffset.x), maximumOffset.x),
+                y: min(max(startOffset.y - translation.y, minimumOffset.y), maximumOffset.y)
+            )
+            if abs(desiredOffset.x - scrollView.contentOffset.x) > 0.5
+                || abs(desiredOffset.y - scrollView.contentOffset.y) > 0.5 {
+                scrollView.setContentOffset(desiredOffset, animated: false)
+                updateVisibleRegionAfterFallbackPan()
+                pdfView.layoutIfNeeded()
+            }
+        case .cancelled, .failed:
+            fallbackPanStartOffset = nil
+        case .possible:
+            break
+        @unknown default:
+            break
+        }
+        if pan.state == .ended {
+            fallbackPanStartOffset = nil
+        }
+    }
+
     func update(
         isEditing: Bool,
         tool: any PKTool,
@@ -71,6 +172,7 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
             isRulerActive = false
             self.activePageIndex = nil
         }
+        updateFingerNavigationFallback(isEnabled: isEditing)
         updateUndoDoubleTapAvailability()
         if pdfView.isInMarkupMode != isEditing {
             pdfView.isInMarkupMode = isEditing
@@ -167,7 +269,6 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
         switch pan.state {
         case .began:
             pdfPanStartOffsets[key] = scrollView.contentOffset
-            pdfPanStartCanvasOffsets[key] = activeCanvas?.contentOffset
             pdfPanSuccessLogged.remove(key)
         case .changed:
             guard !pdfPanSuccessLogged.contains(key),
@@ -195,16 +296,9 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
                 "currentPanState": Self.stateName(pan.state.rawValue),
                 "startContentOffset": pdfPanStartOffsets[key].map { [Double($0.x), Double($0.y)] } ?? [],
                 "finalContentOffset": [Double(scrollView.contentOffset.x), Double(scrollView.contentOffset.y)],
-                "offsetChanged": pdfPanSuccessLogged.contains(key),
-                "startCanvasContentOffset": pdfPanStartCanvasOffsets[key].map { [Double($0.x), Double($0.y)] } ?? [],
-                "finalCanvasContentOffset": activeCanvas.map { [Double($0.contentOffset.x), Double($0.contentOffset.y)] } ?? [],
-                "canvasOffsetChanged": pdfPanStartCanvasOffsets[key].map {
-                    guard let activeCanvas else { return false }
-                    return hypot(activeCanvas.contentOffset.x - $0.x, activeCanvas.contentOffset.y - $0.y) > 0.05
-                } ?? false
+                "offsetChanged": pdfPanSuccessLogged.contains(key)
             ])
             pdfPanStartOffsets.removeValue(forKey: key)
-            pdfPanStartCanvasOffsets.removeValue(forKey: key)
             pdfPanSuccessLogged.remove(key)
         default:
             break
@@ -293,8 +387,6 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
             "pdfPanEnabled": pan.isEnabled,
             "pdfPanState": pan.state.rawValue,
             "pdfPanStateName": Self.stateName(pan.state.rawValue),
-            "pdfPinchIdentity": scrollView?.pinchGestureRecognizer.map { String(describing: ObjectIdentifier($0)) } ?? "nil",
-            "pdfPinchState": scrollView?.pinchGestureRecognizer.map { Self.stateName($0.state.rawValue) } ?? "unknown",
             "numberOfTouches": pan.numberOfTouches,
             "minimumTouches": pan.minimumNumberOfTouches,
             "maximumTouches": pan.maximumNumberOfTouches,
@@ -315,8 +407,7 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
             "viewportHostIdentity": canvasHost.map { String(describing: ObjectIdentifier($0)) } ?? "nil",
             "viewportHostBounds": canvasHost.map { [Double($0.bounds.width), Double($0.bounds.height)] } ?? [],
             "viewportHostTransform": canvasHost.map { [Double($0.transform.a), Double($0.transform.b), Double($0.transform.c), Double($0.transform.d)] } ?? [],
-            "canvasTool": activeCanvas.map { $0.tool is PKLassoTool ? "lasso" : $0.tool is PKEraserTool ? "eraser" : "ink" } ?? "none",
-            "canvasPencilKitToolSequenceActive": activeCanvas?.diagnosticToolSequenceActive ?? false
+            "canvasTool": activeCanvas.map { $0.tool is PKLassoTool ? "lasso" : $0.tool is PKEraserTool ? "eraser" : "ink" } ?? "none"
         ]
         details.merge(extra) { _, new in new }
         JottreDiagnostics.shared.record(event, details: details)
@@ -327,10 +418,21 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
         _ gestureRecognizer: UIGestureRecognizer,
         shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
     ) -> Bool {
-        gestureRecognizer === undoDoubleTapRecognizer
+        if gestureRecognizer === fingerNavigationFallbackPan,
+           pdfNavigationScrollViews().first?.panGestureRecognizer === otherGestureRecognizer {
+            return true
+        }
+        return gestureRecognizer === undoDoubleTapRecognizer
     }
 
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+        if gestureRecognizer === fingerNavigationFallbackPan {
+#if DEBUG && targetEnvironment(simulator)
+            if EditorInteractionFixture.tool == "scribble-undo" { return false }
+#endif
+            let location = touch.location(in: pdfView)
+            return isEditingEnabled && touch.type == .direct && pdfView.bounds.contains(location)
+        }
         guard gestureRecognizer === undoDoubleTapRecognizer else { return true }
         return Self.acceptsUndoDoubleTapTouch(touch.type)
             && isEditingEnabled
@@ -408,6 +510,68 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
 
 final class JotPDFView: PDFView {
     var suppressesStandardEditActions = false
+#if DEBUG
+    private(set) var diagnosticsLastDirectTouchHitTestTarget = "unobserved"
+    private(set) var diagnosticsLastHitTestLocation: [Double] = []
+    private(set) var diagnosticsLastHitTestTouchTypes: [Int] = []
+    private(set) var diagnosticsFingerFallbackPanTransitions: [[String: Any]] = []
+    private var diagnosticsFingerFallbackPanSequence = 0
+
+    func recordFingerNavigationFallbackDiagnostic(
+        state: UIGestureRecognizer.State,
+        scrollView: UIScrollView,
+        fallbackPan: UIPanGestureRecognizer,
+        fallbackReason: String? = nil
+    ) {
+        diagnosticsFingerFallbackPanSequence += 1
+        let stateName: String
+        switch state {
+        case .began: stateName = "began"
+        case .changed: stateName = "changed"
+        case .ended: stateName = "ended"
+        case .cancelled: stateName = "cancelled"
+        case .failed: stateName = "failed"
+        case .possible: stateName = "possible"
+        @unknown default: stateName = "unknown"
+        }
+        let transition: [String: Any] = [
+            "sequence": diagnosticsFingerFallbackPanSequence,
+            "stateName": stateName,
+            "fallbackPanIdentity": String(describing: ObjectIdentifier(fallbackPan)),
+            "pdfPanIdentity": String(describing: ObjectIdentifier(scrollView.panGestureRecognizer)),
+            "pdfPanState": scrollView.panGestureRecognizer.state.rawValue,
+            "pdfPanTouchCount": scrollView.panGestureRecognizer.numberOfTouches,
+            "contentOffset": [Double(scrollView.contentOffset.x), Double(scrollView.contentOffset.y)],
+            "fallbackReason": fallbackReason ?? "notEvaluatedAtStart",
+            "timestamp": Date().timeIntervalSince1970
+        ]
+        diagnosticsFingerFallbackPanTransitions.append(transition)
+        if diagnosticsFingerFallbackPanTransitions.count > 32 {
+            diagnosticsFingerFallbackPanTransitions.removeFirst(
+                diagnosticsFingerFallbackPanTransitions.count - 32
+            )
+        }
+        JottreDiagnostics.shared.record("gesture.pdfFallbackPanStateChanged", details: transition)
+    }
+
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        let target = super.hitTest(point, with: event)
+        guard let event else { return target }
+        diagnosticsLastDirectTouchHitTestTarget = target.map { String(describing: type(of: $0)) } ?? "nil"
+        diagnosticsLastHitTestLocation = [Double(point.x), Double(point.y)]
+        diagnosticsLastHitTestTouchTypes = event.allTouches?.map { $0.type.rawValue } ?? []
+        let beganDirectTouch = event.allTouches?.first { $0.phase == .began && $0.type == .direct }
+        JottreDiagnostics.shared.record("pdfView.hitTest", details: [
+            "eventIdentity": String(describing: ObjectIdentifier(event)),
+            "touchTypes": diagnosticsLastHitTestTouchTypes,
+            "touchIdentity": beganDirectTouch.map { String(describing: ObjectIdentifier($0)) } ?? "unavailable",
+            "locationInPDFView": [Double(point.x), Double(point.y)],
+            "targetClass": diagnosticsLastDirectTouchHitTestTarget,
+            "targetIdentity": target.map { String(describing: ObjectIdentifier($0)) } ?? "nil"
+        ])
+        return target
+    }
+#endif
 
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
         guard !suppressesStandardEditActions else { return false }
@@ -422,11 +586,6 @@ final class JotCanvasView: PKCanvasView {
     private(set) var diagnosticTouchStartType: String?
     private(set) var diagnosticTouchEndType: String?
     private(set) var diagnosticStrokeCountAtTouchStart = 0
-    private(set) var diagnosticToolSequenceActive = false
-
-    func setDiagnosticToolSequenceActive(_ isActive: Bool) {
-        diagnosticToolSequenceActive = isActive
-    }
 
     func resetDiagnosticTouches() {
         diagnosticTouchStartInWindow = nil

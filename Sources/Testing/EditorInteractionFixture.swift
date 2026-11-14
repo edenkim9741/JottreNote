@@ -3,15 +3,60 @@ import UIKit
 import PDFKit
 @preconcurrency import PencilKit
 
+@MainActor
+private final class ScrollPanTransitionCapture: NSObject {
+    private let observedPans = NSHashTable<UIPanGestureRecognizer>.weakObjects()
+    private var lastStates: [ObjectIdentifier: Int] = [:]
+    private var nextSequence = 0
+    private(set) var events: [[String: Any]] = []
+
+    func observe(_ pan: UIPanGestureRecognizer?) {
+        guard let pan, !observedPans.contains(pan) else { return }
+        observedPans.add(pan)
+        lastStates[ObjectIdentifier(pan)] = pan.state.rawValue
+        pan.addTarget(self, action: #selector(stateChanged(_:)))
+    }
+
+    @objc private func stateChanged(_ pan: UIPanGestureRecognizer) {
+        let key = ObjectIdentifier(pan)
+        guard lastStates[key] != pan.state.rawValue else { return }
+        lastStates[key] = pan.state.rawValue
+        nextSequence += 1
+        let scrollView = pan.view as? UIScrollView
+        events.append([
+            "sequence": nextSequence,
+            "state": pan.state.rawValue,
+            "stateName": Self.stateName(pan.state),
+            "numberOfTouches": pan.numberOfTouches,
+            "contentOffset": scrollView.map { [$0.contentOffset.x, $0.contentOffset.y] } ?? [],
+            "timestamp": Date().timeIntervalSince1970
+        ])
+        if events.count > 32 { events.removeFirst(events.count - 32) }
+    }
+
+    private static func stateName(_ state: UIGestureRecognizer.State) -> String {
+        switch state {
+        case .possible: "possible"
+        case .began: "began"
+        case .changed: "changed"
+        case .ended: "ended"
+        case .cancelled: "cancelled"
+        case .failed: "failed"
+        @unknown default: "unknown"
+        }
+    }
+}
+
 /// Deterministic local document for UI input tests. Enabled only by the test
 /// runner's launch environment; no account or remote document is used.
 @MainActor
 enum EditorInteractionFixture {
+    private static let scrollPanCapture = ScrollPanTransitionCapture()
     static var pickerRulerActive = false
 
     static var tool: String? {
         let value = ProcessInfo.processInfo.environment["JOTTRE_INTERACTION_TEST_TOOL"]
-        return ["pen", "lasso", "blank-pen", "scribble-undo", "zoom-memory"].contains(value ?? "") ? value : nil
+        return ["pen", "lasso", "blank-pen", "scribble-undo", "zoom-memory", "scroll"].contains(value ?? "") ? value : nil
     }
 
     private static var rotatesFixturePage: Bool {
@@ -200,6 +245,7 @@ enum EditorInteractionFixture {
     ) {
         guard tool != nil else { return }
         installZoomControls(in: host, pdfView: pdfView)
+        installNavigationGestureProbe(in: host, pdfView: pdfView)
         if tool == "scribble-undo" || tool == "zoom-memory" {
             installUndoButton(in: host, identifier: "editor.test.undo", title: "Undo") { [weak canvas] in
                 guard let canvas, let manager = canvas.undoManager else { return }
@@ -367,6 +413,25 @@ enum EditorInteractionFixture {
                    canvasRect.minX, canvasRect.minY, canvasRect.width, canvasRect.height,
                    midX, pdfView.scaleFactor].allSatisfy(\.isFinite),
                 rect.width > 0, rect.height > 0 else { return nil }
+            let pdfScrollView = Self.navigationScrollView(in: pdfView)
+            let pdfPan = pdfScrollView?.panGestureRecognizer
+            Self.scrollPanCapture.observe(pdfPan)
+            let canvasPan = canvas.panGestureRecognizer
+            let inset = pdfScrollView?.adjustedContentInset ?? .zero
+            let windowHitTarget: String
+            if let window = host.window {
+                let pdfCenterInWindow = pdfView.convert(CGPoint(x: pdfView.bounds.midX, y: pdfView.bounds.midY), to: window)
+                windowHitTarget = String(describing: type(of: window.hitTest(pdfCenterInWindow, with: nil) ?? pdfView))
+            } else {
+                windowHitTarget = "noWindow"
+            }
+            let scrollMinimum = CGPoint(x: -inset.left, y: -inset.top)
+            let scrollMaximum = CGPoint(
+                x: max(scrollMinimum.x, (pdfScrollView?.contentSize.width ?? 0)
+                    - (pdfScrollView?.bounds.width ?? 0) + inset.right),
+                y: max(scrollMinimum.y, (pdfScrollView?.contentSize.height ?? 0)
+                    - (pdfScrollView?.bounds.height ?? 0) + inset.bottom)
+            )
             let info: [String: Any] = [
                 "midX": midX,
                 "strokes": canvas.drawing.strokes.count,
@@ -397,6 +462,7 @@ enum EditorInteractionFixture {
                 "scaleFactor": pdfView.scaleFactor,
                 "fitScaleFactor": zoomBaseScales[ObjectIdentifier(pdfView)] ?? pdfView.scaleFactor,
                 "canvasZoom": canvas.zoomScale,
+                "physicalFootprintBytes": JottreDiagnostics.currentFootprintBytesForTesting() ?? 0,
                 "minimumCanvasZoom": canvas.minimumZoomScale,
                 "maximumCanvasZoom": canvas.maximumZoomScale,
                 "canvasBounds": [canvas.bounds.width, canvas.bounds.height],
@@ -408,6 +474,11 @@ enum EditorInteractionFixture {
                                       visibleCanvasRect.width, visibleCanvasRect.height],
                 "visibleCanvasAreaRatio": visibleCanvasAreaRatio,
                 "overlayBounds": [overlay?.bounds.width ?? 0, overlay?.bounds.height ?? 0],
+                "canvasOverlayLastTouchHitTestTarget": overlay?.diagnosticsLastTouchHitTestTargetClass ?? "unobserved",
+                "actualDirectTouchHitTestTarget": (pdfView as? JotPDFView)?.diagnosticsLastDirectTouchHitTestTarget ?? "unobserved",
+                "pdfViewHitTestLocation": (pdfView as? JotPDFView)?.diagnosticsLastHitTestLocation ?? [],
+                "pdfViewHitTestTouchTypes": (pdfView as? JotPDFView)?.diagnosticsLastHitTestTouchTypes ?? [],
+                "pdfFallbackPanTransitions": (pdfView as? JotPDFView)?.diagnosticsFingerFallbackPanTransitions ?? [],
                 "drawingSize": [overlay?.drawingSize.width ?? 0, overlay?.drawingSize.height ?? 0],
                 "measuredDisplayScale": overlay?.displayScale ?? 0,
                 "viewportHostTransform": [overlay?.viewportHostTransform.a ?? 0, overlay?.viewportHostTransform.d ?? 0],
@@ -422,7 +493,6 @@ enum EditorInteractionFixture {
                 "lastStrokeEndWindow": strokeEndWindow.map { [$0.x, $0.y] } ?? [],
                 "lastStrokeStartErrorPixels": startErrorPixels ?? -1,
                 "screenScale": window.screen.scale,
-                "physicalFootprintBytes": JottreDiagnostics.currentFootprintBytesForTesting() ?? 0,
                 "drawingPipelineEnabled": Self.drawingPipelineEnabled,
                 "drawingChangeCallbackCount": Self.drawingChangeCallbackCount,
                 "canonicalConversionMilliseconds": Self.canonicalConversionMilliseconds,
@@ -438,6 +508,23 @@ enum EditorInteractionFixture {
                 "interpolatedPathPointCount": Self.interpolatedPathPointCount,
                 "coordinateTransformProbe": Self.coordinateTransformProbe,
                 "pdfPageCount": pdfView.document?.pageCount ?? 0,
+                "pdfScrollViewIdentity": pdfScrollView.map { String(describing: ObjectIdentifier($0)) } ?? "nil",
+                "pdfScrollViewContentOffset": pdfScrollView.map { [$0.contentOffset.x, $0.contentOffset.y] } ?? [],
+                "pdfScrollViewContentSize": pdfScrollView.map { [$0.contentSize.width, $0.contentSize.height] } ?? [],
+                "pdfScrollViewBounds": pdfScrollView.map { [$0.bounds.width, $0.bounds.height] } ?? [],
+                "pdfScrollViewAdjustedContentInset": [inset.top, inset.left, inset.bottom, inset.right],
+                "pdfScrollRange": [scrollMinimum.x, scrollMaximum.x, scrollMinimum.y, scrollMaximum.y],
+                "pdfPanState": pdfPan?.state.rawValue ?? -1,
+                "pdfPanTransitions": Self.scrollPanCapture.events,
+                "pdfPanMinimumNumberOfTouches": pdfPan?.minimumNumberOfTouches ?? 0,
+                "pdfPanMaximumNumberOfTouches": pdfPan?.maximumNumberOfTouches ?? 0,
+                "pdfPanAllowedTouchTypes": pdfPan?.allowedTouchTypes.map(\.intValue) ?? [],
+                "pdfPanEnabled": pdfPan?.isEnabled ?? false,
+                "pdfScrollEnabled": pdfScrollView?.isScrollEnabled ?? false,
+                "pdfPanIdentity": pdfPan.map { String(describing: ObjectIdentifier($0)) } ?? "nil",
+                "canvasPanState": canvasPan.state.rawValue,
+                "canvasPanIdentity": String(describing: ObjectIdentifier(canvasPan)),
+                "hitTestTarget": windowHitTarget,
                 "pdfDataBytes": fixturePDFSizeBytes,
                 "activeCanvasCount": activeCanvasCounts.canvases,
                 "activeOverlayCount": activeCanvasCounts.overlays,
@@ -467,12 +554,23 @@ enum EditorInteractionFixture {
         [rect.minX, rect.minY, rect.width, rect.height]
     }
 
+    private static func navigationScrollView(in pdfView: PDFView) -> UIScrollView? {
+        guard let documentView = pdfView.documentView else { return nil }
+        var ancestor = documentView.superview
+        while let view = ancestor {
+            if let scrollView = view as? UIScrollView { return scrollView }
+            ancestor = view.superview
+        }
+        return nil
+    }
+
     private static func installZoomControls(in host: UIView, pdfView: PDFView) {
         guard let window = host.window,
               !window.subviews.contains(where: { $0.accessibilityIdentifier == "editor.test.zoomFactor" }) else { return }
         let viewID = ObjectIdentifier(pdfView)
-        zoomBaseScales[viewID] = max(pdfView.scaleFactor, 0.01)
-        nextZoomStep = 0
+        if zoomBaseScales[viewID] == nil {
+            zoomBaseScales[viewID] = max(pdfView.scaleFactor, 0.01)
+        }
         let button = UIButton(type: .system)
         button.frame = host.convert(
             CGRect(x: max(12, host.bounds.width - 120), y: 150, width: 108, height: 36),
@@ -497,6 +595,23 @@ enum EditorInteractionFixture {
 
     }
 
+    private static func installNavigationGestureProbe(in host: UIView, pdfView: PDFView) {
+        let identifier = "editor.test.pdfNavigation"
+        let probe: UIView
+        if let existing = host.subviews.first(where: { $0.accessibilityIdentifier == identifier }) {
+            probe = existing
+        } else {
+            probe = UIView()
+            probe.accessibilityIdentifier = identifier
+            probe.accessibilityLabel = "PDF navigation test surface"
+            probe.isAccessibilityElement = true
+            probe.isUserInteractionEnabled = false
+            probe.backgroundColor = .clear
+            host.addSubview(probe)
+        }
+        probe.frame = pdfView.convert(pdfView.bounds, to: host)
+    }
+
     private static func editMenuInteractionDescriptions(in root: UIView) -> [String] {
         func collect(_ view: UIView) -> [String] {
             let own = view.interactions.compactMap { interaction -> String? in
@@ -511,7 +626,7 @@ enum EditorInteractionFixture {
     static func makeDocument(using service: any JotFileServiceProtocol) throws -> JotFile.Info {
         runCoordinateTransformProbeIfRequested()
         let bounds = CGRect(x: 0, y: 0, width: 600, height: 800)
-        let pageCount = tool == "scribble-undo" ? 1 : (tool == "zoom-memory" ? 3 : 2)
+        let pageCount = tool == "scribble-undo" ? 1 : (tool == "zoom-memory" ? 3 : (tool == "scroll" ? 8 : 2))
         let sourcePDF: Data
         if tool == "zoom-memory" {
             let image = makeMemoryFixtureImage()

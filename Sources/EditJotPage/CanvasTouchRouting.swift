@@ -39,9 +39,7 @@ enum CanvasTouchRouting {
     }
 
     static func shouldSuppressNativeEditMenuInteractions(isEditing: Bool, tool: any PKTool) -> Bool {
-        // Jottre owns no UIEditMenuInteraction instances. PDFKit and
-        // PencilKit keep their native interactions for every tool.
-        false
+        isEditing && !(tool is PKLassoTool)
     }
 
     /// PencilKit owns Pencil input; PDFKit navigation accepts one direct touch
@@ -58,6 +56,19 @@ enum CanvasTouchRouting {
                 if originalPDFPanConfigurations.object(forKey: pan) == nil {
                     originalPDFPanConfigurations.setObject(OriginalPDFPanConfiguration(pan: pan), forKey: pan)
                 }
+#if DEBUG && targetEnvironment(simulator)
+                if EditorInteractionFixture.tool == "scribble-undo" {
+                    // This fixture maps XCTest's direct touch to PencilKit
+                    // input. Keep PDFKit and the editor fallback from claiming
+                    // that synthetic ink touch; production Pencil input remains
+                    // separate from direct-touch PDF navigation.
+                    let pencilTouch = [NSNumber(value: UITouch.TouchType.pencil.rawValue)]
+                    if pan.allowedTouchTypes != pencilTouch { pan.allowedTouchTypes = pencilTouch }
+                    if pan.minimumNumberOfTouches != 1 { pan.minimumNumberOfTouches = 1 }
+                    if pan.maximumNumberOfTouches < 2 { pan.maximumNumberOfTouches = 2 }
+                    continue
+                }
+#endif
                 let directTouch = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
                 if pan.allowedTouchTypes != directTouch { pan.allowedTouchTypes = directTouch }
                 if pan.minimumNumberOfTouches != 1 { pan.minimumNumberOfTouches = 1 }
