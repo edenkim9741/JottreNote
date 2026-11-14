@@ -355,7 +355,7 @@ enum EditorInteractionFixture {
                    canvasRect.minX, canvasRect.minY, canvasRect.width, canvasRect.height,
                    midX, pdfView.scaleFactor].allSatisfy(\.isFinite),
                 rect.width > 0, rect.height > 0 else { return nil }
-            var info: [String: Any] = [
+            let info: [String: Any] = [
                 "midX": midX,
                 "strokes": canvas.drawing.strokes.count,
                 "strokeSeeds": canvas.drawing.strokes.map(\.randomSeed),
@@ -442,9 +442,6 @@ enum EditorInteractionFixture {
                 "pdfEditMenuInteractions": pdfMenuInteractions,
                 "blankNoteFixture": tool == "blank-pen",
             ]
-#if DEBUG
-            info["geometryExperimentMode"] = JotPDFPageCanvasOverlay.geometryExperimentMode.rawValue
-#endif
             if let data = try? JSONSerialization.data(withJSONObject: info), let value = String(data: data, encoding: .utf8)
             {
                 return value
@@ -485,33 +482,6 @@ enum EditorInteractionFixture {
         }, for: .touchUpInside)
         window.addSubview(button)
 
-        let experimentButton = UIButton(type: .system)
-        experimentButton.frame = host.convert(
-            CGRect(x: max(12, host.bounds.width - 120), y: 194, width: 108, height: 36),
-            to: window
-        )
-        experimentButton.setTitle("Geometry mode", for: .normal)
-        experimentButton.backgroundColor = UIColor.systemBackground.withAlphaComponent(0.9)
-        experimentButton.accessibilityLabel = "Next canvas geometry experiment"
-        experimentButton.accessibilityIdentifier = "editor.test.geometryExperiment"
-        experimentButton.addAction(UIAction { _ in
-            Task { @MainActor in
-                let modes = JotCanvasGeometryExperimentMode.allCases
-                let next = (JotPDFPageCanvasOverlay.geometryExperimentMode.rawValue + 1) % modes.count
-                JotPDFPageCanvasOverlay.geometryExperimentMode = modes[next]
-                @MainActor func refresh(_ view: UIView) {
-                    if let overlay = view as? JotPDFPageCanvasOverlay {
-                        overlay.configure(in: pdfView, pdfScaleFactor: pdfView.scaleFactor)
-                        overlay.setNeedsLayout()
-                        overlay.layoutIfNeeded()
-                        return
-                    }
-                    for child in view.subviews { refresh(child) }
-                }
-                refresh(pdfView)
-            }
-        }, for: .touchUpInside)
-        window.addSubview(experimentButton)
     }
 
     private static func editMenuInteractionDescriptions(in root: UIView) -> [String] {

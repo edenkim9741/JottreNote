@@ -1,7 +1,8 @@
 import UIKit
 
-/// All display geometry is derived from page-local points. PDFKit supplies the
-/// outer transform; PencilKit supplies the native zoom in a normalized drawing.
+/// Display measurements are derived from page-local points. PDFKit owns
+/// document zoom; the overlay maps the normalized PKDrawing coordinate space
+/// into page coordinates while keeping the PencilKit viewport fixed in size.
 struct JotCanvasRenderGeometry: Equatable {
     let viewportSize: CGSize
     let canvasZoom: CGFloat

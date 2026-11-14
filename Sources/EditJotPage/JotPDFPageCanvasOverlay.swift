@@ -9,27 +9,8 @@ enum JotPDFPageRestorationPolicy {
     }
 }
 
-#if DEBUG
-enum JotCanvasGeometryExperimentMode: Int, CaseIterable {
-    case optimized
-    case manualContentSizeOnly
-    case manualContentOffsetOnly
-    case manualContentSizeAndOffset
-    case boundedViewport
-
-    var setsContentSize: Bool {
-        self == .manualContentSizeOnly || self == .manualContentSizeAndOffset
-    }
-
-    var resetsContentOffset: Bool {
-        self == .manualContentOffsetOnly || self == .manualContentSizeAndOffset
-    }
-}
-#endif
-
-/// PDFKit transforms this page container. PencilKit owns as much of the zoom as
-/// its scroll view supports. If that zoom range is reached, the viewport host
-/// supplies only the remaining scale while preserving the page-space geometry.
+/// PDFKit owns document zoom. This overlay keeps PKDrawing in page-local logical
+/// coordinates and maps it into a bounded PencilKit viewport once.
 @MainActor
 final class JotPDFPageCanvasOverlay: UIView {
     let canvas: PKCanvasView
@@ -46,8 +27,6 @@ final class JotPDFPageCanvasOverlay: UIView {
     private var appliedGeometry: JotCanvasRenderGeometry?
     private var lastMemorySampleZoomBucket: Int?
 #if DEBUG
-    static var geometryExperimentMode: JotCanvasGeometryExperimentMode = .optimized
-    private var appliedExperimentMode: JotCanvasGeometryExperimentMode = .optimized
     private var isPencilHoverActive = false
     private var hoverBaselineGeometry: [String: Any]?
     private var hoverLayoutCount = 0
@@ -207,67 +186,29 @@ final class JotPDFPageCanvasOverlay: UIView {
             displayScale: measuredDisplayScale(),
             screenScale: window?.screen.nativeScale ?? traitCollection.displayScale
         ) else { return }
+        // PKDrawing stays in its page-sized logical coordinate system. Keep
+        // the actual PencilKit view bounded to that same size at every PDF
+        // zoom; PDFKit owns document zoom and this host maps page coordinates
+        // into the overlay exactly once.
         let requestedZoom = geometry.canvasZoom
-        let useBoundedViewport: Bool
-#if DEBUG
-        // Compare a logical-page-sized canvas while preserving the same
-        // Drawing-to-page transform and effective render scale.
-        useBoundedViewport = Self.geometryExperimentMode == .boundedViewport
-#else
-        useBoundedViewport = false
-#endif
-        let nativeZoom = useBoundedViewport
-            ? 1
-            : min(requestedZoom, max(canvas.maximumZoomScale, canvas.minimumZoomScale))
-        let viewportSize = useBoundedViewport
-            ? drawingSize
-            : CGSize(
-                width: drawingSize.width * nativeZoom,
-                height: drawingSize.height * nativeZoom
-            )
+        let nativeZoom: CGFloat = 1
+        let viewportSize = drawingSize
         let pageToViewport = CGAffineTransform(
             scaleX: bounds.width / max(viewportSize.width, 1),
             y: bounds.height / max(viewportSize.height, 1)
         )
-        let renderScale = geometry.screenScale * max(1, requestedZoom / max(nativeZoom, 0.01))
-        let scaledContentSize = viewportSize
-#if DEBUG
-        let experimentMode = Self.geometryExperimentMode
-        let setsContentSize = !useBoundedViewport && experimentMode.setsContentSize
-        let resetsContentOffset = !useBoundedViewport && experimentMode.resetsContentOffset
-        let experimentChanged = experimentMode != appliedExperimentMode
-#else
-        let setsContentSize = false
-        let resetsContentOffset = false
-#endif
-        var geometryAlreadyApplied = geometry == appliedGeometry
-#if DEBUG
-        geometryAlreadyApplied = geometryAlreadyApplied && !experimentChanged
-#endif
-        geometryAlreadyApplied = geometryAlreadyApplied
+        let geometryAlreadyApplied = appliedGeometry != nil
             && canvas.bounds.size == viewportSize
+            && canvas.frame == CGRect(origin: .zero, size: viewportSize)
             && abs(canvas.zoomScale - nativeZoom) <= 0.0001
-            && (!setsContentSize || canvas.contentSize == scaledContentSize)
-            && (!resetsContentOffset || canvas.contentOffset == .zero)
             && viewportHost.bounds.size == viewportSize
+            && viewportHost.center == CGPoint(x: bounds.midX, y: bounds.midY)
             && viewportHost.transform == pageToViewport
-            && abs(canvas.contentScaleFactor - renderScale) <= 0.0001
         guard !geometryAlreadyApplied else { return }
 #if DEBUG
         if isPencilHoverActive { hoverGeometryReapplyCount += 1 }
 #endif
-        let isNewGeometry = geometry != appliedGeometry
         appliedGeometry = geometry
-#if DEBUG
-        appliedExperimentMode = experimentMode
-#endif
-        if abs(canvas.contentScaleFactor - renderScale) > 0.0001 {
-#if DEBUG
-            if isPencilHoverActive { hoverContentScaleSetCount += 1 }
-#endif
-            canvas.contentScaleFactor = renderScale
-            canvas.layer.contentsScale = renderScale
-        }
         let nextBounds = CGRect(origin: .zero, size: viewportSize)
         if viewportHost.bounds != nextBounds { viewportHost.bounds = nextBounds }
         let nextCenter = CGPoint(x: bounds.midX, y: bounds.midY)
@@ -276,35 +217,22 @@ final class JotPDFPageCanvasOverlay: UIView {
         // Keep the PKCanvasView itself untransformed. Its frame and bounds
         // must both describe the real display viewport used by its tiler.
         if canvas.frame != nextBounds { canvas.frame = nextBounds }
-        if canvas.minimumZoomScale != min(0.01, nativeZoom) { canvas.minimumZoomScale = min(0.01, nativeZoom) }
-        // Establish the target content extent before applying the zoom. PKCanvasView
-        // may recalculate its own zoom state when its content size changes.
-        if setsContentSize, canvas.contentSize != scaledContentSize {
-#if DEBUG
-            if isPencilHoverActive { hoverContentSizeSetCount += 1 }
-#endif
-            canvas.contentSize = scaledContentSize
-        }
+        if canvas.minimumZoomScale != nativeZoom { canvas.minimumZoomScale = nativeZoom }
+        if canvas.maximumZoomScale != nativeZoom { canvas.maximumZoomScale = nativeZoom }
         if abs(canvas.zoomScale - nativeZoom) > 0.0001 {
 #if DEBUG
             if isPencilHoverActive { hoverZoomSetCount += 1 }
 #endif
             canvas.setZoomScale(nativeZoom, animated: false)
         }
-        if resetsContentOffset, canvas.contentOffset != .zero {
-#if DEBUG
-            if isPencilHoverActive { hoverContentOffsetSetCount += 1 }
-#endif
-            canvas.contentOffset = .zero
-        }
         recordGeometryMilestoneIfNeeded(
-            requestedZoom: requestedZoom,
+            requestedZoom: geometry.canvasZoom,
             nativeZoom: nativeZoom,
-            renderScale: renderScale,
+            renderScale: geometry.screenScale,
             viewportTransform: pageToViewport
         )
         #if DEBUG
-        if isNewGeometry {
+        if appliedGeometry == geometry {
             let details: [String: Any] = [
                 "requestedCanvasZoom": requestedZoom,
                 "nativeCanvasZoom": nativeZoom,
@@ -318,9 +246,6 @@ final class JotPDFPageCanvasOverlay: UIView {
                 "overlayBounds": [bounds.width, bounds.height]
             ]
             JottreDiagnostics.shared.record("zoom.geometryUpdated", details: details)
-            if abs(requestedZoom - nativeZoom) > 0.0001 {
-                JottreDiagnostics.shared.record("zoom.geometryMismatch", details: details)
-            }
         }
         #endif
         // Setting a UIScrollView zoom range can lazily create or re-enable its
