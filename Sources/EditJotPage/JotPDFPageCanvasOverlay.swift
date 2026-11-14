@@ -54,6 +54,8 @@ final class JotPDFPageCanvasOverlay: UIView {
     private var didLogFirstHoverGeometryChange = false
     private var didLogUnchangedGeometryDuringHover = false
     private var lastLoggedCoordinateError: Double?
+    private var didLogInvalidDrawingBounds = false
+    private var lastLassoDrawingState: (boundsState: String, strokeCount: Int)?
     private var lastHoverPoint: CGPoint?
     private var isPencilHoverActive = false
     private var hoverBaselineGeometry: [String: Any]?
@@ -180,6 +182,21 @@ final class JotPDFPageCanvasOverlay: UIView {
         details["timestamp"] = Date().timeIntervalSince1970
         details["sequence"] = JotCanvasGeometryDiagnosticSequence.next()
         JottreDiagnostics.shared.record(eventName, details: details)
+        let boundsState = details["canvasDrawingBoundsState"] as? String ?? "unknown"
+        let strokeCount = details["drawingStrokeCount"] as? Int ?? 0
+        if strokeCount > 0, boundsState != "finite" {
+            if !didLogInvalidDrawingBounds {
+                didLogInvalidDrawingBounds = true
+                JottreDiagnostics.shared.record("canvas.drawingBounds.invalid", details: [
+                    "sourceEvent": eventName,
+                    "boundsState": boundsState,
+                    "strokeCount": strokeCount,
+                    "canvasDrawingBounds": details["canvasDrawingBounds"] ?? NSNull()
+                ])
+            }
+        } else {
+            didLogInvalidDrawingBounds = false
+        }
         guard includeCoordinateProbes,
               let probes = details["coordinateProbes"] as? [[String: Any]] else { return }
         let maximumError = probes.compactMap { $0["errorDistance"] as? Double }
@@ -194,6 +211,19 @@ final class JotPDFPageCanvasOverlay: UIView {
                 "comparedEvent": eventName
             ])
         }
+    }
+
+    func recordLassoDrawingStateIfChanged() {
+        let drawing = canvas.drawing
+        let sample = (Self.drawingBoundsState(drawing.bounds), drawing.strokes.count)
+        guard lastLassoDrawingState?.boundsState != sample.0
+                || lastLassoDrawingState?.strokeCount != sample.1 else { return }
+        lastLassoDrawingState = sample
+        recordGeometryDiagnostic("lasso.drawingStateChanged", extra: [
+            "canvasDrawingBounds": Self.diagnosticDrawingBounds(drawing.bounds),
+            "canvasDrawingBoundsState": sample.0,
+            "drawingStrokeCount": sample.1
+        ])
     }
 
     private func installGeometryDiagnosticObservations() {
@@ -309,6 +339,21 @@ final class JotPDFPageCanvasOverlay: UIView {
     private static func transformComponents(_ transform: CGAffineTransform) -> [Double] {
         [Double(transform.a), Double(transform.b), Double(transform.c), Double(transform.d),
          Double(transform.tx), Double(transform.ty)]
+    }
+
+    private static func drawingBoundsState(_ bounds: CGRect) -> String {
+        if bounds.isNull { return "null" }
+        if bounds.isInfinite { return "infinite" }
+        let components = [bounds.origin.x, bounds.origin.y, bounds.size.width, bounds.size.height,
+                          bounds.maxX, bounds.maxY]
+        guard components.allSatisfy(\.isFinite) else { return "nonFinite" }
+        return bounds.isEmpty ? "empty" : "finite"
+    }
+
+    private static func diagnosticDrawingBounds(_ bounds: CGRect) -> Any {
+        let state = drawingBoundsState(bounds)
+        guard state == "finite" || state == "empty" else { return NSNull() }
+        return rectComponents(bounds)
     }
 #endif
 
@@ -772,7 +817,7 @@ final class JotPDFPageCanvasOverlay: UIView {
                 return [pagePoint.x, pagePoint.y]
             }
         }
-        return [
+        var details: [String: Any] = [
             "pageIndex": diagnosticsPageIndex as Any? ?? NSNull(),
             "pageRotation": diagnosticsPageRotation,
             "cropBox": [diagnosticsCropBox.minX, diagnosticsCropBox.minY,
@@ -831,8 +876,8 @@ final class JotPDFPageCanvasOverlay: UIView {
             } ?? [],
             "strokeCount": drawing.strokes.count,
             "pointCount": pointCount,
-            "drawingBounds": [drawing.bounds.minX, drawing.bounds.minY,
-                              drawing.bounds.width, drawing.bounds.height],
+            "drawingBounds": Self.diagnosticDrawingBounds(drawing.bounds),
+            "drawingBoundsState": Self.drawingBoundsState(drawing.bounds),
             "strokeStructureFingerprint": strokeStructureFingerprint,
             "drawingContentIdentity": strokeStructureFingerprint,
             "drawingContentIdentityCoverage": "stroke seeds, path counts, transforms, render bounds, first and last path points; not a full byte-for-byte drawing hash",
@@ -845,6 +890,9 @@ final class JotPDFPageCanvasOverlay: UIView {
             "activeOverlayCount": diagnosticsActiveOverlayCount,
             "physicalFootprintBytes": JottreDiagnostics.currentFootprintBytesForTesting() ?? 0
         ]
+        details["canvasDrawingBounds"] = Self.diagnosticDrawingBounds(drawing.bounds)
+        details["canvasDrawingBoundsState"] = Self.drawingBoundsState(drawing.bounds)
+        return details
     }
 
     private func changedKeys(_ keys: [String], before: [String: Any], after: [String: Any]) -> [String] {
@@ -898,7 +946,8 @@ final class JotPDFPageCanvasOverlay: UIView {
             "overlayFrame": Self.rectComponents(frame),
             "overlayBounds": Self.rectComponents(bounds),
             "overlayTransform": Self.transformComponents(transform),
-            "canvasDrawingBounds": Self.rectComponents(drawing.bounds),
+            "canvasDrawingBounds": Self.diagnosticDrawingBounds(drawing.bounds),
+            "canvasDrawingBoundsState": Self.drawingBoundsState(drawing.bounds),
             "drawingStrokeCount": drawing.strokes.count,
             "overlayIdentity": String(describing: ObjectIdentifier(self)),
             "canvasIdentity": String(describing: ObjectIdentifier(canvas)),

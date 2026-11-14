@@ -341,7 +341,19 @@ enum EditorInteractionFixture {
             let canvasArea = max(canvas.bounds.width * canvas.bounds.height, 1)
             let rawVisibleCanvasAreaRatio = max(0, visibleCanvasRect.width * visibleCanvasRect.height) / canvasArea
             let visibleCanvasAreaRatio = rawVisibleCanvasAreaRatio.isFinite ? rawVisibleCanvasAreaRatio : 0
-            let midX = canvas.drawing.strokes.isEmpty ? 0 : canvas.drawing.bounds.midX
+            let drawingBounds = canvas.drawing.bounds
+            let drawingBoundsState: String
+            if drawingBounds.isNull {
+                drawingBoundsState = "null"
+            } else if drawingBounds.isInfinite {
+                drawingBoundsState = "infinite"
+            } else if [drawingBounds.minX, drawingBounds.minY, drawingBounds.width,
+                       drawingBounds.height, drawingBounds.maxX, drawingBounds.maxY].allSatisfy(\.isFinite) {
+                drawingBoundsState = drawingBounds.isEmpty ? "empty" : "finite"
+            } else {
+                drawingBoundsState = "nonFinite"
+            }
+            let midX = drawingBoundsState == "finite" ? drawingBounds.midX : 0
             let toolName: String
             if canvas.tool is PKLassoTool {
                 toolName = "lasso"
@@ -358,6 +370,7 @@ enum EditorInteractionFixture {
             let info: [String: Any] = [
                 "midX": midX,
                 "strokes": canvas.drawing.strokes.count,
+                "drawingBoundsState": drawingBoundsState,
                 "strokeSeeds": canvas.drawing.strokes.map(\.randomSeed),
                 "committedStrokeSeeds": synchronizedDrawings?.committed.strokes.map(\.randomSeed) ?? [],
                 "viewModelStrokeSeeds": synchronizedDrawings?.model.strokes.map(\.randomSeed) ?? [],

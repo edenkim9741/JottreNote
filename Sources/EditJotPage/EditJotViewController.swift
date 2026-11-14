@@ -1605,6 +1605,9 @@ extension EditJotViewController: PKCanvasViewDelegate {
             guard !isApplyingOverlayDrawing else { return }
 #if DEBUG
             let callbackStarted = ProcessInfo.processInfo.systemUptime
+            if canvasView.tool is PKLassoTool {
+                pageOverlays[pageIndex]?.recordLassoDrawingStateIfChanged()
+            }
             EditorInteractionFixture.recordDrawingChangeCallback()
             guard EditorInteractionFixture.drawingPipelineEnabled else {
                 JottreDiagnostics.shared.recordDrawingPipelineMetrics([
@@ -1691,6 +1694,11 @@ extension EditJotViewController: PKCanvasViewDelegate {
                         "strokeCountAtTouchStart": canvas.diagnosticStrokeCountAtTouchStart
                     ]
                 )
+                if canvas.tool is PKLassoTool {
+                    pageOverlays[index]?.recordGeometryDiagnostic("lasso.toolContactStarted", extra: [
+                        "selectionLifecycleObservable": false
+                    ])
+                }
                 EditorInteractionFixture.beginDrawingPipelineStroke()
                 publishInteractionFixture(canvas: canvas, pageIndex: index)
                 recordCanvasTouchStart(canvas, pageIndex: index)
@@ -1734,9 +1742,17 @@ extension EditJotViewController: PKCanvasViewDelegate {
                         } ?? []
                     ]
                 )
+                if canvas.tool is PKLassoTool {
+                    pageOverlays[pageIndex]?.recordGeometryDiagnostic("lasso.toolContactEnded", extra: [
+                        "selectionLifecycleObservable": false
+                    ])
+                }
                 recordCommittedCanvasStroke(canvas, pageIndex: pageIndex)
             }
 #endif
+            if canvas.tool is PKLassoTool {
+                gestureCoordinator.refreshPDFScrollRoutingAfterCanvasContact()
+            }
             debugScribbleUndoState(
                 "tool stroke ended",
                 pageIndex: pageIndex,
