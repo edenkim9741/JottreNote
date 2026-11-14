@@ -155,6 +155,9 @@ struct ZoteroItem: Codable, Sendable, Hashable, Identifiable {
 }
 
 struct ZoteroAttachment: Codable, Sendable, Hashable, Identifiable {
+    /// Stable local identity. Remote Zotero keys may change when an offline
+    /// draft is promoted, while local files and editor references must not.
+    var localDocumentID: String
     var key: String
     var parentItemKey: String?
     let contentType: String
@@ -178,10 +181,10 @@ struct ZoteroAttachment: Codable, Sendable, Hashable, Identifiable {
     var conflictDiagnosticID: String?
     var conflictResolutionParentItemKey: String?
     var conflictResolutionAttachmentKey: String?
-    var id: String { key }
+    var id: String { localDocumentID }
 
     private enum CodingKeys: String, CodingKey {
-        case key, parentItemKey, contentType, filename, localCachePath, syncStatus, version
+        case localDocumentID, key, parentItemKey, contentType, filename, localCachePath, syncStatus, version
         case md5, modificationTimeMilliseconds, remoteMD5, remoteMD5IsPDF, verificationRemoteMD5
         case verificationRemoteMD5WasChecked, isPendingSync, syncError, isLocalOnly
         case isConflict, conflictLocalPath, conflictCreatedAt, conflictOriginalKey
@@ -200,8 +203,10 @@ struct ZoteroAttachment: Codable, Sendable, Hashable, Identifiable {
         conflictCreatedAt: Date? = nil, conflictOriginalKey: String? = nil,
         conflictDiagnosticID: String? = nil,
         conflictResolutionParentItemKey: String? = nil,
-        conflictResolutionAttachmentKey: String? = nil
+        conflictResolutionAttachmentKey: String? = nil,
+        localDocumentID: String = UUID().uuidString
     ) {
+        self.localDocumentID = localDocumentID
         self.key = key
         self.parentItemKey = parentItemKey
         self.contentType = contentType
@@ -254,7 +259,11 @@ struct ZoteroAttachment: Codable, Sendable, Hashable, Identifiable {
             conflictOriginalKey: try values.decodeIfPresent(String.self, forKey: .conflictOriginalKey),
             conflictDiagnosticID: try values.decodeIfPresent(String.self, forKey: .conflictDiagnosticID),
             conflictResolutionParentItemKey: try values.decodeIfPresent(String.self, forKey: .conflictResolutionParentItemKey),
-            conflictResolutionAttachmentKey: try values.decodeIfPresent(String.self, forKey: .conflictResolutionAttachmentKey)
+            conflictResolutionAttachmentKey: try values.decodeIfPresent(String.self, forKey: .conflictResolutionAttachmentKey),
+            // Deterministic migration for pre-ID cache snapshots. Re-encoding
+            // persists this value without moving any existing file.
+            localDocumentID: try values.decodeIfPresent(String.self, forKey: .localDocumentID)
+                ?? "legacy-" + (try values.decode(String.self, forKey: .key))
         )
     }
 }
@@ -358,6 +367,17 @@ struct ZoteroCollectionSnapshot: Sendable {
 /// atomically so the sidebar never sees a partially applied API delta.
 final class ZoteroCacheStore: @unchecked Sendable {
 
+    private struct DraftTransactionManifest: Codable {
+        let userID: String
+        let item: ZoteroItem
+        let attachment: ZoteroAttachment
+        let libraryVersion: Int
+        let temporaryPDFPath: String
+        let finalPDFPath: String
+        let temporaryJotPath: String
+        let finalJotPath: String
+    }
+
     private let rootDirectory: URL
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
@@ -377,6 +397,7 @@ final class ZoteroCacheStore: @unchecked Sendable {
 
     func load(userID: String) -> ZoteroCacheSnapshot {
         withCacheAccess {
+            recoverDraftTransactionsUnlocked(userID: userID)
             guard let data = try? Data(contentsOf: url(for: userID)),
                   var snapshot = try? decoder.decode(ZoteroCacheSnapshot.self, from: data),
                   snapshot.userID == userID else {
@@ -1086,7 +1107,7 @@ final class ZoteroCacheStore: @unchecked Sendable {
             if let path = attachment.localCachePath, !path.isEmpty {
                 fileURL = URL(fileURLWithPath: path)
             } else {
-                fileURL = defaultPDFCacheURL(for: key)
+                fileURL = defaultPDFCacheURL(for: attachment.localDocumentID)
                 attachment.localCachePath = fileURL.path
             }
             try FileManager.default.createDirectory(
@@ -1095,9 +1116,12 @@ final class ZoteroCacheStore: @unchecked Sendable {
             )
             try data.write(to: fileURL, options: .atomic)
             attachment.syncStatus = .dirty
+            let preparationFailed = attachment.syncError?.hasPrefix("localPDFPreparation:") == true
+            attachment.syncError = nil
             attachment.md5 = ZoteroSyncService.md5Hex(data)
             attachment.modificationTimeMilliseconds = Int64((Date().timeIntervalSince1970 * 1_000).rounded())
             snapshot.attachments[canonicalKey] = attachment
+            if preparationFailed { clearParentSyncError(for: attachment, snapshot: &snapshot) }
             try saveUnlocked(snapshot)
             return fileURL
         }
@@ -1156,16 +1180,59 @@ final class ZoteroCacheStore: @unchecked Sendable {
         attachment: ZoteroAttachment,
         hybridPDF: Data,
         libraryVersion: Int,
-        userID: String
+        userID: String,
+        localJotData: Data? = nil,
+        localJotURL: URL? = nil
     ) throws -> URL {
         try withCacheAccess {
             var snapshot = loadUnlocked(userID: userID)
-            let fileURL = defaultPDFCacheURL(for: attachment.key)
+            let fileURL = defaultPDFCacheURL(for: attachment.localDocumentID)
             try FileManager.default.createDirectory(
                 at: fileURL.deletingLastPathComponent(),
                 withIntermediateDirectories: true
             )
-            try hybridPDF.write(to: fileURL, options: .atomic)
+            guard Self.isValidPDFAttachment(hybridPDF) else {
+                throw Failure.invalidLocalAttachmentFile
+            }
+            var transactionManifestURL: URL?
+            if let localJotData, let localJotURL {
+                let transactionID = UUID().uuidString
+                let transactionDirectory = draftTransactionsDirectory
+                    .appendingPathComponent(transactionID, isDirectory: true)
+                try FileManager.default.createDirectory(at: transactionDirectory, withIntermediateDirectories: true)
+                let temporaryPDF = transactionDirectory.appendingPathComponent("attachment.pdf")
+                let temporaryJot = transactionDirectory.appendingPathComponent("document.jot")
+                try hybridPDF.write(to: temporaryPDF, options: .atomic)
+                try localJotData.write(to: temporaryJot, options: .atomic)
+                guard Self.isValidPDFAttachment(try Data(contentsOf: temporaryPDF)),
+                      (try? PropertyListDecoder().decode(Jot.self, from: Data(contentsOf: temporaryJot))) != nil else {
+                    throw Failure.invalidLocalAttachmentFile
+                }
+                try FileManager.default.createDirectory(
+                    at: localJotURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                let manifestURL = transactionDirectory.appendingPathComponent("manifest.json")
+                let manifest = DraftTransactionManifest(
+                    userID: userID,
+                    item: item,
+                    attachment: attachment,
+                    libraryVersion: libraryVersion,
+                    temporaryPDFPath: temporaryPDF.path,
+                    finalPDFPath: fileURL.path,
+                    temporaryJotPath: temporaryJot.path,
+                    finalJotPath: localJotURL.path
+                )
+                try JSONEncoder().encode(manifest).write(to: manifestURL, options: .atomic)
+                transactionManifestURL = manifestURL
+                try installTransactionFile(from: temporaryPDF, to: fileURL)
+                try installTransactionFile(from: temporaryJot, to: localJotURL)
+            } else {
+                try hybridPDF.write(to: fileURL, options: .atomic)
+            }
+            guard isUsableLocalCacheFile(at: fileURL) else {
+                throw Failure.invalidLocalAttachmentFile
+            }
 
             var localAttachment = attachment
             localAttachment.localCachePath = fileURL.path
@@ -1191,6 +1258,9 @@ final class ZoteroCacheStore: @unchecked Sendable {
             snapshot.lastLibraryVersion = max(snapshot.lastLibraryVersion, libraryVersion)
             snapshot.lastSyncedAt = Date()
             try saveUnlocked(snapshot)
+            if let transactionManifestURL {
+                try? FileManager.default.removeItem(at: transactionManifestURL.deletingLastPathComponent())
+            }
             return fileURL
         }
     }
@@ -1199,7 +1269,9 @@ final class ZoteroCacheStore: @unchecked Sendable {
         item: ZoteroItem,
         attachment: ZoteroAttachment,
         hybridPDF: Data,
-        userID: String
+        userID: String,
+        localJotData: Data? = nil,
+        localJotURL: URL? = nil
     ) throws -> URL {
         guard item.isPendingSync, attachment.isPendingSync else { throw Failure.invalidPendingDraft }
         return try registerCreatedDocument(
@@ -1207,7 +1279,9 @@ final class ZoteroCacheStore: @unchecked Sendable {
             attachment: attachment,
             hybridPDF: hybridPDF,
             libraryVersion: load(userID: userID).lastLibraryVersion,
-            userID: userID
+            userID: userID,
+            localJotData: localJotData,
+            localJotURL: localJotURL
         )
     }
 
@@ -1215,7 +1289,9 @@ final class ZoteroCacheStore: @unchecked Sendable {
         parentItem: ZoteroItem,
         attachment: ZoteroAttachment,
         hybridPDF: Data,
-        userID: String
+        userID: String,
+        localJotData: Data? = nil,
+        localJotURL: URL? = nil
     ) throws -> URL {
         guard !parentItem.isPendingSync,
               attachment.isPendingSync,
@@ -1227,7 +1303,9 @@ final class ZoteroCacheStore: @unchecked Sendable {
             attachment: attachment,
             hybridPDF: hybridPDF,
             libraryVersion: load(userID: userID).lastLibraryVersion,
-            userID: userID
+            userID: userID,
+            localJotData: localJotData,
+            localJotURL: localJotURL
         )
     }
 
@@ -1257,33 +1335,9 @@ final class ZoteroCacheStore: @unchecked Sendable {
                   oldItem.isPendingSync, oldAttachment.isPendingSync else {
                 throw Failure.pendingDraftNotFound
             }
-            let oldPath = oldAttachment.localCachePath.map(URL.init(fileURLWithPath:))
-            let newPath = defaultPDFCacheURL(for: created.attachmentKey)
-            if let oldPath, FileManager.default.fileExists(atPath: oldPath.path) {
-                try FileManager.default.createDirectory(
-                    at: newPath.deletingLastPathComponent(),
-                    withIntermediateDirectories: true
-                )
-                if oldPath.path != newPath.path {
-                    if FileManager.default.fileExists(atPath: newPath.path) {
-                        _ = try FileManager.default.replaceItemAt(newPath, withItemAt: oldPath)
-                    } else {
-                        try FileManager.default.copyItem(at: oldPath, to: newPath)
-                    }
-                }
-                if let data = try? Data(contentsOf: newPath),
-                   let loaded = try? HybridPDFManager.load(data: data) {
-                    var remappedJot = loaded.jot
-                    remappedJot.zoteroItemKey = created.attachmentKey
-                    remappedJot.zoteroFileName = oldAttachment.filename
-                    let jotData = try JotHybridPDFBuilder.encodedJotData(remappedJot)
-                    let remapped = try HybridPDFManager.embedJotPreservingSourcePDF(
-                        pdfData: loaded.pdfData,
-                        jotData: jotData
-                    )
-                    try remapped.write(to: newPath, options: .atomic)
-                    oldAttachment.md5 = ZoteroSyncService.md5Hex(remapped)
-                }
+            guard let localPath = oldAttachment.localCachePath,
+                  isUsableLocalCacheFile(at: URL(fileURLWithPath: localPath)) else {
+                throw Failure.invalidLocalAttachmentFile
             }
             snapshot.items.removeValue(forKey: temporaryParentKey)
             snapshot.items.removeValue(forKey: temporaryAttachmentKey)
@@ -1308,7 +1362,9 @@ final class ZoteroCacheStore: @unchecked Sendable {
             )
             oldAttachment.key = created.attachmentKey
             oldAttachment.parentItemKey = created.parentItemKey
-            oldAttachment.localCachePath = newPath.path
+            // Keep the local path unchanged when the remote key is promoted.
+            // Existing editor URLs and recovery references remain valid.
+            oldAttachment.localCachePath = localPath
             oldAttachment.version = version
             oldAttachment.isPendingSync = false
             oldAttachment.syncError = nil
@@ -1332,9 +1388,6 @@ final class ZoteroCacheStore: @unchecked Sendable {
             snapshot.attachments[created.attachmentKey] = oldAttachment
             snapshot.lastLibraryVersion = max(snapshot.lastLibraryVersion, version)
             try saveUnlocked(snapshot)
-            if let oldPath, oldPath.path != newPath.path {
-                try? FileManager.default.removeItem(at: oldPath)
-            }
         }
     }
 
@@ -1353,18 +1406,11 @@ final class ZoteroCacheStore: @unchecked Sendable {
                   !parent.isPendingSync else {
                 throw Failure.pendingDraftNotFound
             }
-            let oldPath = attachment.localCachePath.map(URL.init(fileURLWithPath:))
-            let newPath = defaultPDFCacheURL(for: createdAttachmentKey)
-            if let oldPath, oldPath.path != newPath.path,
-               FileManager.default.fileExists(atPath: oldPath.path) {
-                try FileManager.default.createDirectory(
-                    at: newPath.deletingLastPathComponent(),
-                    withIntermediateDirectories: true
-                )
-                try FileManager.default.copyItem(at: oldPath, to: newPath)
-            }
-            guard FileManager.default.fileExists(atPath: newPath.path),
-                  let loaded = try? HybridPDFManager.load(data: Data(contentsOf: newPath)) else {
+            let localPath = attachment.localCachePath
+                ?? defaultPDFCacheURL(for: attachment.localDocumentID).path
+            let localURL = URL(fileURLWithPath: localPath)
+            guard FileManager.default.fileExists(atPath: localURL.path),
+                  let loaded = try? HybridPDFManager.load(data: Data(contentsOf: localURL)) else {
                 throw Failure.invalidLocalAttachmentFile
             }
             var remappedJot = loaded.jot
@@ -1375,7 +1421,7 @@ final class ZoteroCacheStore: @unchecked Sendable {
                 pdfData: loaded.pdfData,
                 jotData: jotData
             )
-            try remapped.write(to: newPath, options: .atomic)
+            try remapped.write(to: localURL, options: .atomic)
 
             snapshot.items.removeValue(forKey: temporaryAttachmentKey)
             snapshot.attachments.removeValue(forKey: temporaryAttachmentKey)
@@ -1384,7 +1430,7 @@ final class ZoteroCacheStore: @unchecked Sendable {
             }
             attachment.key = createdAttachmentKey
             attachment.parentItemKey = parentKey
-            attachment.localCachePath = newPath.path
+            attachment.localCachePath = localURL.path
             attachment.version = version
             attachment.md5 = ZoteroSyncService.md5Hex(remapped)
             attachment.remoteMD5 = nil
@@ -1410,9 +1456,6 @@ final class ZoteroCacheStore: @unchecked Sendable {
             snapshot.attachments[createdAttachmentKey] = attachment
             snapshot.lastLibraryVersion = max(snapshot.lastLibraryVersion, version)
             try saveUnlocked(snapshot)
-            if let oldPath, oldPath.path != newPath.path {
-                try? FileManager.default.removeItem(at: oldPath)
-            }
         }
     }
 
@@ -1434,6 +1477,25 @@ final class ZoteroCacheStore: @unchecked Sendable {
             snapshot.attachments[key] = attachment
             if let parentKey = attachment.parentItemKey, var item = snapshot.items[parentKey] {
                 item.syncError = message
+                snapshot.items[parentKey] = item
+            }
+            try saveUnlocked(snapshot)
+        }
+    }
+
+    /// Keeps an editor save locally successful while making sure a stale PDF
+    /// cache can never be reported as synchronized. Upload code recognizes this
+    /// marker and rebuilds the upload payload from the authoritative .jot.
+    func recordLocalPDFPreparationFailure(key: String, message: String, userID: String) throws {
+        try withCacheAccess {
+            var snapshot = loadUnlocked(userID: userID)
+            let canonicalKey = snapshot.keyAliases[key] ?? key
+            guard var attachment = snapshot.attachments[canonicalKey] else { throw Failure.attachmentNotFound }
+            attachment.syncStatus = .dirty
+            attachment.syncError = "localPDFPreparation: \(message)"
+            snapshot.attachments[canonicalKey] = attachment
+            if let parentKey = attachment.parentItemKey, var item = snapshot.items[parentKey] {
+                item.syncError = attachment.syncError
                 snapshot.items[parentKey] = item
             }
             try saveUnlocked(snapshot)
@@ -2043,6 +2105,82 @@ final class ZoteroCacheStore: @unchecked Sendable {
     private func saveUnlocked(_ snapshot: ZoteroCacheSnapshot) throws {
         try FileManager.default.createDirectory(at: rootDirectory, withIntermediateDirectories: true)
         try encoder.encode(snapshot).write(to: url(for: snapshot.userID), options: .atomic)
+    }
+
+    private var draftTransactionsDirectory: URL {
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        return support.appendingPathComponent("ZoteroDraftTransactions", isDirectory: true)
+    }
+
+    private func installTransactionFile(from temporaryURL: URL, to finalURL: URL) throws {
+        try FileManager.default.createDirectory(
+            at: finalURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        if FileManager.default.fileExists(atPath: finalURL.path) { return }
+        try FileManager.default.moveItem(at: temporaryURL, to: finalURL)
+    }
+
+    /// Completes interrupted offline-document commits before the library reads
+    /// its snapshot. A manifest is retained until both files and metadata are
+    /// valid, so a crash never makes a locally written draft disappear.
+    private func recoverDraftTransactionsUnlocked(userID: String) {
+        guard let transactionFolders = try? FileManager.default.contentsOfDirectory(
+            at: draftTransactionsDirectory,
+            includingPropertiesForKeys: [.isDirectoryKey]
+        ) else { return }
+        for folder in transactionFolders {
+            let manifestURL = folder.appendingPathComponent("manifest.json")
+            guard let manifestData = try? Data(contentsOf: manifestURL),
+                  let manifest = try? JSONDecoder().decode(DraftTransactionManifest.self, from: manifestData),
+                  manifest.userID == userID else { continue }
+            let pdfURL = URL(fileURLWithPath: manifest.finalPDFPath)
+            let jotURL = URL(fileURLWithPath: manifest.finalJotPath)
+            do {
+                try installTransactionFile(
+                    from: URL(fileURLWithPath: manifest.temporaryPDFPath),
+                    to: pdfURL
+                )
+                try installTransactionFile(
+                    from: URL(fileURLWithPath: manifest.temporaryJotPath),
+                    to: jotURL
+                )
+                guard let pdfData = try? Data(contentsOf: pdfURL),
+                      Self.isValidPDFAttachment(pdfData),
+                      let jotData = try? Data(contentsOf: jotURL),
+                      (try? PropertyListDecoder().decode(Jot.self, from: jotData)) != nil else { continue }
+                var snapshot = loadUnlocked(userID: userID)
+                if snapshot.attachments[manifest.attachment.key] == nil {
+                    var attachment = manifest.attachment
+                    attachment.localCachePath = pdfURL.path
+                    attachment.syncStatus = .dirty
+                    attachment.isPendingSync = manifest.item.isPendingSync || attachment.isPendingSync
+                    attachment.md5 = ZoteroSyncService.md5Hex(pdfData)
+                    snapshot.items[manifest.item.key] = manifest.item
+                    snapshot.items[attachment.key] = ZoteroItem(
+                        key: attachment.key,
+                        title: attachment.filename,
+                        creators: [],
+                        year: nil,
+                        parentItemKey: attachment.parentItemKey,
+                        collectionKeys: [],
+                        itemType: "attachment",
+                        dateAdded: manifest.item.dateAdded,
+                        dateModified: manifest.item.dateModified,
+                        version: attachment.version,
+                        isTrashed: false
+                    )
+                    snapshot.attachments[attachment.key] = attachment
+                    snapshot.lastLibraryVersion = max(snapshot.lastLibraryVersion, manifest.libraryVersion)
+                    snapshot.lastSyncedAt = Date()
+                }
+                try saveUnlocked(snapshot)
+                try FileManager.default.removeItem(at: folder)
+            } catch {
+                // Keep both manifest and surviving files for the next launch.
+                continue
+            }
+        }
     }
 
     private func url(for userID: String) -> URL {

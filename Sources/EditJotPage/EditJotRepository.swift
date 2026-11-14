@@ -244,17 +244,34 @@ struct EditJotRepository: EditJotRepositoryProtocol {
         if let key = content.zoteroItemKey,
            let userID = defaultsService.getValue(DefaultsKey<String>.zoteroUserID),
            !userID.isEmpty {
-            let hybridPDF = try savedPDF ?? JotHybridPDFBuilder.buildHybridPDF(
-                jot: jotFile.jot,
-                dirtyPageIndices: content.dirtyPageIndices
-            )
-            let cacheURL = try zoteroCacheStore.saveEditedPDF(
-                key: key,
-                data: hybridPDF,
-                userID: userID
-            )
-            print("[ZoteroSave] Successfully saved hybrid PDF to cache: \(cacheURL.path), bytes: \(hybridPDF.count)")
-            NotificationCenter.default.post(name: .zoteroAttachmentCacheChanged, object: key)
+            do {
+                let hybridPDF = try savedPDF ?? JotHybridPDFBuilder.buildHybridPDF(
+                    jot: jotFile.jot,
+                    dirtyPageIndices: content.dirtyPageIndices
+                )
+                let cacheURL = try zoteroCacheStore.saveEditedPDF(
+                    key: key,
+                    data: hybridPDF,
+                    userID: userID
+                )
+                print("[ZoteroSave] Successfully saved hybrid PDF to cache: \(cacheURL.path), bytes: \(hybridPDF.count)")
+                NotificationCenter.default.post(name: .zoteroAttachmentCacheChanged, object: key)
+            } catch {
+                // The .jot is the local commit point. Record that sync payload
+                // preparation must be retried, but do not report local save as
+                // failed or allow an older cache to be marked clean.
+                try? zoteroCacheStore.recordLocalPDFPreparationFailure(
+                    key: key,
+                    message: error.localizedDescription,
+                    userID: userID
+                )
+                JottreDiagnostics.shared.record("zotero.localPDFPreparation.failed", details: [
+                    "attachmentID": String(ZoteroSyncService.md5Hex(Data(key.utf8)).prefix(12)),
+                    "errorDomain": (error as NSError).domain,
+                    "errorCode": (error as NSError).code
+                ])
+                NotificationCenter.default.post(name: .zoteroAttachmentCacheChanged, object: key)
+            }
         }
     }
 

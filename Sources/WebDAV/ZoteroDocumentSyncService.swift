@@ -62,7 +62,7 @@ struct ZoteroDocumentSyncService: Sendable {
         conflictResolution: String?
     ) async -> String? {
         let key = canonicalKey
-        let attachment = cacheStore.load(userID: userID).attachments[canonicalKey]
+        var attachment = cacheStore.load(userID: userID).attachments[canonicalKey]
         if attachment?.isLocalOnly == true || attachment?.isConflict == true {
             print("[ZoteroUpload] Skipped \(key): local-only or conflict attachment.")
             return nil
@@ -72,6 +72,21 @@ struct ZoteroDocumentSyncService: Sendable {
             return nil
         }
         guard attachment?.syncStatus == .dirty else { return nil }
+        if attachment?.syncError?.hasPrefix("localPDFPreparation:") == true {
+            do {
+                guard let current = attachment,
+                      let jotURL = localJotURL(for: current),
+                      let jotData = try? Data(contentsOf: jotURL),
+                      let jot = try? PropertyListDecoder().decode(Jot.self, from: jotData) else {
+                    throw ZoteroCacheStore.Failure.invalidLocalAttachmentFile
+                }
+                let hybrid = try JotHybridPDFBuilder.buildHybridPDF(jot: jot)
+                _ = try cacheStore.saveEditedPDF(key: canonicalKey, data: hybrid, userID: userID)
+                attachment = cacheStore.load(userID: userID).attachments[canonicalKey]
+            } catch {
+                return "Local Zotero upload data could not be rebuilt from the saved document: \(error.localizedDescription)"
+            }
+        }
         guard let path = attachment?.localCachePath,
             FileManager.default.fileExists(atPath: path),
             let pdf = try? Data(contentsOf: URL(fileURLWithPath: path))
@@ -178,6 +193,20 @@ struct ZoteroDocumentSyncService: Sendable {
             )
             return error.localizedDescription
         }
+    }
+
+    private func localJotURL(for attachment: ZoteroAttachment) -> URL? {
+        guard let support = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first else { return nil }
+        let directory = support.appendingPathComponent("ZoteroJots", isDirectory: true)
+        let stableURL = directory.appendingPathComponent("\(attachment.localDocumentID).jot")
+        if FileManager.default.fileExists(atPath: stableURL.path) { return stableURL }
+        // Key-based local Jot paths predate LocalDocumentID. They remain a
+        // supported fallback during the mapping migration.
+        let legacyURL = directory.appendingPathComponent("\(attachment.key).jot")
+        return FileManager.default.fileExists(atPath: legacyURL.path) ? legacyURL : nil
     }
 
     private func recordConflictUploadEvent(

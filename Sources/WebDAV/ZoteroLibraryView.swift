@@ -828,23 +828,7 @@ private final class ZoteroLibraryViewModel: ObservableObject {
                 zoteroFileName: filename
             )
             let hybridPDF = try JotHybridPDFBuilder.buildHybridPDF(jot: jot)
-            let cacheURL: URL
-            if existingParent == nil {
-                cacheURL = try cacheStore.registerOfflineDraft(
-                    item: item,
-                    attachment: attachment,
-                    hybridPDF: hybridPDF,
-                    userID: userID
-                )
-            } else {
-                cacheURL = try cacheStore.registerPendingAttachment(
-                    parentItem: item,
-                    attachment: attachment,
-                    hybridPDF: hybridPDF,
-                    userID: userID
-                )
-            }
-            let fileURL = try localJotURL(for: temporaryAttachmentKey)
+            let fileURL = try localJotURL(for: attachment.localDocumentID)
             let jotWithPDF = Jot(
                 drawing: empty.drawing,
                 width: pageSize.width,
@@ -853,8 +837,32 @@ private final class ZoteroLibraryViewModel: ObservableObject {
                 zoteroFileName: filename
             )
             let fileInfo = JotFile.Info(url: fileURL, name: resolvedTitle, modificationDate: now)
-            try JotFileService(fileService: LocalFileService(fileManager: .default))
-                .write(jotFile: JotFile(info: fileInfo, jot: jotWithPDF))
+            let jotEncoder = PropertyListEncoder()
+            jotEncoder.outputFormat = .binary
+            let localJotData = try jotEncoder.encode(jotWithPDF)
+            guard (try? PropertyListDecoder().decode(Jot.self, from: localJotData)) != nil else {
+                throw ZoteroCacheStore.Failure.invalidLocalAttachmentFile
+            }
+            let cacheURL: URL
+            if existingParent == nil {
+                cacheURL = try cacheStore.registerOfflineDraft(
+                    item: item,
+                    attachment: attachment,
+                    hybridPDF: hybridPDF,
+                    userID: userID,
+                    localJotData: localJotData,
+                    localJotURL: fileURL
+                )
+            } else {
+                cacheURL = try cacheStore.registerPendingAttachment(
+                    parentItem: item,
+                    attachment: attachment,
+                    hybridPDF: hybridPDF,
+                    userID: userID,
+                    localJotData: localJotData,
+                    localJotURL: fileURL
+                )
+            }
 
             snapshot = cacheStore.load(userID: userID)
             selection = selectedCollectionKeys.first.map(ZoteroLibraryLocation.collection) ?? .myLibrary
@@ -872,7 +880,7 @@ private final class ZoteroLibraryViewModel: ObservableObject {
             let currentKey = cacheStore.canonicalAttachmentKey(temporaryAttachmentKey, userID: userID)
             let currentAttachment = cacheStore.load(userID: userID).attachments[currentKey]
             if currentAttachment?.isPendingSync == true { return String(localized: "zotero.create.offlineDraft") }
-            if currentAttachment?.syncStatus == .dirty { return String(localized: "zotero.create.uploadFailed") }
+            if currentAttachment?.syncStatus == .dirty { return String(localized: "zotero.create.offlineDraft") }
             return nil
         } catch {
             if !didOpenEditor, let sessionIDForCleanup {
@@ -1373,12 +1381,21 @@ private final class ZoteroLibraryViewModel: ObservableObject {
         var sourceDataReady = false
         var remoteCacheInstalled = false
         var jotSaved = false
+        var hasLocalFile = false
+        var jotRecoveryFileExists = false
         var failureStage = "localCacheRead"
         do {
             var sourceData: Data
             var loadedFromLocalCache: Bool
-            let hasLocalFile = cacheStore.hasUsableLocalFile(for: currentAttachment)
-            let jotRecoveryFileExists = FileManager.default.fileExists(atPath: jotSessionID(for: attachment.key))
+            hasLocalFile = cacheStore.hasUsableLocalFile(for: currentAttachment)
+            let recoveryJotURL = URL(fileURLWithPath: jotSessionID(for: attachment.key))
+            jotRecoveryFileExists = FileManager.default.fileExists(atPath: recoveryJotURL.path)
+            let recoveryJot = JotFile.Info(url: recoveryJotURL, modificationDate: nil)
+                .flatMap { try? JotFileService(fileService: LocalFileService(fileManager: .default)).readJotFile(jotFileInfo: $0).jot }
+            let recoverableJotPDF = recoveryJot.flatMap { jot -> Data? in
+                if let data = jot.pdfData, isValidEditorPDFData(data) { return data }
+                return try? JotHybridPDFBuilder.buildHybridPDF(jot: jot)
+            }
             let hasConflictCopy = cacheStore.hasUsableConflictCopy(forOriginalKey: attachment.key, userID: userID)
             let currentCachePathExists = currentAttachment.localCachePath.map {
                 FileManager.default.fileExists(atPath: $0)
@@ -1396,8 +1413,8 @@ private final class ZoteroLibraryViewModel: ObservableObject {
                 throw ZoteroCacheStore.Failure.invalidLocalAttachmentFile
             }
             let canRecoverMissingDirtyCache = currentAttachment.syncStatus == .dirty
-                && !currentAttachment.isPendingSync
-                && (!jotRecoveryFileExists || hasConflictCopy)
+                && (!currentAttachment.isPendingSync || recoverableJotPDF != nil)
+                && (!jotRecoveryFileExists || hasConflictCopy || recoverableJotPDF != nil)
                 && (!currentCachePathExists || hasConflictCopy)
             if currentAttachment.syncStatus == .dirty && !hasLocalFile && !canRecoverMissingDirtyCache {
                 JottreDiagnostics.shared.record("zotero.recovery.skippedForLocalChanges", details: [
@@ -1412,7 +1429,24 @@ private final class ZoteroLibraryViewModel: ObservableObject {
                 ])
                 throw ZoteroCacheStore.Failure.invalidLocalAttachmentFile
             }
-            if hasLocalFile, let path = currentAttachment.localCachePath {
+            if !hasLocalFile, let recoveredPDF = recoverableJotPDF {
+                // The local .jot is authoritative when its derived PDF cache
+                // is missing. Reopen it without contacting Zotero and rebuild
+                // the derived cache locally when storage is available.
+                sourceData = recoveredPDF
+                loadedFromLocalCache = true
+                if let repairedURL = try? cacheStore.saveEditedPDF(
+                    key: currentAttachment.key,
+                    data: recoveredPDF,
+                    userID: userID
+                ) {
+                    NotificationCenter.default.post(
+                        name: .zoteroAttachmentCacheChanged,
+                        object: currentAttachment.key
+                    )
+                    print("[ZoteroRecovery] Rebuilt local PDF cache from Jot at \(repairedURL.path).")
+                }
+            } else if hasLocalFile, let path = currentAttachment.localCachePath {
                 if let localData = try? Data(contentsOf: URL(fileURLWithPath: path)),
                    ZoteroCacheStore.isSupportedAttachmentData(localData),
                    isValidEditorPDFData(localData) {
@@ -1685,7 +1719,14 @@ private final class ZoteroLibraryViewModel: ObservableObject {
             }
             await endEditingSession(sessionID: sessionID, requestSynchronization: !wasCancelled)
             if !wasCancelled {
-                errorMessage = String(localized: "zotero.error.openPDF")
+                if !hasLocalFile && !jotRecoveryFileExists {
+                    errorMessage = String(
+                        localized: "zotero.open.downloadRequired",
+                        defaultValue: "This document is not stored on this device. Connect to the internet and download it before opening."
+                    )
+                } else {
+                    errorMessage = String(localized: "zotero.error.openPDF")
+                }
             }
         }
     }
@@ -1743,10 +1784,7 @@ private final class ZoteroLibraryViewModel: ObservableObject {
     }
 
     private func jotSessionID(for key: String) -> String {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("ZoteroJots", isDirectory: true)
-            .appendingPathComponent("\(key).jot")
-            .standardizedFileURL.path
+        (try? localJotURL(for: key).standardizedFileURL.path) ?? ""
     }
 
     private func endEditingSession(sessionID: String, requestSynchronization: Bool) async {
@@ -1773,11 +1811,25 @@ private final class ZoteroLibraryViewModel: ObservableObject {
         let folder = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("ZoteroJots", isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        return folder.appendingPathComponent("\(key).jot")
+        let attachment = snapshot.attachments[key]
+            ?? snapshot.attachments[cacheStore.canonicalAttachmentKey(key, userID: userID)]
+        let stableID = attachment?.localDocumentID ?? key
+        let stableURL = folder.appendingPathComponent("\(stableID).jot")
+        if FileManager.default.fileExists(atPath: stableURL.path) { return stableURL }
+        // Temporary-key Jot files from older builds remain openable after
+        // cache metadata has acquired its deterministic legacy local ID.
+        let legacyURL = folder.appendingPathComponent("\(key).jot")
+        if FileManager.default.fileExists(atPath: legacyURL.path) { return legacyURL }
+        return stableURL
     }
 
     private func pdfCacheURL(for key: String) -> URL {
-        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        if let attachment = snapshot.attachments[key]
+            ?? snapshot.attachments[cacheStore.canonicalAttachmentKey(key, userID: userID)],
+           let path = attachment.localCachePath, !path.isEmpty {
+            return URL(fileURLWithPath: path)
+        }
+        return FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("ZoteroPDFs", isDirectory: true)
             .appendingPathComponent("\(key).pdf")
     }
