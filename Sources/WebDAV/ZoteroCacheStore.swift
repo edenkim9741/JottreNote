@@ -45,15 +45,33 @@ struct ZoteroCollection: Codable, Sendable, Hashable, Identifiable {
     }
 
     static func activeKeys(in collections: [String: ZoteroCollection]) -> Set<String> {
-        func isActive(_ key: String, ancestors: Set<String> = []) -> Bool {
-            guard let collection = collections[key], !collection.isTrashed,
-                  !ancestors.contains(key) else { return false }
-            guard let parentKey = collection.parentCollectionKey else { return true }
-            var nextAncestors = ancestors
-            nextAncestors.insert(key)
-            return isActive(parentKey, ancestors: nextAncestors)
+        // Memoize each ancestor result and walk iteratively so deep or malformed
+        // trees neither repeat ancestor scans nor exhaust the call stack.
+        var resolved: [String: Bool] = [:]
+        for key in collections.keys {
+            var path: [String] = []
+            var visiting = Set<String>()
+            var current = key
+            var active = false
+            while true {
+                if let known = resolved[current] {
+                    active = known
+                    break
+                }
+                guard let collection = collections[current], !collection.isTrashed,
+                      visiting.insert(current).inserted else { break }
+                path.append(current)
+                guard let parent = collection.parentCollectionKey else {
+                    active = true
+                    break
+                }
+                current = parent
+            }
+            for visited in path { resolved[visited] = active }
+            // Deleted nodes, missing parents and cycles are all inactive.
+            resolved[key] = active
         }
-        return Set(collections.keys.filter { isActive($0) })
+        return Set(resolved.compactMap { $0.value ? $0.key : nil })
     }
 }
 
