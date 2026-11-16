@@ -85,7 +85,7 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
         } else if !isEnabled,
                   let pan = fingerNavigationFallbackPan,
                   pan.state != .began, pan.state != .changed, pan.numberOfTouches == 0 {
-            pdfView.removeGestureRecognizer(pan)
+            pan.view?.removeGestureRecognizer(pan)
             fingerNavigationFallbackPan = nil
             fallbackPanStartOffset = nil
         }
@@ -418,9 +418,31 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
         _ gestureRecognizer: UIGestureRecognizer,
         shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
     ) -> Bool {
-        if gestureRecognizer === fingerNavigationFallbackPan,
-           pdfNavigationScrollViews().first?.panGestureRecognizer === otherGestureRecognizer {
-            return true
+        if gestureRecognizer === fingerNavigationFallbackPan
+            || otherGestureRecognizer === fingerNavigationFallbackPan {
+            let other = gestureRecognizer === fingerNavigationFallbackPan
+                ? otherGestureRecognizer : gestureRecognizer
+            if let scrollView = pdfNavigationScrollViews().first,
+               other === scrollView.panGestureRecognizer || other === scrollView.pinchGestureRecognizer {
+                return true
+            }
+            // A native lasso selection adds recognizers after ink is selected
+            // or moved. Even with pencilOnly, those can prevent the window's
+            // finger fallback before PDFKit sees a pan. Keep that direct-touch
+            // fallback alive alongside page selection gestures. It still only
+            // changes offsets when PDFKit's pan fails or never tracks a touch.
+            // Pencil input never enters the fallback; ruler/anyInput canvases
+            // retain exclusive handling of their finger interactions.
+            var view = other.view
+            while let current = view {
+                if let overlay = current as? JotPDFPageCanvasOverlay {
+                    return isEditingEnabled
+                        && overlay.canvas.drawingPolicy == .pencilOnly
+                        && !overlay.canvas.isRulerActive
+                }
+                view = current.superview
+            }
+            return false
         }
         return gestureRecognizer === undoDoubleTapRecognizer
     }
