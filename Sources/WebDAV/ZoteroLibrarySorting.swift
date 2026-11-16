@@ -36,10 +36,11 @@ struct ZoteroLibrarySorting: Codable, Equatable, Sendable {
         }
     }
 
+    var isAscending: Bool { order == .title ? !isReversed : isReversed }
+
     var accessibilityDescription: String {
-        let ascending = order == .title ? !isReversed : isReversed
         let direction =
-            ascending ? String(localized: "zotero.sort.ascending") : String(localized: "zotero.sort.descending")
+            isAscending ? String(localized: "zotero.sort.ascending") : String(localized: "zotero.sort.descending")
         return order.title + ", " + direction
     }
 

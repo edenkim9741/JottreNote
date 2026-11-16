@@ -51,6 +51,7 @@ struct ZoteroLibraryView: View {
                 ForEach(model.childCollections(of: nil)) { collection in
                     ZoteroCollectionTreeRow(
                         collection: collection,
+                        selectedLocation: model.selection,
                         children: { model.childCollections(of: $0) },
                         onSelect: { model.selection = .collection($0) }
                     )
@@ -354,6 +355,8 @@ struct ZoteroLibraryView: View {
                 .foregroundStyle(model.selection == location ? Color.accentColor : Color.primary)
         }
         .buttonStyle(.plain)
+        .listRowBackground(model.selection == location ? Color.accentColor.opacity(0.12) : Color.clear)
+        .accessibilityAddTraits(model.selection == location ? .isSelected : [])
     }
 
     private func showImportErrorUnlessCancelled(_ error: Error) {
@@ -362,88 +365,74 @@ struct ZoteroLibraryView: View {
         creationNotice = error.localizedDescription
     }
 
+    @ToolbarContentBuilder
+    private var libraryToolbar: some ToolbarContent {
+        ToolbarItem(placement: .topBarLeading) {
+            Button {
+                withAnimation {
+                    columnVisibility = columnVisibility == .detailOnly ? .all : .detailOnly
+                }
+            } label: {
+                Label(
+                    String(
+                        localized: columnVisibility == .detailOnly
+                            ? "zotero.sidebar.showSidebar" : "zotero.sidebar.hideSidebar"
+                    ),
+                    systemImage: "sidebar.left"
+                )
+            }
+        }
+        ToolbarItemGroup(placement: .topBarTrailing) {
+            Button(
+                model.isSelecting
+                    ? String(localized: "zotero.document.selection.done")
+                    : String(localized: "zotero.document.selection.select")
+            ) {
+                model.setSelectionMode(!model.isSelecting)
+            }
+            Menu {
+                ForEach(ZoteroAttachmentSortOrder.allCases) { order in
+                    Button {
+                        model.selectSortOrder(order)
+                    } label: {
+                        if model.sortOrder == order {
+                            Label(order.title, systemImage: model.sorting.isAscending ? "arrow.up" : "arrow.down")
+                        } else {
+                            Text(order.title)
+                        }
+                    }
+                    .accessibilityIdentifier("zotero.sort.\(order.rawValue)")
+                }
+            } label: {
+                Label(String(localized: "zotero.sort.menu"), systemImage: "arrow.up.arrow.down")
+            }
+            .accessibilityIdentifier("zotero.sort")
+            .accessibilityValue(Text(model.sorting.accessibilityDescription))
+            Menu {
+                Button {
+                    showingNewDocument = true
+                } label: {
+                    Label(String(localized: "zotero.create.newDocument"), systemImage: "doc.badge.plus")
+                }
+                Button {
+                    showingPDFImporter = true
+                } label: {
+                    Label(String(localized: "zotero.import.createItemFromPDF"), systemImage: "doc.viewfinder")
+                }
+            } label: {
+                Label(String(localized: "zotero.create.newDocument"), systemImage: "plus")
+            }
+        }
+    }
+
     private var attachmentList: some View {
         let groups = model.attachmentGroups(for: model.selection)
         return List {
-            HStack(spacing: 12) {
-                Text(title(for: model.selection))
-                    .font(.title2.weight(.bold))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.8)
-                Spacer(minLength: 0)
-                Button(
-                    model.isSelecting
-                        ? String(localized: "zotero.document.selection.done")
-                        : String(localized: "zotero.document.selection.select")
-                ) {
-                    model.setSelectionMode(!model.isSelecting)
-                }
-                .buttonStyle(.borderless)
-                Menu {
-                    Button {
-                        showingNewDocument = true
-                    } label: {
-                        Label(String(localized: "zotero.create.newDocument"), systemImage: "doc.badge.plus")
-                    }
-                    Button {
-                        showingPDFImporter = true
-                    } label: {
-                        Label(String(localized: "zotero.import.createItemFromPDF"), systemImage: "doc.viewfinder")
-                    }
-                } label: {
-                    Image(systemName: "plus")
-                }
-                .buttonStyle(.borderless)
-                .accessibilityLabel(String(localized: "zotero.create.newDocument"))
-                Menu {
-                    ForEach(ZoteroAttachmentSortOrder.allCases) { order in
-                        Button {
-                            model.selectSortOrder(order)
-                        } label: {
-                            if model.sortOrder == order {
-                                let isAscending = order == .title ? !model.isSortReversed : model.isSortReversed
-                                Label(order.title, systemImage: isAscending ? "arrow.up" : "arrow.down")
-                            } else {
-                                Text(order.title)
-                            }
-                        }
-                        .accessibilityIdentifier("zotero.sort.\(order.rawValue)")
-                    }
-                } label: {
-                    Image(systemName: "arrow.up.arrow.down")
-                }
-                .buttonStyle(.borderless)
-                .accessibilityLabel(String(localized: "zotero.sort.menu"))
-                .accessibilityIdentifier("zotero.sort")
-                .accessibilityValue(Text(model.sorting.accessibilityDescription))
-                Button {
-                    withAnimation {
-                        columnVisibility = columnVisibility == .detailOnly ? .all : .detailOnly
-                    }
-                } label: {
-                    Image(systemName: "sidebar.left")
-                }
-                .buttonStyle(.borderless)
-                .accessibilityLabel(
-                    String(
-                        localized: columnVisibility == .detailOnly
-                            ? "zotero.sidebar.showSidebar"
-                            : "zotero.sidebar.hideSidebar"
-                    )
-                )
-            }
-            .listRowInsets(EdgeInsets(top: 8, leading: 20, bottom: 12, trailing: 20))
-            .listRowSeparator(.hidden)
-            .listRowBackground(Color.clear)
-            .accessibilityAddTraits(.isHeader)
-
             ForEach(groups) { group in
                 DisclosureGroup(isExpanded: expandedBinding(for: group.key)) {
                     ForEach(group.attachments) { attachment in
                         attachmentRow(
                             attachment,
-                            title: attachment.filename,
-                            subtitle: "",
                             selectionKey: attachmentSelectionKey(attachment, groupKey: group.key)
                         )
                     }
@@ -454,26 +443,9 @@ struct ZoteroLibraryView: View {
                         !["attachment", "note", "annotation"].contains(groupItem.itemType),
                         !groupItem.isTrashed
                     {
-                        Menu {
-                            Button {
-                                pendingAttachmentParentKey = group.key
-                                expandedAttachmentGroups.insert(group.key)
-                                showingAttachmentImporter = true
-                            } label: {
-                                Label(String(localized: "zotero.import.addPDF"), systemImage: "doc.badge.plus")
-                            }
-                            Button {
-                                newNoteParentKey = group.key
-                                expandedAttachmentGroups.insert(group.key)
-                                showingNewDocument = true
-                            } label: {
-                                Label(String(localized: "zotero.import.addNote"), systemImage: "square.and.pencil")
-                            }
-                        } label: {
-                            Label(String(localized: "zotero.import.addAttachment"), systemImage: "plus")
-                                .font(.subheadline.weight(.medium))
-                        }
-                        .buttonStyle(.borderless)
+                        attachmentCreationMenu(itemKey: group.key)
+                            .font(.subheadline.weight(.medium))
+                            .buttonStyle(.borderless)
                     }
                 } label: {
                     HStack(spacing: 10) {
@@ -492,6 +464,7 @@ struct ZoteroLibraryView: View {
                             .padding(.vertical, 4)
                             .background(.quaternary, in: Capsule())
                     }
+                    .padding(.vertical, 8)
                     .contentShape(Rectangle())
                     .contextMenu {
                         if model.selection != .trash || model.snapshot.items[group.key]?.isTrashed == true {
@@ -501,6 +474,10 @@ struct ZoteroLibraryView: View {
                 }
             }
         }
+        .listStyle(.insetGrouped)
+        .navigationTitle(title(for: model.selection))
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar { libraryToolbar }
         .contentMargins(.top, 0, for: .scrollContent)
         .safeAreaInset(edge: .bottom, spacing: 0) {
             if model.isSelecting {
@@ -526,23 +503,23 @@ struct ZoteroLibraryView: View {
                             Label(String(localized: "zotero.document.restore"), systemImage: "arrow.uturn.backward")
                         }
                         .disabled(model.selectedItemKeys.isEmpty)
-                        Button(role: .destructive) {
-                            pendingTrashKeys = model.selectedItemKeys
-                            showingTrashConfirmation = true
-                        } label: {
-                            Label(String(localized: "zotero.document.deletePermanently"), systemImage: "trash")
-                        }
-                        .disabled(model.selectedItemKeys.isEmpty)
-                    } else {
-                        Button(role: .destructive) {
-                            pendingTrashKeys = model.selectedItemKeys
-                            showingTrashConfirmation = true
-                        } label: {
-                            Label(String(localized: "zotero.document.trash"), systemImage: "trash")
-                        }
-                        .disabled(model.selectedItemKeys.isEmpty)
                     }
+                    Button(role: .destructive) {
+                        pendingTrashKeys = model.selectedItemKeys
+                        showingTrashConfirmation = true
+                    } label: {
+                        Label(
+                            String(
+                                localized: model.selection == .trash
+                                    ? "zotero.document.deletePermanently" : "zotero.document.trash"
+                            ),
+                            systemImage: "trash"
+                        )
+                    }
+                    .disabled(model.selectedItemKeys.isEmpty)
                 }
+                .labelStyle(.iconOnly)
+                .buttonStyle(.bordered)
                 .font(.callout.weight(.medium))
                 .padding(.horizontal, 16)
                 .padding(.vertical, 12)
@@ -578,8 +555,6 @@ struct ZoteroLibraryView: View {
 
     private func attachmentRow(
         _ attachment: ZoteroAttachment,
-        title: String,
-        subtitle: String,
         selectionKey: String
     ) -> some View {
         let displayStatus = model.displayStatus(for: attachment)
@@ -594,15 +569,20 @@ struct ZoteroLibraryView: View {
         } label: {
             HStack(spacing: 12) {
                 if model.isSelecting { selectionIndicator(for: selectionKey) }
-                Image(systemName: statusSymbol(displayStatus))
-                    .foregroundStyle(statusColor(displayStatus))
-                    .frame(width: 24)
-                    .accessibilityLabel(statusDescription(displayStatus))
+                Image(systemName: "doc.richtext")
+                    .font(.title3)
+                    .foregroundStyle(Color.accentColor)
+                    .frame(width: 40, height: 48)
+                    .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+                    .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(title).font(.headline).lineLimit(2)
-                    if !subtitle.isEmpty {
-                        Text(subtitle).font(.subheadline).foregroundStyle(.secondary).lineLimit(2)
-                    }
+                    Text(attachment.filename)
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.primary)
+                        .lineLimit(2)
+                    Label(statusDescription(displayStatus), systemImage: statusSymbol(displayStatus))
+                        .font(.caption)
+                        .foregroundStyle(statusColor(displayStatus))
                 }
                 Spacer()
                 if attachment.isConflict {
@@ -656,6 +636,27 @@ struct ZoteroLibraryView: View {
             )
     }
 
+    private func attachmentCreationMenu(itemKey: String) -> some View {
+        Menu {
+            Button {
+                pendingAttachmentParentKey = itemKey
+                expandedAttachmentGroups.insert(itemKey)
+                showingAttachmentImporter = true
+            } label: {
+                Label(String(localized: "zotero.import.addPDF"), systemImage: "doc.badge.plus")
+            }
+            Button {
+                newNoteParentKey = itemKey
+                expandedAttachmentGroups.insert(itemKey)
+                showingNewDocument = true
+            } label: {
+                Label(String(localized: "zotero.import.addNote"), systemImage: "square.and.pencil")
+            }
+        } label: {
+            Label(String(localized: "zotero.import.addAttachment"), systemImage: "plus")
+        }
+    }
+
     @ViewBuilder
     private func documentContextMenu(itemKey: String) -> some View {
         if let item = model.snapshot.items[itemKey], ZoteroSyncService.isValidKey(itemKey) {
@@ -675,24 +676,7 @@ struct ZoteroLibraryView: View {
                 if item.parentItemKey == nil,
                     !["attachment", "note", "annotation"].contains(item.itemType)
                 {
-                    Menu {
-                        Button {
-                            pendingAttachmentParentKey = itemKey
-                            expandedAttachmentGroups.insert(itemKey)
-                            showingAttachmentImporter = true
-                        } label: {
-                            Label(String(localized: "zotero.import.addPDF"), systemImage: "doc.badge.plus")
-                        }
-                        Button {
-                            newNoteParentKey = itemKey
-                            expandedAttachmentGroups.insert(itemKey)
-                            showingNewDocument = true
-                        } label: {
-                            Label(String(localized: "zotero.import.addNote"), systemImage: "square.and.pencil")
-                        }
-                    } label: {
-                        Label(String(localized: "zotero.import.addAttachment"), systemImage: "plus")
-                    }
+                    attachmentCreationMenu(itemKey: itemKey)
                 }
                 Button {
                     editingItem = item
@@ -762,6 +746,7 @@ struct ZoteroLibraryView: View {
 
 private struct ZoteroCollectionTreeRow: View {
     let collection: ZoteroCollection
+    let selectedLocation: ZoteroLibraryLocation
     let children: (String) -> [ZoteroCollection]
     let onSelect: (String) -> Void
 
@@ -774,7 +759,7 @@ private struct ZoteroCollectionTreeRow: View {
             Button {
                 onSelect(collection.key)
             } label: {
-                Label(collection.name, systemImage: "folder")
+                collectionLabel
             }
             .buttonStyle(.plain)
         } else {
@@ -782,6 +767,7 @@ private struct ZoteroCollectionTreeRow: View {
                 ForEach(childCollections) { child in
                     ZoteroCollectionTreeRow(
                         collection: child,
+                        selectedLocation: selectedLocation,
                         children: children,
                         onSelect: onSelect
                     )
@@ -790,12 +776,19 @@ private struct ZoteroCollectionTreeRow: View {
                 Button {
                     onSelect(collection.key)
                 } label: {
-                    Label(collection.name, systemImage: "folder")
+                    collectionLabel
                 }
                 .buttonStyle(.plain)
             }
         }
     }
+
+    private var collectionLabel: some View {
+        Label(collection.name, systemImage: selectedLocation == .collection(collection.key) ? "folder.fill" : "folder")
+            .foregroundStyle(selectedLocation == .collection(collection.key) ? Color.accentColor : Color.primary)
+            .accessibilityAddTraits(selectedLocation == .collection(collection.key) ? .isSelected : [])
+    }
+
 }
 
 private struct ZoteroRestoreBackupShareSheet: UIViewControllerRepresentable {

@@ -24,7 +24,6 @@ final class ZoteroLibraryViewModel: ObservableObject {
     private var groupsByLocation: [ZoteroLibraryLocation: [ZoteroAttachmentGroup]] = [:]
     private var collectionsByParent: [String?: [ZoteroCollection]]?
     var sortOrder: ZoteroAttachmentSortOrder { sorting.order }
-    var isSortReversed: Bool { sorting.isReversed }
     @Published private(set) var isSelecting = false
     @Published private(set) var selectedItemKeys = Set<String>()
     private var synchronizationRequestedWhileSyncing = false

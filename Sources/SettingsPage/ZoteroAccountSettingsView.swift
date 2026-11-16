@@ -12,7 +12,7 @@ struct ZoteroAccountSettingsView: View {
     @State private var defaultAuthorFullName: String
     @State private var isResolvingUserID = false
     @State private var statusMessage: String?
-    @State private var localSnapshot: ZoteroCacheSnapshot
+    @State private var localInventory: ZoteroLocalDocumentInventory
     @State private var selectedLocalKeys = Set<String>()
     @State private var localCacheMessage: String?
 
@@ -32,7 +32,9 @@ struct ZoteroAccountSettingsView: View {
         _defaultAuthorFirstName = State(initialValue: defaults.getValue(.zoteroDefaultAuthorFirstName) ?? "")
         _defaultAuthorLastName = State(initialValue: defaults.getValue(.zoteroDefaultAuthorLastName) ?? "")
         _defaultAuthorFullName = State(initialValue: defaults.getValue(.zoteroDefaultAuthorFullName) ?? "")
-        _localSnapshot = State(initialValue: .empty(userID: defaults.getValue(.zoteroUserID) ?? ""))
+        _localInventory = State(
+            initialValue: ZoteroLocalDocumentInventory(snapshot: .empty(userID: defaults.getValue(.zoteroUserID) ?? ""))
+        )
     }
 
     var body: some View {
@@ -76,20 +78,25 @@ struct ZoteroAccountSettingsView: View {
                 }
 
                 Section {
-                    if localDocuments.isEmpty {
+                    if localInventory.documents.isEmpty {
                         Text(String(localized: "zotero.settings.localDocumentsEmpty"))
                             .foregroundStyle(.secondary)
                     } else {
                         HStack {
-                            Text(String.localizedStringWithFormat(
-                                String(localized: "zotero.settings.localDocumentCount"),
-                                localDocuments.count
-                            ))
+                            Text(
+                                String.localizedStringWithFormat(
+                                    String(localized: "zotero.settings.localDocumentCount"),
+                                    localInventory.documents.count
+                                )
+                            )
                             Spacer()
-                            Text(ByteCountFormatter.string(fromByteCount: localDocuments.reduce(Int64(0)) {
-                                $0 + localDocumentSize($1)
-                            }, countStyle: .file))
-                                .foregroundStyle(.secondary)
+                            Text(
+                                ByteCountFormatter.string(
+                                    fromByteCount: localInventory.totalByteCount,
+                                    countStyle: .file
+                                )
+                            )
+                            .foregroundStyle(.secondary)
                         }
 
                         Button(role: .destructive) {
@@ -97,7 +104,7 @@ struct ZoteroAccountSettingsView: View {
                         } label: {
                             Text(String(localized: "zotero.settings.offloadAll"))
                         }
-                        .disabled(offloadableKeys.isEmpty)
+                        .disabled(localInventory.offloadableKeys.isEmpty)
 
                         Button(role: .destructive) {
                             offloadSelected()
@@ -111,8 +118,8 @@ struct ZoteroAccountSettingsView: View {
                         }
                         .disabled(selectedLocalKeys.isEmpty)
 
-                        ForEach(localDocuments) { attachment in
-                            localDocumentRow(attachment)
+                        ForEach(localInventory.documents) { document in
+                            localDocumentRow(document)
                         }
                     }
                     if let localCacheMessage {
@@ -169,9 +176,18 @@ struct ZoteroAccountSettingsView: View {
         defaults.set(.zoteroUserID, value: userID.trimmingCharacters(in: .whitespacesAndNewlines))
         defaults.set(.webDAVURL, value: webDAVURL.trimmingCharacters(in: .whitespacesAndNewlines))
         defaults.set(.webDAVUsername, value: webDAVUsername.trimmingCharacters(in: .whitespacesAndNewlines))
-        defaults.set(.zoteroDefaultAuthorFirstName, value: defaultAuthorFirstName.trimmingCharacters(in: .whitespacesAndNewlines))
-        defaults.set(.zoteroDefaultAuthorLastName, value: defaultAuthorLastName.trimmingCharacters(in: .whitespacesAndNewlines))
-        defaults.set(.zoteroDefaultAuthorFullName, value: defaultAuthorFullName.trimmingCharacters(in: .whitespacesAndNewlines))
+        defaults.set(
+            .zoteroDefaultAuthorFirstName,
+            value: defaultAuthorFirstName.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+        defaults.set(
+            .zoteroDefaultAuthorLastName,
+            value: defaultAuthorLastName.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+        defaults.set(
+            .zoteroDefaultAuthorFullName,
+            value: defaultAuthorFullName.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
         _ = keychain.set(apiKey.trimmingCharacters(in: .whitespacesAndNewlines), for: "zotero_api_key")
         _ = keychain.set(webDAVPassword, for: "webdav_password")
         onSaved()
@@ -185,35 +201,29 @@ struct ZoteroAccountSettingsView: View {
         return "\(version) (\(build))"
     }
 
-    private var localDocuments: [ZoteroAttachment] {
-        localSnapshot.attachments.values
-            .filter { attachment in
-                guard let path = attachment.localCachePath else { return false }
-                return FileManager.default.fileExists(atPath: path)
-            }
-            .sorted { localDocumentTitle($0).localizedCaseInsensitiveCompare(localDocumentTitle($1)) == .orderedAscending }
-    }
-
-    private var offloadableKeys: Set<String> {
-        Set(localDocuments.filter { $0.syncStatus != .dirty }.map(\.key))
-    }
-
-    private func localDocumentRow(_ attachment: ZoteroAttachment) -> some View {
-        let isDirty = attachment.syncStatus == .dirty
+    private func localDocumentRow(_ document: ZoteroLocalDocumentInventory.Document) -> some View {
+        let attachment = document.attachment
+        let isDirty = !document.isOffloadable
         let isSelected = selectedLocalKeys.contains(attachment.key)
         return Button {
             guard !isDirty else { return }
-            if isSelected { selectedLocalKeys.remove(attachment.key) }
-            else { selectedLocalKeys.insert(attachment.key) }
+            if isSelected { selectedLocalKeys.remove(attachment.key) } else { selectedLocalKeys.insert(attachment.key) }
         } label: {
             HStack(spacing: 12) {
+                Image(systemName: "doc.richtext")
+                    .font(.title3)
+                    .foregroundStyle(isDirty ? Color.orange : Color.accentColor)
+                    .frame(width: 36, height: 44)
+                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+                    .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(localDocumentTitle(attachment))
+                    Text(document.title)
+                        .font(.subheadline.weight(.medium))
                         .foregroundStyle(.primary)
                         .lineLimit(2)
                     HStack(spacing: 8) {
                         Text(attachment.filename)
-                        Text(ByteCountFormatter.string(fromByteCount: localDocumentSize(attachment), countStyle: .file))
+                        Text(ByteCountFormatter.string(fromByteCount: document.byteCount, countStyle: .file))
                         if isDirty {
                             Text(String(localized: "zotero.settings.localDocumentPending"))
                                 .foregroundStyle(.orange)
@@ -224,36 +234,33 @@ struct ZoteroAccountSettingsView: View {
                     .lineLimit(1)
                 }
                 Spacer(minLength: 4)
-                Image(systemName: isDirty ? "arrow.triangle.2.circlepath" : (isSelected ? "checkmark.circle.fill" : "circle"))
-                    .foregroundStyle(isDirty ? Color.orange : (isSelected ? Color.accentColor : Color.secondary))
+                Image(
+                    systemName: isDirty
+                        ? "arrow.triangle.2.circlepath" : (isSelected ? "checkmark.circle.fill" : "circle")
+                )
+                .foregroundStyle(isDirty ? Color.orange : (isSelected ? Color.accentColor : Color.secondary))
             }
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
         .disabled(isDirty)
-    }
-
-    private func localDocumentTitle(_ attachment: ZoteroAttachment) -> String {
-        attachment.parentItemKey.flatMap { localSnapshot.items[$0]?.title } ?? attachment.filename
-    }
-
-    private func localDocumentSize(_ attachment: ZoteroAttachment) -> Int64 {
-        guard let path = attachment.localCachePath,
-              let attributes = try? FileManager.default.attributesOfItem(atPath: path),
-              let size = attributes[.size] as? NSNumber else { return 0 }
-        return size.int64Value
     }
 
     @MainActor
     private func refreshLocalSnapshot() {
         let userID = defaults.getValue(.zoteroUserID) ?? ""
-        localSnapshot = cacheStore.load(userID: userID)
-        selectedLocalKeys.formIntersection(offloadableKeys)
+        updateLocalInventory(cacheStore.load(userID: userID))
+    }
+
+    private func updateLocalInventory(_ snapshot: ZoteroCacheSnapshot) {
+        localInventory = ZoteroLocalDocumentInventory(snapshot: snapshot)
+        selectedLocalKeys.formIntersection(localInventory.offloadableKeys)
     }
 
     @MainActor
     private func offloadAll() {
-        offload(keys: offloadableKeys, skippedDirtyCount: localDocuments.filter { $0.syncStatus == .dirty }.count)
+        offload(keys: localInventory.offloadableKeys, skippedDirtyCount: localInventory.pendingDocumentCount)
     }
 
     @MainActor
@@ -266,9 +273,9 @@ struct ZoteroAccountSettingsView: View {
         guard !keys.isEmpty else { return }
         let userID = defaults.getValue(.zoteroUserID) ?? ""
         do {
-            localSnapshot = try cacheStore.offload(keys: keys, userID: userID)
-            selectedLocalKeys.subtract(keys)
-            localCacheMessage = skippedDirtyCount > 0
+            updateLocalInventory(try cacheStore.offload(keys: keys, userID: userID))
+            localCacheMessage =
+                skippedDirtyCount > 0
                 ? String(localized: "zotero.settings.offloadSkippedPending")
                 : String(localized: "zotero.settings.offloadComplete")
             NotificationCenter.default.post(name: .zoteroAttachmentCacheChanged, object: nil)
