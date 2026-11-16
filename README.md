@@ -127,6 +127,10 @@ xcodebuild test -project Jottre.xcodeproj \
 
 이 스크립트는 자동 프로비저닝 갱신을 사용하며 마케팅 버전과 빌드 번호를 스크립트 안에서 지정합니다. 배포 전에 `MARKETING_VERSION`과 `CURRENT_PROJECT_VERSION` 값을 확인하고 Apple 개발자 계정의 서명 설정을 준비하세요. 생성 결과는 저장소 루트의 `Jottre.ipa`입니다.
 
+## 개발 문서
+
+- [코드 및 UI 정리 내역 (2026-11)](docs/code-cleanup-2026-11.md): 구조 변경, 계산 최적화, UI 변경과 검증 결과
+
 ## 라이선스
 
 Jottre Note는 원본 프로젝트의 저작권 고지와 라이선스를 유지합니다. 이 프로젝트는 [GNU GPLv3](LICENSE)에 따라 배포됩니다.
