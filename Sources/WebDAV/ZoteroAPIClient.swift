@@ -145,7 +145,9 @@ struct ZoteroAPIClient: Sendable {
     /// Fetches the complete collection tree using Zotero's offset pagination.
     /// The version header is checked on each page so callers never reconcile
     /// against a mixed snapshot while the library is changing.
-    func fetchAllCollections() async throws -> ZoteroCollectionSnapshot {
+    func fetchAllCollections(
+        progress: (@Sendable (Int, Int?) async -> Void)? = nil
+    ) async throws -> ZoteroCollectionSnapshot {
         guard Int(userID) != nil else { throw Failure.invalidUserID }
         var collections: [ZoteroCollection] = []
         var start = 0
@@ -153,6 +155,7 @@ struct ZoteroAPIClient: Sendable {
         var snapshotVersion: Int?
 
         while totalResults.map({ start < $0 }) ?? true {
+            try Task.checkCancellation()
             let query = [
                 URLQueryItem(name: "limit", value: "100"),
                 URLQueryItem(name: "start", value: String(start)),
@@ -175,6 +178,7 @@ struct ZoteroAPIClient: Sendable {
             }
             collections.append(contentsOf: page.compactMap(Self.collection(from:)))
             start += page.count
+            await progress?(start, totalResults)
 
             if page.isEmpty || (totalResults == nil && page.count < 100) { break }
         }
@@ -184,22 +188,30 @@ struct ZoteroAPIClient: Sendable {
 
     /// Retrieves Zotero's changed object versions, fetches those objects in
     /// batches, and returns a delta that the cache can apply atomically.
-    func fetchDelta(since: Int) async throws -> ZoteroLibraryDelta? {
+    func fetchDelta(
+        since: Int,
+        progress: (@Sendable (Double, String) async -> Void)? = nil
+    ) async throws -> ZoteroLibraryDelta? {
         guard Int(userID) != nil else { throw Failure.invalidUserID }
         let prefix = "/users/\(userID)"
-        // Keep the deletion cursor pinned to the version captured by the
-        // caller and ask for tombstones before fetching collection objects.
-        let deleted = try await fetchDeleted(path: "\(prefix)/deleted", since: since)
-        var responseVersions: [Int] = []
-
+        await progress?(0, String(localized: "zotero.sync.status.checkingVersions"))
         let collectionVersions = try await fetchVersions(
             path: "\(prefix)/collections",
             since: since,
             conditional: true
         )
-        if !collectionVersions.notModified {
-            responseVersions.append(collectionVersions.libraryVersion)
+        // This conditional response covers the entire library, including
+        // deletions. Do not download all version maps again on an unchanged sync.
+        if collectionVersions.notModified {
+            await progress?(1, String(localized: "zotero.sync.status.noChanges"))
+            return nil
         }
+        var responseVersions = [collectionVersions.libraryVersion]
+        await progress?(0.1, String(localized: "zotero.sync.status.fetchingDeletions"))
+        // Preserve the caller's cursor, even if another client changes the
+        // library while this sync is running. Never advance past tombstones.
+        let deleted = try await fetchDeleted(path: "\(prefix)/deleted", since: since)
+        await progress?(0.2, String(localized: "zotero.sync.status.checkingVersions"))
 
         let topItemVersions = try await fetchVersions(
             path: "\(prefix)/items/top",
@@ -208,6 +220,7 @@ struct ZoteroAPIClient: Sendable {
             includeTrashed: true
         )
         responseVersions.append(topItemVersions.libraryVersion)
+        await progress?(0.3, String(localized: "zotero.sync.status.checkingVersions"))
         let childItemVersions = try await fetchVersions(
             path: "\(prefix)/items",
             since: since,
@@ -218,25 +231,38 @@ struct ZoteroAPIClient: Sendable {
         guard Set(responseVersions).count == 1, let libraryVersion = responseVersions.first else {
             throw Failure.libraryChangedDuringSync
         }
+        guard deleted.libraryVersion == libraryVersion else { throw Failure.libraryChangedDuringSync }
 
-        let collectionObjects = collectionVersions.notModified ? [] : try await fetchObjects(
+        let itemVersionMap = topItemVersions.objects.merging(childItemVersions.objects) { _, latest in latest }
+        let collectionCount = collectionVersions.objects.count
+        let total = collectionCount + itemVersionMap.count
+        @Sendable func reportObjects(_ completed: Int) async {
+            await progress?(0.4 + 0.6 * Double(completed) / Double(max(1, total)),
+                            String(localized: "zotero.sync.status.fetchingObjects",
+                                   defaultValue: "Fetching library changes… (\(completed)/\(total))"))
+        }
+        await reportObjects(0)
+        let collectionObjects = try await fetchObjects(
             path: "\(prefix)/collections",
             keyParameter: "collectionKey",
-            versions: collectionVersions.objects
+            versions: collectionVersions.objects,
+            libraryVersion: libraryVersion,
+            progress: reportObjects
         ) { object in
             Self.collection(from: object)
         }
-        let itemVersionMap = topItemVersions.objects.merging(childItemVersions.objects) { _, latest in latest }
         let itemObjects = try await fetchObjects(
             path: "\(prefix)/items",
             keyParameter: "itemKey",
             versions: itemVersionMap,
-            extraQuery: [URLQueryItem(name: "includeTrashed", value: "1")]
+            libraryVersion: libraryVersion,
+            extraQuery: [URLQueryItem(name: "includeTrashed", value: "1")],
+            progress: { completed in await reportObjects(collectionCount + completed) }
         ) { object in
             Self.itemAndAttachment(from: object)
         }
 
-        guard deleted.libraryVersion == libraryVersion else { throw Failure.libraryChangedDuringSync }
+        await progress?(1, String(localized: "zotero.sync.status.fetching"))
         return ZoteroLibraryDelta(
             sinceVersion: since,
             libraryVersion: libraryVersion,
@@ -684,20 +710,41 @@ struct ZoteroAPIClient: Sendable {
         path: String,
         keyParameter: String,
         versions: [String: Int],
+        libraryVersion: Int,
         extraQuery: [URLQueryItem] = [],
+        progress: (@Sendable (Int) async -> Void)? = nil,
         transform: ([String: Any]) -> T?
     ) async throws -> [T] {
         var output: [T] = []
         let keys = versions.keys.sorted()
+        var completed = 0
         for batch in keys.chunked(maxCount: 50) {
-            var query = [URLQueryItem(name: keyParameter, value: batch.joined(separator: ","))]
+            try Task.checkCancellation()
+            var query = [
+                URLQueryItem(name: keyParameter, value: batch.joined(separator: ",")),
+                URLQueryItem(name: "limit", value: String(batch.count)),
+            ]
             query.append(contentsOf: extraQuery)
             let (data, response) = try await performData(for: request(path: path, query: query))
             try Self.validate(response)
-            guard let array = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            guard let http = response as? HTTPURLResponse,
+                  let responseVersion = http.value(forHTTPHeaderField: "Last-Modified-Version").flatMap(Int.init),
+                  let array = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
                 throw Failure.invalidResponse
             }
-            output.append(contentsOf: array.compactMap(transform))
+            // Never commit a cursor for a truncated batch or a mixed snapshot.
+            guard responseVersion == libraryVersion,
+                  array.count == batch.count,
+                  Set(array.compactMap { $0["key"] as? String }) == Set(batch),
+                  array.allSatisfy({ object in
+                      guard let key = object["key"] as? String, let version = object["version"] as? Int else { return false }
+                      return versions[key] == version
+                  }) else { throw Failure.libraryChangedDuringSync }
+            let objects = array.compactMap(transform)
+            guard objects.count == array.count else { throw Failure.invalidResponse }
+            output.append(contentsOf: objects)
+            completed += batch.count
+            await progress?(completed)
         }
         return output
     }
@@ -729,9 +776,26 @@ struct ZoteroAPIClient: Sendable {
     }
 
     private func performData(for request: URLRequest) async throws -> (Data, URLResponse) {
+        // Categories deliberately omit account IDs, object keys and API keys.
+        let path = request.url?.path ?? ""
+        let category = path.contains("/keys/") ? "keyAccess"
+            : path.contains("/collections") ? "collections"
+            : path.hasSuffix("/deleted") ? "deletions"
+            : path.contains("/items") ? "items" : "schema"
         for attempt in 0..<3 {
+            try Task.checkCancellation()
+            let startedAt = Date()
+            JottreDiagnostics.shared.record("zotero.api.requestStarted", details: [
+                "category": category, "attempt": attempt + 1
+            ])
             do {
                 let result = try await session.data(for: request)
+                JottreDiagnostics.shared.record("zotero.api.requestCompleted", details: [
+                    "category": category, "attempt": attempt + 1,
+                    "httpStatus": (result.1 as? HTTPURLResponse)?.statusCode ?? 0,
+                    "byteCount": result.0.count,
+                    "durationMilliseconds": Date().timeIntervalSince(startedAt) * 1_000
+                ])
                 if let response = result.1 as? HTTPURLResponse,
                    Self.isTransientStatus(response.statusCode), attempt < 2 {
                     try await Task.sleep(for: .seconds(attempt + 1))
@@ -739,6 +803,11 @@ struct ZoteroAPIClient: Sendable {
                 }
                 return result
             } catch {
+                JottreDiagnostics.shared.record("zotero.api.requestFailed", details: [
+                    "category": category, "attempt": attempt + 1,
+                    "errorDomain": (error as NSError).domain, "errorCode": (error as NSError).code,
+                    "durationMilliseconds": Date().timeIntervalSince(startedAt) * 1_000
+                ])
                 guard attempt < 2, Self.isTransientNetworkError(error) else { throw error }
                 try await Task.sleep(for: .seconds(attempt + 1))
             }

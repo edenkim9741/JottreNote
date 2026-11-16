@@ -296,7 +296,7 @@ private final class ZoteroLibraryViewModel: ObservableObject {
             errorMessage = nil
             JottreDiagnostics.shared.record("zotero.sync.completed", details: ["trigger": trigger.rawValue, "durationMilliseconds": Date().timeIntervalSince(startedAt) * 1_000])
         } catch {
-            errorMessage = String(localized: "zotero.error.librarySync")
+            errorMessage = String(localized: "zotero.error.librarySync") + "\n" + error.localizedDescription
             JottreDiagnostics.shared.record("zotero.sync.failed", details: ["trigger": trigger.rawValue, "durationMilliseconds": Date().timeIntervalSince(startedAt) * 1_000, "errorDomain": (error as NSError).domain, "errorCode": (error as NSError).code])
         }
         await syncGate.endSynchronization()
@@ -1896,11 +1896,13 @@ struct ZoteroLibraryView: View {
                             HStack {
                                 Text(syncProgress.syncStatusMessage).lineLimit(1)
                                 Spacer(minLength: 4)
-                                Text("\(Int((syncProgress.syncProgress * 100).rounded()))%")
-                                    .monospacedDigit()
+                                if syncProgress.syncProgress > 0 {
+                                    Text("\(Int((syncProgress.syncProgress * 100).rounded()))%")
+                                        .monospacedDigit()
+                                }
                             }
                             .font(.caption)
-                            ProgressView(value: syncProgress.syncProgress)
+                            ProgressView(value: syncProgress.syncProgress > 0 ? syncProgress.syncProgress : nil)
                                 .tint(.accentColor)
                         }
                         .frame(maxWidth: 260)

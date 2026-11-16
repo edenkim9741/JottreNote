@@ -10490,6 +10490,91 @@
         }
       }
     },
+    "zotero.sync.status.checkingVersions" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Checking library versions…"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "라이브러리 변경 확인 중…"
+          }
+        }
+      }
+    },
+    "zotero.sync.status.fetchingCollections" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fetching collections…"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "컬렉션 가져오는 중…"
+          }
+        }
+      }
+    },
+    "zotero.sync.status.fetchingDeletions" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fetching deleted entries…"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "삭제된 항목 확인 중…"
+          }
+        }
+      }
+    },
+    "zotero.sync.status.fetchingObjects" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fetching library changes… (%lld/%lld)"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "라이브러리 변경 사항 가져오는 중… (%lld/%lld)"
+          }
+        }
+      }
+    },
+    "zotero.sync.status.retryingChanges" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Library changed. Retrying…"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "라이브러리가 변경되어 다시 시도 중…"
+          }
+        }
+      }
+    },
     "zotero.sync.status.fetching" : {
       "extractionState" : "manual",
       "localizations" : {

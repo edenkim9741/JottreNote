@@ -60,16 +60,26 @@ actor ZoteroSyncEngine {
         await progress?.begin()
         do {
         for attempt in 0..<3 {
+            try Task.checkCancellation()
             let current = cacheStore.load(userID: userID)
             let savedOldVersion = current.lastLibraryVersion
             do {
                 var snapshot = current
-                let delta = try await apiClient.fetchDelta(since: savedOldVersion)
+                let progress = self.progress
+                let delta = try await apiClient.fetchDelta(since: savedOldVersion) { value, message in
+                    await progress?.update(0.25 * value, message: message)
+                }
                 let expectedVersion = delta?.libraryVersion ?? savedOldVersion
-                let fullCollections = try await apiClient.fetchAllCollections()
+                await progress?.update(0.25, message: String(localized: "zotero.sync.status.fetchingCollections"))
+                let fullCollections = try await apiClient.fetchAllCollections { completed, total in
+                    let fraction = total.map { Double(completed) / Double(max(1, $0)) } ?? 0
+                    await progress?.update(0.25 + 0.04 * fraction,
+                                           message: String(localized: "zotero.sync.status.fetchingCollections"))
+                }
                 guard fullCollections.libraryVersion == expectedVersion else {
                     throw ZoteroAPIClient.Failure.libraryChangedDuringSync
                 }
+                try Task.checkCancellation()
 
                 if let delta {
                     await progress?.update(0.3, message: String(localized: "zotero.sync.status.applyingChanges"))
@@ -343,10 +353,12 @@ actor ZoteroSyncEngine {
                 await progress?.finish(succeeded: true)
                 return result
             } catch ZoteroAPIClient.Failure.libraryChangedDuringSync {
-                try? await Task.sleep(for: .seconds(1 << attempt))
+                await progress?.update(0, message: String(localized: "zotero.sync.status.retryingChanges"))
+                if attempt < 2 { try await Task.sleep(for: .seconds(1 << attempt)) }
                 continue
             } catch ZoteroCacheStore.Failure.cacheAdvancedDuringSync {
-                try? await Task.sleep(for: .seconds(1 << attempt))
+                await progress?.update(0, message: String(localized: "zotero.sync.status.retryingChanges"))
+                if attempt < 2 { try await Task.sleep(for: .seconds(1 << attempt)) }
                 continue
             }
         }
