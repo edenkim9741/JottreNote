@@ -23,6 +23,24 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
     private var isPDFScrollRoutingPending = false
     private(set) var fingerNavigationFallbackPan: UIPanGestureRecognizer?
     private var fallbackPanStartOffset: CGPoint?
+    private var fallbackPanMovedContent = false
+    private var fallbackDisplayLink: CADisplayLink?
+    private weak var fallbackDecelerationScrollView: UIScrollView?
+    private(set) var fallbackDeceleration: JotScrollDeceleration?
+    private var fallbackFrameTimestamp: CFTimeInterval = 0
+
+    @MainActor
+    private final class DisplayLinkTarget: NSObject {
+        weak var coordinator: JotEditorGestureCoordinator?
+
+        @objc func tick(_ link: CADisplayLink) {
+            guard let coordinator else {
+                link.invalidate()
+                return
+            }
+            coordinator.advanceFallbackDeceleration(link)
+        }
+    }
 #if DEBUG
     private var pdfPanStartOffsets: [ObjectIdentifier: CGPoint] = [:]
     private var pdfPanSuccessLogged = Set<ObjectIdentifier>()
@@ -64,6 +82,7 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
     }
 
     private func updateFingerNavigationFallback(isEnabled: Bool) {
+        if !isEnabled { stopFingerNavigationDeceleration() }
         let gestureHost = pdfView.window ?? fingerNavigationGestureHost ?? pdfView
         if isEnabled, fingerNavigationFallbackPan == nil {
             let pan = UIPanGestureRecognizer(target: self, action: #selector(fingerNavigationFallbackChanged(_:)))
@@ -92,12 +111,20 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
     }
 
     @objc private func fingerNavigationFallbackChanged(_ pan: UIPanGestureRecognizer) {
+        defer {
+            if pan.state == .ended || pan.state == .cancelled || pan.state == .failed {
+                fallbackPanStartOffset = nil
+                fallbackPanMovedContent = false
+            }
+        }
         guard isEditingEnabled,
               let scrollView = pdfNavigationScrollViews().first else { return }
         let pdfPan = scrollView.panGestureRecognizer
 
         switch pan.state {
         case .began:
+            stopFingerNavigationDeceleration()
+            fallbackPanMovedContent = false
             fallbackPanStartOffset = scrollView.contentOffset
 #if DEBUG
             pdfView.recordFingerNavigationFallbackDiagnostic(state: pan.state, scrollView: scrollView, fallbackPan: pan)
@@ -116,7 +143,7 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
             } else {
                 fallbackReason = nil
             }
-            guard let fallbackReason,
+            guard !scrollView.isDecelerating, let fallbackReason,
                   let startOffset = fallbackPanStartOffset else { return }
 #if DEBUG
             pdfView.recordFingerNavigationFallbackDiagnostic(
@@ -127,32 +154,93 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
             )
 #endif
             let translation = pan.translation(in: scrollView)
-            let inset = scrollView.adjustedContentInset
-            let minimumOffset = CGPoint(x: -inset.left, y: -inset.top)
-            let maximumOffset = CGPoint(
-                x: max(minimumOffset.x, scrollView.contentSize.width - scrollView.bounds.width + inset.right),
-                y: max(minimumOffset.y, scrollView.contentSize.height - scrollView.bounds.height + inset.bottom)
-            )
+            let range = Self.scrollOffsetRange(in: scrollView)
             let desiredOffset = CGPoint(
-                x: min(max(startOffset.x - translation.x, minimumOffset.x), maximumOffset.x),
-                y: min(max(startOffset.y - translation.y, minimumOffset.y), maximumOffset.y)
+                x: min(max(startOffset.x - translation.x, range.minX), range.maxX),
+                y: min(max(startOffset.y - translation.y, range.minY), range.maxY)
             )
             if abs(desiredOffset.x - scrollView.contentOffset.x) > 0.5
                 || abs(desiredOffset.y - scrollView.contentOffset.y) > 0.5 {
                 scrollView.setContentOffset(desiredOffset, animated: false)
+                fallbackPanMovedContent = true
                 updateVisibleRegionAfterFallbackPan()
                 pdfView.layoutIfNeeded()
             }
+            if pan.state == .ended, fallbackPanMovedContent {
+                let velocity = pan.velocity(in: scrollView)
+                startFallbackDeceleration(velocity: CGPoint(x: -velocity.x, y: -velocity.y), in: scrollView)
+            }
         case .cancelled, .failed:
-            fallbackPanStartOffset = nil
+            stopFingerNavigationDeceleration()
         case .possible:
             break
         @unknown default:
             break
         }
-        if pan.state == .ended {
-            fallbackPanStartOffset = nil
+    }
+
+    private static func scrollOffsetRange(in scrollView: UIScrollView) -> CGRect {
+        let inset = scrollView.adjustedContentInset
+        let minimum = CGPoint(x: -inset.left, y: -inset.top)
+        return CGRect(origin: minimum, size: CGSize(
+            width: max(0, scrollView.contentSize.width - scrollView.bounds.width + inset.right - minimum.x),
+            height: max(0, scrollView.contentSize.height - scrollView.bounds.height + inset.bottom - minimum.y)
+        ))
+    }
+
+    func startFallbackDeceleration(velocity: CGPoint, in scrollView: UIScrollView) {
+        stopFingerNavigationDeceleration()
+        guard isEditingEnabled, scrollView.isScrollEnabled, !scrollView.isDecelerating,
+              !scrollView.isZooming,
+              scrollView.decelerationRate.rawValue > 0, scrollView.decelerationRate.rawValue < 1,
+              velocity.x.isFinite, velocity.y.isFinite else { return }
+        let motion = JotScrollDeceleration(offset: scrollView.contentOffset, velocity: velocity,
+                                          rate: scrollView.decelerationRate.rawValue)
+        guard motion.isMoving else { return }
+        fallbackDeceleration = motion
+        fallbackDecelerationScrollView = scrollView
+        fallbackFrameTimestamp = CACurrentMediaTime()
+        let target = DisplayLinkTarget()
+        target.coordinator = self
+        let link = CADisplayLink(target: target, selector: #selector(DisplayLinkTarget.tick(_:)))
+        fallbackDisplayLink = link
+        link.add(to: .main, forMode: .common)
+    }
+
+    func stopFingerNavigationDeceleration() {
+        fallbackDisplayLink?.invalidate()
+        fallbackDisplayLink = nil
+        fallbackDeceleration = nil
+        fallbackDecelerationScrollView = nil
+    }
+
+    private func advanceFallbackDeceleration(_ link: CADisplayLink) {
+        guard isEditingEnabled, let scrollView = fallbackDecelerationScrollView,
+              pdfNavigationScrollViews().first === scrollView, scrollView.window != nil,
+              scrollView.isScrollEnabled,
+              !scrollView.isTracking, !scrollView.isDecelerating, !scrollView.isZooming,
+              !scrollView.isZoomBouncing,
+              let motion = fallbackDeceleration,
+              abs(scrollView.contentOffset.x - motion.offset.x) < 1,
+              abs(scrollView.contentOffset.y - motion.offset.y) < 1 else {
+            stopFingerNavigationDeceleration()
+            return
         }
+        let elapsed = link.targetTimestamp - fallbackFrameTimestamp
+        guard elapsed > 0 else { return }
+        // Stop after a suspension instead of jumping across the document.
+        guard elapsed < 0.25 else {
+            stopFingerNavigationDeceleration()
+            return
+        }
+        fallbackFrameTimestamp = link.targetTimestamp
+        var next = motion
+        next.advance(by: elapsed, within: Self.scrollOffsetRange(in: scrollView))
+        fallbackDeceleration = next
+        scrollView.setContentOffset(next.offset, animated: false)
+        updateVisibleRegionAfterFallbackPan()
+        pdfView.layoutIfNeeded()
+        if !next.isMoving { stopFingerNavigationDeceleration() }
     }
 
     func update(
@@ -249,6 +337,7 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
 #endif
 
     @objc private func pdfPanStateChanged(_ pan: UIPanGestureRecognizer) {
+        if pan.state == .began || pan.state == .changed { stopFingerNavigationDeceleration() }
 #if DEBUG
         guard let scrollView = pan.view as? UIScrollView else { return }
         let key = ObjectIdentifier(pan)
@@ -453,6 +542,7 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
             if EditorInteractionFixture.tool == "scribble-undo" { return false }
 #endif
             let location = touch.location(in: pdfView)
+            if pdfView.bounds.contains(location) { stopFingerNavigationDeceleration() }
             return isEditingEnabled && touch.type == .direct && pdfView.bounds.contains(location)
         }
         guard gestureRecognizer === undoDoubleTapRecognizer else { return true }
@@ -516,6 +606,7 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
         let current = Set(pdfNavigationScrollViews().map { ObjectIdentifier($0.panGestureRecognizer) })
         let routed = Set(routedPDFPans.allObjects.map(ObjectIdentifier.init))
         guard current != routed else { return }
+        stopFingerNavigationDeceleration()
         applyPDFScrollRouting()
     }
 
@@ -527,6 +618,28 @@ final class JotEditorGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
             return left.eraserType == right.eraserType && left.width == right.width
         }
         return lhs is PKLassoTool && rhs is PKLassoTool
+    }
+}
+
+/// Integrates exponential velocity decay in seconds, independently of frame rate.
+/// UIKit's deceleration rate is applied per millisecond; velocity is points/second.
+struct JotScrollDeceleration {
+    private(set) var offset: CGPoint
+    private(set) var velocity: CGPoint
+    let rate: CGFloat
+
+    var isMoving: Bool { max(abs(velocity.x), abs(velocity.y)) > 5 }
+
+    mutating func advance(by elapsed: TimeInterval, within range: CGRect) {
+        guard elapsed.isFinite, elapsed > 0, rate > 0, rate < 1 else { return }
+        let exponent = 1_000 * log(Double(rate))
+        let decay = CGFloat(exp(exponent * elapsed))
+        let distance = CGFloat(expm1(exponent * elapsed) / exponent)
+        let proposed = CGPoint(x: offset.x + velocity.x * distance, y: offset.y + velocity.y * distance)
+        offset = CGPoint(x: min(max(proposed.x, range.minX), range.maxX),
+                         y: min(max(proposed.y, range.minY), range.maxY))
+        velocity = CGPoint(x: offset.x == proposed.x ? velocity.x * decay : 0,
+                           y: offset.y == proposed.y ? velocity.y * decay : 0)
     }
 }
 

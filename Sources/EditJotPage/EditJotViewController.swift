@@ -1696,6 +1696,7 @@ extension EditJotViewController: PKCanvasViewDelegate {
     }
 
     func canvasViewDidBeginUsingTool(_ canvasView: PKCanvasView) {
+        gestureCoordinator.stopFingerNavigationDeceleration()
         if let canvas = canvasView as? JotCanvasView,
             pageIndexByCanvas[ObjectIdentifier(canvas)] != nil
         {
